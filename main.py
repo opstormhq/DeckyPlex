@@ -1211,7 +1211,7 @@ class Plugin:
         }
 
     async def plex_login_poll(self) -> Dict[str, Any]:
-        """Poll the PlexAPI PIN login object and discover account resources."""
+        """Poll PIN approval and save the account token before resource discovery."""
         pin_login = _pin_state.get("login")
         if pin_login is None:
             return {"error": "No active Plex login. Start login again."}
@@ -1224,15 +1224,9 @@ class Plugin:
                 return {}
 
             auth_token = pin_login.token
-            try:
-                info = self._account_resources(auth_token)
-            except Exception as e:
-                logger.error(f"Plex login succeeded but resource discovery failed: {e}", exc_info=True)
-                info = {"username": "", "servers": [], "plexamp_url": "", "plexamp_client_id": ""}
-
             settings = _load_settings()
             settings["plex_token"] = auth_token
-            settings["logged_in_username"] = info.get("username", "")
+            settings["logged_in_username"] = ""
             settings["selected_player_id"] = ""
             settings["selected_player_name"] = ""
             settings["playback_target"] = "local"
@@ -1241,27 +1235,15 @@ class Plugin:
             settings["selected_server_url"] = ""
             settings["server_access_token"] = ""
             settings["plexamp_url"] = ""
-            if info["plexamp_url"]:
-                settings["plexamp_url"] = info["plexamp_url"]
-            if info["servers"]:
-                selected = next((s for s in info["servers"] if s["id"] == settings.get("selected_server_id")), info["servers"][0])
-                settings.update({
-                    "selected_server_id": selected["id"],
-                    "selected_server_name": selected["name"],
-                    "selected_server_url": selected["base_url"],
-                    "server_access_token": selected.get("access_token") or auth_token,
-                })
             _save_settings(settings)
 
             _pin_state.clear()
-            logger.info("Plex login succeeded for %s; discovered %d server(s)",
-                        info["username"] or "account", len(info["servers"]))
+            logger.info("Plex PIN login approved; account token saved, starting server discovery")
             return {
                 "logged_in": True,
-                "username": info["username"],
-                "servers": [{key: server.get(key, "") for key in ("id", "name", "base_url")}
-                            for server in info["servers"]],
-                "plexamp_url": info["plexamp_url"],
+                "username": "",
+                "servers": [],
+                "discovery_pending": True,
             }
         except Exception as e:
             logger.error(f"Plex PIN polling failed: {e}", exc_info=True)
@@ -1275,6 +1257,7 @@ class Plugin:
             return {"servers": [], "error": "Not logged in to Plex"}
         try:
             info = self._account_resources(token)
+            settings["logged_in_username"] = info.get("username", "")
             if info["plexamp_url"]:
                 settings["plexamp_url"] = info["plexamp_url"]
                 _save_settings(settings)
@@ -1286,6 +1269,15 @@ class Plugin:
                     "base_url": settings["selected_server_url"],
                     "access_token": settings.get("server_access_token") or token,
                 }]
+            if servers:
+                selected = next((server for server in servers if server["id"] == settings.get("selected_server_id")), servers[0])
+                settings.update({
+                    "selected_server_id": selected["id"],
+                    "selected_server_name": selected["name"],
+                    "selected_server_url": selected["base_url"],
+                    "server_access_token": selected.get("access_token") or token,
+                })
+            _save_settings(settings)
             public_servers = [{key: server.get(key, "") for key in ("id", "name", "base_url")}
                               for server in servers]
             return {

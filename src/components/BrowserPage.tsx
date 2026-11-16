@@ -11,6 +11,7 @@ import {
   Spinner,
   ModalRoot,
   Navigation,
+  GamepadButton,
   showModal,
 } from '@decky/ui';
 import { call } from '@decky/api';
@@ -50,6 +51,7 @@ interface BrowserHistoryEntry {
   focusedItemId?: string;
   scrollTop: number;
 }
+interface TabFocusPosition { itemId: string; scrollTop: number; }
 
 export function BrowserPage() {
   const { playTrack, playRemoteQueue, remoteMode, remotePlayerName, addToQueue } = usePlayer();
@@ -81,6 +83,7 @@ export function BrowserPage() {
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
   const pendingScrollTop = useRef<number | undefined>(undefined);
+  const tabFocusPositions = useRef(new Map<BrowserTab, TabFocusPosition>());
   const pendingSearchFocus = useRef(false);
   const loadingMoreRef = useRef(false);
   const restoringHistoryRef = useRef(false);
@@ -93,12 +96,14 @@ export function BrowserPage() {
       const item = element.closest<HTMLElement>('[data-browser-item-id]') || element;
       const itemRect = item.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
-      const edgePadding = 18;
+      const edgePadding = 28;
       if (itemRect.bottom > viewportRect.bottom - edgePadding) {
         viewport.scrollTop += itemRect.bottom - (viewportRect.bottom - edgePadding);
       } else if (itemRect.top < viewportRect.top + edgePadding) {
         viewport.scrollTop -= (viewportRect.top + edgePadding) - itemRect.top;
       }
+      const itemId = item.dataset.browserItemId;
+      if (itemId && !subView) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: viewport.scrollTop });
     });
   };
 
@@ -225,6 +230,9 @@ export function BrowserPage() {
             pendingFocusId.current = undefined;
             return;
           }
+          pendingFocusId.current = undefined;
+          pendingScrollTop.current = undefined;
+          enterContentPending.current = true;
         }
         if (pendingSearchFocus.current) {
           pendingSearchFocus.current = false;
@@ -583,6 +591,29 @@ export function BrowserPage() {
 
   const gridView = subView?.type === 'albums' || (!subView && ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab));
 
+  const handleGridDirection = (event: import('@decky/ui').GamepadEvent) => {
+    if (subView || event.detail.button !== GamepadButton.DIR_UP) return;
+    const focusedId = document.activeElement instanceof HTMLElement
+      ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
+      : undefined;
+    const focusedIndex = items.findIndex(item => item.id === (focusedId || focusedItemId.current));
+    const isTopRow = gridView ? focusedIndex >= 0 && focusedIndex < gridColumns : focusedIndex === 0;
+    if (isTopRow) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  };
+
+  const jumpToListTop = (event: import('@decky/ui').GamepadEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!items.length) return;
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+    const firstItem = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
+      .find(element => element.dataset.browserItemId === items[0].id);
+    if (firstItem) firstItem.focus({ preventScroll: true });
+  };
+
   const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
     const imageUrl = versionArtwork(item.type === 'artist' ? (item.art || item.thumb || '') : (item.thumb || item.art || ''), artworkRevision);
     const fallbackIcon = item.type === 'track' ? <FaMusic /> : item.type === 'album' ? <FaCompactDisc /> : item.type === 'playlist' ? <FaListUl /> : <FaUser />;
@@ -594,6 +625,7 @@ export function BrowserPage() {
           data-browser-item-id={item.id}
           onFocus={() => {
             focusedItemId.current = item.id;
+            if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
             if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
           }}
           onActivate={onClick}
@@ -678,6 +710,7 @@ export function BrowserPage() {
             data-browser-item-id={item.id}
           onFocus={() => {
             focusedItemId.current = item.id;
+            if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
             if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
           }}
             onActivate={onClick}
@@ -697,7 +730,10 @@ export function BrowserPage() {
     }
     return (
       <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id}
-        onFocus={() => { focusedItemId.current = item.id; }} onActivate={onClick} onClick={onClick}
+        onFocus={() => {
+          focusedItemId.current = item.id;
+          if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
+        }} onActivate={onClick} onClick={onClick}
         onCancel={handleCancel} style={rowStyle}>
         {rowDetails}
       </Focusable>
@@ -778,14 +814,18 @@ export function BrowserPage() {
           <PanelSectionRow>
             <div style={{ width: '100%', paddingTop: subView?.type === 'search' ? '0.45rem' : 0, boxSizing: 'border-box' }}>
             {gridView ? (
-              <Focusable flow-children="geometric" onCancel={handleCancel} style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
+              <Focusable flow-children="geometric" onCancel={handleCancel} onGamepadDirection={handleGridDirection}
+                onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
+                style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
                 {items.map((item, idx) => {
                   const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
                 })}
               </Focusable>
             ) : (
-              <Focusable key={`list-${activeTab}-${subView?.type || 'root'}-${subView?.id || ''}-${focusTreeVersion}`} flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
+              <Focusable key={`list-${activeTab}-${subView?.type || 'root'}-${subView?.id || ''}-${focusTreeVersion}`} flow-children="column" onCancel={handleCancel}
+                onGamepadDirection={handleGridDirection} onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
+                style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
                 {items.map((item, idx) => {
                   const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
@@ -835,11 +875,19 @@ export function BrowserPage() {
 
   const enterContent = () => {
     focusZone.current = 'content';
-    enterContentPending.current = true;
+    const savedPosition = tabFocusPositions.current.get(activeTab);
+    enterContentPending.current = !savedPosition;
+    if (savedPosition) {
+      pendingFocusId.current = savedPosition.itemId;
+      pendingScrollTop.current = savedPosition.scrollTop;
+      setRestoreFocusTick(value => value + 1);
+    }
     if (!loading && (items.length > 0 || activeTab === 'search')) {
-      enterContentPending.current = false;
-      if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
-      else firstItemRef.current?.focus();
+      if (!savedPosition) {
+        enterContentPending.current = false;
+        if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+        else firstItemRef.current?.focus();
+      }
     }
   };
 
@@ -876,7 +924,7 @@ export function BrowserPage() {
           ))}
         </Focusable>
       </div>
-      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, overflowY: 'auto', padding: '0.55rem 0.35rem 0 0', boxSizing: 'border-box' }}>
+      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.55rem 0.35rem 0 0', boxSizing: 'border-box' }}>
         {renderContent()}
       </div>
     </div>

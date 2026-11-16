@@ -10,6 +10,7 @@ import {
   SliderField,
   DialogCheckbox,
   SidebarNavigation,
+  Spinner,
 } from '@decky/ui';
 import { call } from '@decky/api';
 import { FaUser, FaServer, FaMusic, FaCog, FaTh } from 'react-icons/fa';
@@ -71,9 +72,15 @@ export function SettingsPage() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [servers, setServers] = useState<Server[]>([]);
   const [status, setStatus] = useState<string>("");
+  const [serverStatus, setServerStatus] = useState("");
+  const [playersStatus, setPlayersStatus] = useState("");
+  const [browserStatus, setBrowserStatus] = useState("");
+  const [advancedStatus, setAdvancedStatus] = useState("");
   const [pinCode, setPinCode] = useState<string>("");
   const [pinUrl, setPinUrl] = useState<string>("");
   const [loggingIn, setLoggingIn] = useState(false);
+  const [connectingToPlex, setConnectingToPlex] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [refreshingPlayers, setRefreshingPlayers] = useState(false);
 
   const settingsRef = useRef(settings);
@@ -82,13 +89,12 @@ export function SettingsPage() {
   const saveSettings = useCallback((s: Settings) => {
     return call("set_settings", s).then((result: any) => {
       if (result?.error) {
-        setStatus("Failed to save settings: " + result.error);
+        return result;
       } else {
         window.dispatchEvent(new Event('deckyplex-settings-change'));
       }
       return result;
     }).catch(() => {
-      setStatus("Failed to save settings.");
       return { error: "Failed to save settings." };
     });
   }, []);
@@ -160,25 +166,39 @@ export function SettingsPage() {
       try {
         const result: any = await callWithTimeout("plex_login_poll", 15000);
         if (result.logged_in) {
-          // Login successful — save settings and update UI
           clearInterval(interval);
-          setPinCode("");
-          setPinUrl("");
-
-          const savedSettings: any = await callWithTimeout("get_settings", 10000);
-          settingsRef.current = savedSettings;
-          setSettings(savedSettings);
-          setServers(result.servers || []);
-
-          // Load players
+          setConnectingToPlex(true);
+          setStatus("Plex approved. Connecting to your server...");
           try {
-            const playersResult: any = await callWithTimeout("discover_players", 30000);
-            if (playersResult.players) {
-              setPlayers(playersResult.players);
-            }
-          } catch {}
+            const savedSettings: any = await callWithTimeout("get_settings", 10000);
+            settingsRef.current = savedSettings;
+            setSettings(savedSettings);
+            setPinCode("");
+            setPinUrl("");
+            setStatus("Login complete. Discovering your Plex server...");
 
-          setStatus(`Logged in as ${result.username || 'user'}. ${result.servers?.length || 0} server(s) found.`);
+            const discovery: any = await callWithTimeout("discover_servers", 30000);
+            setServers(discovery.servers || []);
+            const connectedSettings: any = await callWithTimeout("get_settings", 10000);
+            settingsRef.current = connectedSettings;
+            setSettings(connectedSettings);
+            setStatus(discovery.servers?.length
+              ? `Connected as ${connectedSettings.logged_in_username || 'your Plex account'}. ${discovery.servers.length} server(s) found.`
+              : "Plex login succeeded, but no server was found. Check Server or Advanced settings.");
+            setConnectingToPlex(false);
+
+            setRefreshingPlayers(true);
+            void callWithTimeout("discover_players", 30000)
+              .then((playersResult: any) => setPlayers(playersResult.players || []))
+              .catch(() => {})
+              .finally(() => setRefreshingPlayers(false));
+          } catch (e: any) {
+            setPinCode("");
+            setPinUrl("");
+            setStatus(e?.message || "Plex login succeeded, but server discovery failed.");
+          } finally {
+            setConnectingToPlex(false);
+          }
         } else if (result.error) {
           clearInterval(interval);
           setPinCode("");
@@ -196,15 +216,22 @@ export function SettingsPage() {
     return () => clearInterval(interval);
   }, [pinCode]);
 
-  const handleLogout = useCallback(() => {
-    call("logout").then((cleared: any) => {
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    setStatus("Logging out of Plex...");
+    try {
+      const cleared: any = await callWithTimeout("logout", 15000);
       settingsRef.current = cleared;
       setSettings(cleared);
       window.dispatchEvent(new Event('deckyplex-settings-change'));
-    });
-    setServers([]);
-    setPlayers([]);
-    setStatus("Logged out.");
+      setServers([]);
+      setPlayers([]);
+      setStatus("Logged out.");
+    } catch (e: any) {
+      setStatus(e?.message || "Could not log out of Plex.");
+    } finally {
+      setLoggingOut(false);
+    }
   }, []);
 
   const handleSelectServer = useCallback((serverId: string) => {
@@ -215,8 +242,8 @@ export function SettingsPage() {
         settingsRef.current = result.settings;
         setSettings(result.settings);
         window.dispatchEvent(new Event('deckyplex-settings-change'));
-        setStatus(`Selected server: ${server.name}`);
-      }).catch((e: any) => setStatus(e?.message || "Could not select Plex server."));
+        setServerStatus(`Selected server: ${server.name}`);
+      }).catch((e: any) => setServerStatus(e?.message || "Could not select Plex server."));
     }
   }, [servers]);
 
@@ -246,9 +273,9 @@ export function SettingsPage() {
         setSettings(updated);
         await saveSettings(updated);
       }
-      setStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s), including account-registered devices.` : "No Plex players were found through the server or account device list.");
+      setPlayersStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s), including account-registered devices.` : "No Plex players were found through the server or account device list.");
     } catch (e: any) {
-      setStatus(e?.message || "Could not refresh Plex players.");
+      setPlayersStatus(e?.message || "Could not refresh Plex players.");
     } finally {
       setRefreshingPlayers(false);
     }
@@ -263,23 +290,23 @@ export function SettingsPage() {
 
   const saveAdvancedSettings = useCallback(async () => {
     const result: any = await saveSettings(settingsRef.current);
-    if (!result?.error) setStatus("Advanced settings saved.");
+    setAdvancedStatus(result?.error || "Advanced settings saved.");
   }, [saveSettings]);
 
   const saveBrowserSettings = useCallback(async () => {
     const result: any = await saveSettings(settingsRef.current);
-    if (!result?.error) setStatus("Browser settings saved.");
+    setBrowserStatus(result?.error || "Browser settings saved.");
   }, [saveSettings]);
 
   const testServerConnection = useCallback(async () => {
-    setStatus("Testing Plex server connection...");
+    setAdvancedStatus("Testing Plex server connection...");
     try {
       const saved: any = await saveSettings(settingsRef.current);
       if (saved?.error) throw new Error(saved.error);
       const result: any = await callWithTimeout("validate_connection", 15000);
-      setStatus(result.valid ? `Connected to ${result.serverName || "Plex Media Server"}.` : `Connection failed: ${result.error}`);
+      setAdvancedStatus(result.valid ? `Connected to ${result.serverName || "Plex Media Server"}.` : `Connection failed: ${result.error}`);
     } catch (e: any) {
-      setStatus(e?.message || "Connection test failed.");
+      setAdvancedStatus(e?.message || "Connection test failed.");
     }
   }, [saveSettings]);
 
@@ -310,8 +337,9 @@ export function SettingsPage() {
               </DialogBodyText>
             )}
             <DialogBodyText style={{ marginTop: '1rem', opacity: 0.7 }}>
-              Waiting for approval...
+              {connectingToPlex ? 'Plex approved. Connecting to your server...' : 'Waiting for approval...'}
             </DialogBodyText>
+            {connectingToPlex && <Spinner style={{ margin: '0.5rem auto' }} />}
           </div>
         </PanelSectionRow>
       )}
@@ -325,8 +353,12 @@ export function SettingsPage() {
         <DialogBodyText>Logged in as: {settings.logged_in_username || 'Unknown'}</DialogBodyText>
       </PanelSectionRow>
       <PanelSectionRow>
-        <ButtonItem onClick={handleLogout}>Logout</ButtonItem>
+        <ButtonItem onClick={handleLogout} disabled={loggingOut}>
+          {loggingOut ? 'Logging out...' : 'Logout'}
+        </ButtonItem>
       </PanelSectionRow>
+      {loggingOut && <PanelSectionRow><Spinner /></PanelSectionRow>}
+      {connectingToPlex && <PanelSectionRow><Spinner /></PanelSectionRow>}
       {status && (
         <PanelSectionRow>
           <DialogBodyText>{status}</DialogBodyText>
@@ -341,6 +373,7 @@ export function SettingsPage() {
       <PanelSectionRow>
         <DialogBodyText>Servers found: {servers.length}</DialogBodyText>
       </PanelSectionRow>
+      {serverStatus && <PanelSectionRow><DialogBodyText>{serverStatus}</DialogBodyText></PanelSectionRow>}
       {servers.length > 0 && (
         <PanelSectionRow>
           <div style={{ width: '100%' }}>
@@ -418,6 +451,7 @@ export function SettingsPage() {
           <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>
         </PanelSectionRow>
       )}
+      {playersStatus && <PanelSectionRow><DialogBodyText>{playersStatus}</DialogBodyText></PanelSectionRow>}
     </PanelSection>
   );
 
@@ -439,7 +473,7 @@ export function SettingsPage() {
       <PanelSectionRow>
         <Button onClick={saveBrowserSettings}>Save browser settings</Button>
       </PanelSectionRow>
-      {status && <PanelSectionRow><DialogBodyText>{status}</DialogBodyText></PanelSectionRow>}
+      {browserStatus && <PanelSectionRow><DialogBodyText>{browserStatus}</DialogBodyText></PanelSectionRow>}
     </PanelSection>
   );
 
@@ -480,7 +514,7 @@ export function SettingsPage() {
         <Button onClick={saveAdvancedSettings}>Save advanced settings</Button>
         <Button style={{ marginLeft: '0.5rem' }} onClick={testServerConnection}>Test connection</Button>
       </PanelSectionRow>
-      {status && <PanelSectionRow><DialogBodyText>{status}</DialogBodyText></PanelSectionRow>}
+      {advancedStatus && <PanelSectionRow><DialogBodyText>{advancedStatus}</DialogBodyText></PanelSectionRow>}
     </PanelSection>
   );
 
