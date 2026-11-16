@@ -339,11 +339,16 @@ class PlexHTTP:
         return [{"id": str(section.key), "name": section.title, "type": section.type}
                 for section in self.sdk.library.sections()]
 
-    def get_section_contents(self, section_id: str, type_filter: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    def get_section_contents(self, section_id: str, type_filter: str = "", limit: int = 100,
+                             offset: int = 0) -> Dict[str, Any]:
         section = self.sdk.library.sectionByID(int(section_id))
         item_type = type_filter if type_filter in ("artist", "album", "track") else "artist"
-        sort = "titleSort:asc"
-        return [self._item_dict(item) for item in section.search(libtype=item_type, sort=sort, maxresults=limit)]
+        limit = max(1, min(int(limit), 250))
+        offset = max(0, int(offset))
+        items = [self._item_dict(item) for item in section.search(
+            libtype=item_type, sort="titleSort:asc", container_start=offset,
+            container_size=limit, maxresults=limit)]
+        return {"items": items, "has_more": len(items) == limit}
 
     def get_shuffled_tracks(self, section_id: str) -> List[Dict[str, Any]]:
         """Return every track in a music section in randomized queue order."""
@@ -922,14 +927,14 @@ class Plugin:
             logger.error(f"Failed to get library sections: {e}")
             return {"sections": [], "error": str(e)}
 
-    async def get_section_contents(self, section_id: str, item_type: str = "", limit: int = 50) -> Dict[str, Any]:
+    async def get_section_contents(self, section_id: str, item_type: str = "", limit: int = 100,
+                                   offset: int = 0) -> Dict[str, Any]:
         """Get contents of a music library section (artists, albums, etc.)."""
         plex = self._get_plex()
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            items = plex.get_section_contents(section_id, item_type, limit)
-            return {"items": items}
+            return plex.get_section_contents(section_id, item_type, limit, offset)
         except Exception as e:
             logger.error(f"Failed to get section contents: {e}")
             return {"items": [], "error": str(e)}

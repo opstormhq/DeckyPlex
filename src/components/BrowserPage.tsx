@@ -37,7 +37,7 @@ interface LibraryItem {
 
 type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search';
 type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string; id?: string; queueLabel?: string } | null;
-interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; }
+interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; hasMore?: boolean; }
 
 function versionArtwork(url: string, revision: number): string {
   if (!url) return '';
@@ -55,6 +55,9 @@ export function BrowserPage() {
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [tabHasMore, setTabHasMore] = useState(false);
+  const [focusTreeVersion, setFocusTreeVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSection, setSelectedSection] = useState<string>('');
@@ -77,14 +80,15 @@ export function BrowserPage() {
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
   const pendingSearchFocus = useRef(false);
+  const loadingMoreRef = useRef(false);
   const enterContentPending = useRef(false);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cached = itemCache.current.get(key);
-    if (cached && cached.expiresAt > Date.now()) return { items: cached.items };
+    if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore };
     const result = await request();
     if (Array.isArray(result?.items) && !result?.error) {
-      itemCache.current.set(key, { items: result.items, expiresAt: Date.now() + ttlMs });
+      itemCache.current.set(key, { items: result.items, hasMore: result.has_more, expiresAt: Date.now() + ttlMs });
       setArtworkRevision(revision => revision + 1);
     }
     return result;
@@ -281,6 +285,7 @@ export function BrowserPage() {
 
   const loadTabData = useCallback(async (tab: BrowserTab) => {
     setLoading(true);
+    setTabHasMore(false);
     setError(null);
     try {
       let result: any;
@@ -294,7 +299,8 @@ export function BrowserPage() {
         result = await cachedItems(cacheKey, ttl, () => call('get_audio_playlists', 100));
       } else {
         const typeFilter = tab === 'artists' ? 'artist' : tab === 'albums' ? 'album' : 'track';
-        result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100));
+        result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100, 0));
+        setTabHasMore(Boolean(result.has_more));
       }
       if (result.error) {
         setError(result.error);
@@ -312,8 +318,37 @@ export function BrowserPage() {
     }
   }, [selectedSection, cachedItems]);
 
+  const loadMoreTabPage = useCallback(async () => {
+    if (!tabHasMore || loadingMoreRef.current || !selectedSection || subView || !['artists', 'albums', 'tracks'].includes(activeTab)) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      const typeFilter = activeTab === 'artists' ? 'artist' : activeTab === 'albums' ? 'album' : 'track';
+      const offset = items.length;
+      const cacheKey = `tab:${selectedSection}:${activeTab}:${offset}`;
+      const result: any = await cachedItems(cacheKey, 300000,
+        () => call('get_section_contents', selectedSection, typeFilter, 100, offset));
+      if (result.error) {
+        setError(result.error);
+        return;
+      }
+      const nextPage: LibraryItem[] = Array.isArray(result.items) ? result.items : [];
+      setItems(previous => {
+        const existing = new Set(previous.map(item => item.id));
+        return [...previous, ...nextPage.filter(item => !existing.has(item.id))];
+      });
+      setTabHasMore(Boolean(result.has_more));
+    } catch (e) {
+      setError('Could not load more music library items.');
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [tabHasMore, selectedSection, subView, activeTab, items.length, cachedItems]);
+
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
     setSubView({ type: 'albums', title: artistName || 'Albums', id: artistId });
@@ -334,6 +369,7 @@ export function BrowserPage() {
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: playlistName || 'Playlist', id: playlistId, queueLabel: 'Play Playlist' });
@@ -351,6 +387,7 @@ export function BrowserPage() {
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: albumName || 'Tracks', id: albumId, queueLabel: 'Play Album' });
@@ -497,7 +534,10 @@ export function BrowserPage() {
           key={item.id}
           ref={idx === 0 ? firstItemRef : undefined}
           data-browser-item-id={item.id}
-          onFocus={() => { focusedItemId.current = item.id; }}
+          onFocus={() => {
+            focusedItemId.current = item.id;
+            if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
+          }}
           onActivate={onClick}
           onClick={onClick}
           onCancel={handleCancel}
@@ -578,7 +618,10 @@ export function BrowserPage() {
           key={item.id}
             ref={idx === 0 ? firstItemRef : undefined}
             data-browser-item-id={item.id}
-            onFocus={() => { focusedItemId.current = item.id; }}
+          onFocus={() => {
+            focusedItemId.current = item.id;
+            if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
+          }}
             onActivate={onClick}
             onClick={onClick}
             onCancel={handleCancel}
@@ -622,9 +665,9 @@ export function BrowserPage() {
           <DialogLabel style={{ flex: 1, minWidth: 0 }}>
             {subView?.title || (activeTab === 'recentlyAdded' ? 'Recently Added' : activeTab === 'recent' ? 'Recently Played' : activeTab === 'playlists' ? 'Playlists' : activeTab === 'search' ? 'Search' : activeTab === 'tracks' ? 'Songs' : activeTab[0].toUpperCase() + activeTab.slice(1))}
           </DialogLabel>
-          {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
+          {(loading || loadingMore) && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
           {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
-            <Button ref={playCollectionRef} onClick={handlePlayCollection} onCancelButton={handleCancel} disabled={loading}>
+            <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef} onClick={handlePlayCollection} onCancelButton={handleCancel} disabled={loading}>
               <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
             </Button>
           )}
@@ -684,7 +727,7 @@ export function BrowserPage() {
                 })}
               </Focusable>
             ) : (
-              <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
+              <Focusable key={`list-${activeTab}-${subView?.type || 'root'}-${subView?.id || ''}-${focusTreeVersion}`} flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
                 {items.map((item, idx) => {
                   const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
