@@ -5,7 +5,6 @@ import {
   DialogBodyText,
   DialogLabel,
   Button,
-  ButtonItem,
   Focusable,
   SliderField,
   TextField,
@@ -72,7 +71,7 @@ export function BrowserPage() {
   const gridDialogRef = useRef<{ Close: () => void } | null>(null);
   const gridPromptShown = useRef(false);
   const actionDialogRef = useRef<{ Close: () => void } | null>(null);
-  const focusZone = useRef<'sidebar' | 'content'>('content');
+  const focusZone = useRef<'sidebar' | 'content'>('sidebar');
   const sidebarRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
@@ -88,6 +87,13 @@ export function BrowserPage() {
       setArtworkRevision(revision => revision + 1);
     }
     return result;
+  }, []);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${activeTab}"]`)?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   useEffect(() => {
@@ -116,7 +122,8 @@ export function BrowserPage() {
       event.stopPropagation();
       event.stopImmediatePropagation();
       window.setTimeout(() => {
-        sidebarRef.current?.querySelectorAll<HTMLElement>('button, [role="button"]')[tabKeys.indexOf(activeTab)]?.focus();
+        Array.from(sidebarRef.current?.querySelectorAll<HTMLElement>('[data-browser-tab]') || [])
+          .find(tab => tab.dataset.browserTab === activeTab)?.focus();
       }, 0);
       return;
     }
@@ -711,6 +718,16 @@ export function BrowserPage() {
     { title: 'Search', icon: <FaSearch /> },
   ];
 
+  const enterContent = () => {
+    focusZone.current = 'content';
+    enterContentPending.current = true;
+    if (!loading && (items.length > 0 || activeTab === 'search')) {
+      enterContentPending.current = false;
+      if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+      else firstItemRef.current?.focus();
+    }
+  };
+
   return (
     <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
     <div
@@ -720,33 +737,24 @@ export function BrowserPage() {
       style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0, overflow: 'hidden' }}
     >
       <div data-browser-zone="sidebar" ref={sidebarRef}
-        onFocusCapture={(event) => {
-          const button = event.target instanceof HTMLElement ? event.target.closest('button,[role="button"]') : null;
-          const buttons = Array.from(sidebarRef.current?.querySelectorAll('button,[role="button"]') || []);
-          const index = button ? buttons.indexOf(button) : -1;
-          if (index >= 0 && tabKeys[index] !== activeTab) setActiveTab(tabKeys[index]);
-          focusZone.current = 'sidebar';
-        }}
         style={{ width: '22%', minWidth: '180px', maxWidth: '260px', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)', padding: '0.35rem 0.45rem 0.5rem 0.2rem', overflowY: 'auto' }}>
         <DialogLabel style={{ display: 'block', padding: '0.5rem 0.65rem 0.8rem' }}>DeckyPlex</DialogLabel>
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
           {tabConfig.map((config, idx) => (
-            <ButtonItem
+            <Focusable
               key={tabKeys[idx]}
-              label={<span style={{ fontWeight: activeTab === tabKeys[idx] ? 600 : 400 }}>{config.title}{activeTab === tabKeys[idx] ? '  •' : ''}</span>}
-              icon={config.icon}
-              layout="inline"
-              bottomSeparator="none"
-              onClick={() => {
-                focusZone.current = 'content';
-                enterContentPending.current = true;
-                if (!loading && items.length > 0) {
-                  enterContentPending.current = false;
-                  if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
-                  else firstItemRef.current?.focus();
-                }
+              data-browser-tab={tabKeys[idx]}
+              onFocus={() => {
+                focusZone.current = 'sidebar';
+                if (activeTab !== tabKeys[idx]) setActiveTab(tabKeys[idx]);
               }}
-            />
+              onActivate={enterContent}
+              onClick={enterContent}
+              style={{ display: 'inline-flex', alignSelf: 'flex-start', width: 'fit-content', maxWidth: '100%', alignItems: 'center', gap: '0.55rem', padding: '0.4rem 0.55rem', whiteSpace: 'nowrap' }}
+            >
+              <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{config.icon}</span>
+              <span style={{ fontWeight: activeTab === tabKeys[idx] ? 600 : 400 }}>{config.title}</span>
+            </Focusable>
           ))}
         </Focusable>
       </div>
