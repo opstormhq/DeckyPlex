@@ -86,6 +86,8 @@ def _save_settings(settings: Dict[str, Any]) -> None:
 
 # Store PIN state across calls
 _pin_state: Dict[str, Any] = {}
+_plex_cache_key = None
+_plex_cache_instance = None
 
 
 class PlexHTTP:
@@ -107,9 +109,19 @@ class PlexHTTP:
             value = getattr(item, name, default)
             return default if value is None else value
 
+        item_type = attr("type")
+        artist = attr("grandparentTitle")
+        if item_type == "album":
+            artist = artist or attr("parentTitle")
+            if not artist:
+                try:
+                    artist = item.artist().title or ""
+                except Exception:
+                    artist = ""
+
         return {
             "id": str(attr("ratingKey")), "key": attr("key"),
-            "title": attr("title"), "type": attr("type"),
+            "title": attr("title"), "type": item_type, "artist": artist,
             "thumb": attr("thumbUrl"), "art": attr("artUrl"),
             "summary": attr("summary"), "year": attr("year"),
             "index": attr("index"), "parentTitle": attr("parentTitle"),
@@ -156,11 +168,32 @@ class PlexHTTP:
     def get_section_contents(self, section_id: str, type_filter: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         section = self.sdk.library.sectionByID(int(section_id))
         item_type = type_filter if type_filter in ("artist", "album", "track") else "artist"
-        return [self._item_dict(item) for item in section.search(libtype=item_type, maxresults=limit)]
+        sort = "titleSort:asc"
+        return [self._item_dict(item) for item in section.search(libtype=item_type, sort=sort, maxresults=limit)]
 
     def get_metadata_children(self, metadata_id: str) -> List[Dict[str, Any]]:
         item = self.sdk.fetchItem(int(metadata_id))
-        return [self._item_dict(child) for child in item.fetchItems(f"{item.key}/children")]
+        if getattr(item, "type", "") == "artist":
+            try:
+                children = item.albums(sort="titleSort:asc")
+            except Exception:
+                children = []
+            if not children:
+                children = item.fetchItems(f"{item.key}/children")
+        elif getattr(item, "type", "") == "album":
+            children = item.tracks()
+            if not children:
+                children = item.fetchItems(f"{item.key}/children")
+        else:
+            children = item.fetchItems(f"{item.key}/children")
+        return [self._item_dict(child) for child in children]
+
+    def get_artist_tracks(self, artist_id: str) -> List[Dict[str, Any]]:
+        artist = self.sdk.fetchItem(int(artist_id))
+        if getattr(artist, "type", "") != "artist":
+            raise ValueError("Selected Plex item is not an artist")
+        tracks = artist.tracks(maxresults=1000)
+        return [self._item_dict(track) for track in tracks]
 
     def get_recently_played(self, section_id: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         """Return recently played tracks using PlexAPI's server history endpoint."""
@@ -168,7 +201,24 @@ class PlexHTTP:
             maxresults=max(1, min(int(limit), 100)),
             librarySectionID=int(section_id) if section_id else None,
         )
-        return [self._item_dict(item) for item in history if getattr(item, "type", "") == "track"]
+        result = []
+        for history_item in history:
+            if getattr(history_item, "type", "") != "track":
+                continue
+            try:
+                source = history_item.source()
+                if source is not None:
+                    history_item = source
+            except Exception:
+                pass
+            result.append(self._item_dict(history_item))
+        return result
+
+    def get_recently_added(self, section_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return the newest albums in a music library, using PlexAPI sorting."""
+        section = self.sdk.library.sectionByID(int(section_id))
+        albums = section.search(libtype="album", sort="addedAt:desc", maxresults=max(1, min(int(limit), 100)))
+        return [self._item_dict(album) for album in albums]
 
     def get_audio_playlists(self, limit: int = 100) -> List[Dict[str, Any]]:
         playlists = self.sdk.playlists(playlistType="audio", sort="titleSort:asc")
@@ -212,11 +262,16 @@ class PlexHTTP:
         return {"machineIdentifier": self.sdk.machineIdentifier or "",
                 "friendlyName": self.sdk.friendlyName or "", "version": self.sdk.version or ""}
 
-    def get_stream_url(self, rating_key: str) -> str:
-        """Create Plex's single-file MP3 transcode URL with PlexAPI token handling."""
+    def get_stream_urls(self, rating_key: str) -> Dict[str, str]:
+        """Prefer PlexAPI's direct media URL for common codecs, with MP3 transcode fallback."""
         track = self.sdk.fetchItem(int(rating_key))
         if getattr(track, "type", "") != "track":
             raise ValueError("Selected Plex item is not a music track")
+        media = list(getattr(track, "media", []) or [])
+        part = next((part for item in media for part in (getattr(item, "parts", []) or [])
+                     if getattr(part, "key", "")), None)
+        direct_url = self.sdk.url(part.key, includeToken=True) if part else ""
+        codec = str(getattr(media[0], "audioCodec", "") or "").lower() if media else ""
         # The transcoder requires a client identifier. Reuse PlexAPI's
         # configured identifier and advertise an MP3 target profile so the
         # response is an audio/mpeg byte stream, not a manifest/error document.
@@ -237,7 +292,37 @@ class PlexHTTP:
             "X-Plex-Product": "DeckyPlex",
             "X-Plex-Version": "1.0.0",
         })
-        return self.sdk.url(f"/music/:/transcode/universal/start.mp3?{params}", includeToken=True)
+        transcode_url = self.sdk.url(f"/music/:/transcode/universal/start.mp3?{params}", includeToken=True)
+        if direct_url and codec in ("mp3", "flac"):
+            return {"stream_url": direct_url, "fallback_stream_url": transcode_url,
+                    "stream_mode": f"direct-{codec}"}
+        return {"stream_url": transcode_url,
+                "fallback_stream_url": direct_url if codec in ("mp3", "flac") else "",
+                "stream_mode": "transcode-mp3"}
+
+    def inspect_stream(self, rating_key: str, stream_url: str) -> Dict[str, Any]:
+        """Read a tiny range from the exact stream URL the client rejected."""
+        expected = urllib.parse.urlparse(self.sdk._baseurl)
+        supplied = urllib.parse.urlparse(stream_url)
+        if supplied.scheme not in ("http", "https") or supplied.netloc != expected.netloc:
+            raise ValueError("Stream diagnostic URL does not match the connected Plex server")
+        response = self.sdk._session.get(
+            stream_url, headers={"Range": "bytes=0-255"}, stream=True, timeout=(4, 8)
+        )
+        try:
+            body = next(response.iter_content(256), b"")
+            content_type = response.headers.get("Content-Type", "")
+            result = {
+                "status": response.status_code,
+                "content_type": content_type,
+                "content_range": response.headers.get("Content-Range", ""),
+                "prefix_hex": body[:32].hex(),
+            }
+            if "text" in content_type or "json" in content_type or "xml" in content_type:
+                result["body_preview"] = body[:256].decode("utf-8", errors="replace")
+            return result
+        finally:
+            response.close()
 
 
 class Plugin:
@@ -329,6 +414,7 @@ class Plugin:
 
     def _get_plex(self) -> Optional[PlexHTTP]:
         """Connect to the Plex server using saved settings."""
+        global _plex_cache_key, _plex_cache_instance
         settings = _load_settings()
         url = self._get_plex_server_url()
         # Use server-specific access token if available, otherwise fall back to user token
@@ -337,11 +423,16 @@ class Plugin:
             # Only log once at DEBUG level — this is expected when no server is configured
             logger.debug(f"_get_plex: missing url or token (url={bool(url)}, token={bool(token)}), plex_token in settings={bool(settings.get('plex_token', '').strip())}")
             return None
+        cache_key = (url.rstrip("/"), token)
+        if _plex_cache_instance is not None and _plex_cache_key == cache_key:
+            return _plex_cache_instance
         try:
             plex = PlexHTTP(url, token)
             # PlexServer validates the connection during construction and keeps
             # the authenticated session for every subsequent SDK request.
             logger.debug(f"_get_plex: connected to server at {url}")
+            _plex_cache_key = cache_key
+            _plex_cache_instance = plex
             return plex
         except Exception as e:
             logger.debug(f"_get_plex: cannot connect to {url}: {e}")
@@ -568,6 +659,16 @@ class Plugin:
             logger.error(f"Failed to get metadata children: {e}")
             return {"items": [], "error": str(e)}
 
+    async def get_artist_tracks(self, artist_id: str) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            return {"items": plex.get_artist_tracks(artist_id)}
+        except Exception as e:
+            logger.error(f"Failed to get tracks for artist {artist_id}: {e}")
+            return {"items": [], "error": str(e)}
+
     async def get_recently_played(self, section_id: str = "", limit: int = 50) -> Dict[str, Any]:
         plex = self._get_plex()
         if not plex:
@@ -576,6 +677,16 @@ class Plugin:
             return {"items": plex.get_recently_played(section_id, limit)}
         except Exception as e:
             logger.error(f"Failed to get recently played tracks: {e}")
+            return {"items": [], "error": str(e)}
+
+    async def get_recently_added(self, section_id: str, limit: int = 50) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            return {"items": plex.get_recently_added(section_id, limit)}
+        except Exception as e:
+            logger.error(f"Failed to get recently added albums: {e}")
             return {"items": [], "error": str(e)}
 
     async def get_audio_playlists(self, limit: int = 100) -> Dict[str, Any]:
@@ -656,7 +767,8 @@ class Plugin:
         try:
             # PlexAPI's getStreamURL() is HLS-only; our adapter uses the SDK's
             # authenticated URL builder for the single-file MP3 transcode.
-            stream_url = plex.get_stream_url(rating_key)
+            streams = plex.get_stream_urls(rating_key)
+            logger.info("play_track: using %s for track %s", streams.get("stream_mode"), rating_key)
             play_queue_id = ""
             selected_item_id = ""
             container_key = ""
@@ -664,7 +776,7 @@ class Plugin:
 
             return {
                 "success": True,
-                "stream_url": stream_url,
+                **streams,
                 "play_queue_id": play_queue_id,
                 "selected_item_id": selected_item_id,
                 "container_key": container_key,
@@ -672,6 +784,26 @@ class Plugin:
             }
         except Exception as e:
             logger.error(f"Failed to get stream for track: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    async def inspect_stream(self, rating_key: str, stream_url: str) -> Dict[str, Any]:
+        """Inspect Plex's response for a track the Decky audio element rejected."""
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        try:
+            result = plex.inspect_stream(rating_key, stream_url)
+            logger.info(
+                "Stream diagnostic for track %s: status=%s content_type=%s content_range=%s prefix=%s",
+                rating_key, result.get("status"), result.get("content_type"),
+                result.get("content_range"), result.get("prefix_hex"),
+            )
+            preview = result.get("body_preview")
+            if preview:
+                logger.info("Stream diagnostic response preview for track %s: %s", rating_key, preview[:256])
+            return {"success": True, **result}
+        except Exception as e:
+            logger.error(f"Stream diagnostic failed for track {rating_key}: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def report_playback(self, rating_key: str, time_ms: int, state: str,

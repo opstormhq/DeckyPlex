@@ -3,16 +3,18 @@ import {
   PanelSection,
   PanelSectionRow,
   DialogBodyText,
+  DialogLabel,
   ButtonItem,
   Button,
   Focusable,
+  SliderField,
   TextField,
   Spinner,
   SidebarNavigation,
   Navigation,
 } from '@decky/ui';
 import { call } from '@decky/api';
-import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl } from 'react-icons/fa';
+import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 
 interface LibraryItem {
@@ -23,6 +25,7 @@ interface LibraryItem {
   thumb?: string;
   art?: string;
   summary?: string;
+  artist?: string;
   year?: number;
   index?: number;
   parentTitle?: string;
@@ -32,8 +35,14 @@ interface LibraryItem {
   duration?: number;
 }
 
-type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'playlists' | 'search';
-type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string } | null;
+type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search';
+type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string; id?: string; queueLabel?: string } | null;
+interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; }
+
+function versionArtwork(url: string, revision: number): string {
+  if (!url) return '';
+  return `${url}${url.includes('?') ? '&' : '?'}deckyplex_art=${revision}`;
+}
 interface BrowserHistoryEntry {
   items: LibraryItem[];
   subView: BrowserSubView;
@@ -51,9 +60,35 @@ export function BrowserPage() {
   const [connected, setConnected] = useState(false);
   const [subView, setSubView] = useState<BrowserSubView>(null);
   const [history, setHistory] = useState<BrowserHistoryEntry[]>([]);
+  const [gridColumns, setGridColumns] = useState(() => {
+    try {
+      const saved = Number(window.localStorage.getItem('deckyplex-grid-columns'));
+      return Number.isInteger(saved) && saved >= 3 && saved <= 8 ? saved : 5;
+    } catch {
+      return 5;
+    }
+  });
+  const [artworkRevision, setArtworkRevision] = useState(0);
+  const itemCache = useRef(new Map<string, ItemCacheEntry>());
 
-  const activeTabRef = useRef(activeTab);
-  activeTabRef.current = activeTab;
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('deckyplex-grid-columns', String(gridColumns));
+    } catch (e) {
+      console.warn('[DeckyPlex] Could not save grid column preference:', e);
+    }
+  }, [gridColumns]);
+
+  const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
+    const cached = itemCache.current.get(key);
+    if (cached && cached.expiresAt > Date.now()) return { items: cached.items };
+    const result = await request();
+    if (Array.isArray(result?.items) && !result?.error) {
+      itemCache.current.set(key, { items: result.items, expiresAt: Date.now() + ttlMs });
+      setArtworkRevision(revision => revision + 1);
+    }
+    return result;
+  }, []);
 
   useEffect(() => {
     setHistory([]);
@@ -129,19 +164,23 @@ export function BrowserPage() {
     setError(null);
     try {
       let result: any;
+      const cacheKey = `tab:${selectedSection}:${tab}`;
+      const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
       if (tab === 'recent') {
-        result = await call('get_recently_played', selectedSection, 100);
+        result = await cachedItems(cacheKey, ttl, () => call('get_recently_played', selectedSection, 100));
+      } else if (tab === 'recentlyAdded') {
+        result = await cachedItems(cacheKey, ttl, () => call('get_recently_added', selectedSection, 100));
       } else if (tab === 'playlists') {
-        result = await call('get_audio_playlists', 100);
+        result = await cachedItems(cacheKey, ttl, () => call('get_audio_playlists', 100));
       } else {
         const typeFilter = tab === 'artists' ? 'artist' : tab === 'albums' ? 'album' : 'track';
-        result = await call("get_section_contents", selectedSection, typeFilter, 100);
+        result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100));
       }
-      if (result.items) {
-        setItems(result.items);
-      } else if (result.error) {
+      if (result.error) {
         setError(result.error);
         setItems([]);
+      } else if (Array.isArray(result.items)) {
+        setItems(result.items);
       } else {
         setItems([]);
       }
@@ -151,16 +190,16 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedSection]);
+  }, [selectedSection, cachedItems]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
-    setSubView({ type: 'albums', title: artistName || 'Albums' });
+    setSubView({ type: 'albums', title: artistName || 'Albums', id: artistId });
     try {
-      const result: any = await call("get_metadata_children", artistId);
-      if (result.items) {
+      const result: any = await cachedItems(`children:${artistId}`, 300000, () => call("get_metadata_children", artistId));
+      if (Array.isArray(result.items)) {
         setItems(result.items);
       } else {
         setItems([]);
@@ -171,16 +210,16 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [items, subView, searchQuery]);
+  }, [items, subView, searchQuery, cachedItems]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
-    setSubView({ type: 'tracks', title: playlistName || 'Playlist' });
+    setSubView({ type: 'tracks', title: playlistName || 'Playlist', id: playlistId, queueLabel: 'Play Playlist' });
     try {
-      const result: any = await call('get_playlist_tracks', playlistId, 200);
-      if (result.items) setItems(result.items);
+      const result: any = await cachedItems(`playlist:${playlistId}`, 60000, () => call('get_playlist_tracks', playlistId, 200));
+      if (Array.isArray(result.items)) setItems(result.items);
       else { setItems([]); if (result.error) setError(result.error); }
     } catch {
       setError('Failed to load playlist tracks.');
@@ -188,16 +227,16 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [items, subView, searchQuery]);
+  }, [items, subView, searchQuery, cachedItems]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
     setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
-    setSubView({ type: 'tracks', title: albumName || 'Tracks' });
+    setSubView({ type: 'tracks', title: albumName || 'Tracks', id: albumId, queueLabel: 'Play Album' });
     try {
-      const result: any = await call("get_metadata_children", albumId);
-      if (result.items) {
+      const result: any = await cachedItems(`children:${albumId}`, 300000, () => call("get_metadata_children", albumId));
+      if (Array.isArray(result.items)) {
         setItems(result.items);
       } else {
         setItems([]);
@@ -208,7 +247,7 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [items, subView, searchQuery]);
+  }, [items, subView, searchQuery, cachedItems]);
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
@@ -217,8 +256,9 @@ export function BrowserPage() {
     setError(null);
     setSubView({ type: 'search', title: 'Search Results' });
     try {
-      const result: any = await call("search_library", searchQuery, selectedSection, 30);
-      if (result.items) {
+      const cacheKey = `search:${selectedSection}:${searchQuery.trim().toLowerCase()}`;
+      const result: any = await cachedItems(cacheKey, 30000, () => call("search_library", searchQuery, selectedSection, 30));
+      if (Array.isArray(result.items)) {
         setItems(result.items);
       }
     } catch (e) {
@@ -226,32 +266,25 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [searchQuery, selectedSection, items, subView]);
+  }, [searchQuery, selectedSection, items, subView, cachedItems]);
 
-  const handlePlayTrack = useCallback(async (item: LibraryItem) => {
+  const startTrackQueue = useCallback(async (sourceItems: LibraryItem[], startId?: string) => {
     try {
-      console.log(`[DeckyPlex] Playing track: ${item.title} (id: ${item.id})`);
-      const trackQueue = items.filter(entry => entry.type === 'track').map(entry => ({
+      const trackQueue = sourceItems.filter(entry => entry.type === 'track').map(entry => ({
         id: entry.id,
         sectionId: selectedSection,
         title: entry.title || 'Unknown',
-        artist: entry.grandparentTitle || '',
+        artist: entry.grandparentTitle || entry.artist || '',
         album: entry.parentTitle || '',
         duration: entry.duration || 0,
-        thumb: entry.thumb || '',
+        thumb: versionArtwork(entry.thumb || '', artworkRevision),
       }));
-      const trackInfo = {
-        id: item.id,
-        sectionId: selectedSection,
-        title: item.title || 'Unknown',
-        artist: item.grandparentTitle || '',
-        album: item.parentTitle || '',
-        duration: item.duration || 0,
-        thumb: item.thumb || '',
-      };
+      if (!trackQueue.length) throw new Error('No tracks found to play.');
+      const trackInfo = trackQueue.find(track => track.id === startId) || trackQueue[0];
+      itemCache.current.delete(`tab:${selectedSection}:recent`);
       // Get stream URL first, then play — playTrack must be called with a valid URL
       // so audio.play() can start immediately from this call stack.
-      const result: any = await call("play_track", item.id, selectedSection);
+      const result: any = await call("play_track", trackInfo.id, selectedSection);
       console.log(`[DeckyPlex] play_track result:`, result);
       if (!result?.success) {
         const message = result?.error || "Plex did not return a playable audio stream.";
@@ -261,7 +294,7 @@ export function BrowserPage() {
       }
       if (result.stream_url) {
         console.log(`[DeckyPlex] Got stream URL, starting playback`);
-        playTrack(result.stream_url, trackInfo, trackQueue);
+        playTrack(result.stream_url, trackInfo, trackQueue, result.fallback_stream_url || '');
       } else {
         setError("Plex returned no audio stream URL.");
       }
@@ -269,7 +302,31 @@ export function BrowserPage() {
       console.error(`[DeckyPlex] play_track exception:`, e);
       setError("Failed to play track.");
     }
-  }, [selectedSection, playTrack, items]);
+  }, [selectedSection, playTrack, artworkRevision]);
+
+  const handlePlayTrack = useCallback((item: LibraryItem) => {
+    void startTrackQueue(items, item.id);
+  }, [items, startTrackQueue]);
+
+  const handlePlayCollection = useCallback(async () => {
+    if (!subView) return;
+    if (subView.type === 'albums' && subView.id) {
+      setLoading(true);
+      setError(null);
+      try {
+        const result: any = await cachedItems(`artistTracks:${subView.id}`, 300000,
+          () => call('get_artist_tracks', subView.id));
+        if (result.error) throw new Error(result.error);
+        await startTrackQueue(result.items || []);
+      } catch (e: any) {
+        setError(e?.message || 'Failed to load artist tracks.');
+      } finally {
+        setLoading(false);
+      }
+    } else {
+      await startTrackQueue(items);
+    }
+  }, [subView, cachedItems, startTrackQueue, items]);
 
   const handleItemClick = useCallback((item: LibraryItem) => {
     if (item.type === 'artist') {
@@ -300,8 +357,36 @@ export function BrowserPage() {
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const gridView = subView?.type === 'albums' || (!subView && ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab));
+
   const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
-    const imageUrl = item.type === 'artist' ? (item.art || item.thumb) : (item.thumb || item.art);
+    const imageUrl = versionArtwork(item.type === 'artist' ? (item.art || item.thumb || '') : (item.thumb || item.art || ''), artworkRevision);
+    const fallbackIcon = item.type === 'track' ? <FaMusic /> : item.type === 'album' ? <FaCompactDisc /> : item.type === 'playlist' ? <FaListUl /> : <FaUser />;
+    if (gridView) {
+      return (
+        <Focusable
+          key={idx}
+          onActivate={onClick}
+          onClick={onClick}
+          style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0.35rem', gap: '0.3rem' }}
+        >
+          <div style={{ width: '100%', aspectRatio: '1 / 1', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            {imageUrl ? <img src={imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
+          </div>
+          <DialogBodyText style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {item.title || '(unknown)'}
+          </DialogBodyText>
+          {(item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle)) && (
+            <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {item.artist || item.grandparentTitle || item.parentTitle}
+            </DialogBodyText>
+          )}
+          {item.type === 'playlist' && item.leafCount != null && (
+            <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65 }}>{item.leafCount} tracks</DialogBodyText>
+          )}
+        </Focusable>
+      );
+    }
     return (
       <Focusable
         key={idx}
@@ -332,10 +417,7 @@ export function BrowserPage() {
               </div>
             ) : (
               <div style={{ minWidth: '1.5rem', textAlign: 'center' }}>
-                {item.type === 'track' && <FaMusic size={12} />}
-                {item.type === 'album' && <FaCompactDisc size={12} />}
-                {item.type === 'artist' && <FaUser size={12} />}
-                {item.type === 'playlist' && <FaListUl size={12} />}
+                {fallbackIcon}
               </div>
             )}
             <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -347,9 +429,9 @@ export function BrowserPage() {
                   {item.parentTitle}
                 </DialogBodyText>
               )}
-              {item.type === 'album' && item.grandparentTitle && (
+              {item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle) && (
                 <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
-                  {item.grandparentTitle}
+                  {item.artist || item.grandparentTitle || item.parentTitle}
                 </DialogBodyText>
               )}
               {item.type === 'album' && item.leafCount != null && item.leafCount > 0 && (
@@ -394,21 +476,25 @@ export function BrowserPage() {
 
     return (
       <PanelSection>
-        {subView && (
-          <PanelSectionRow>
-            <ButtonItem onClick={goBack}>← Back</ButtonItem>
-            <DialogBodyText style={{ flex: 1, fontWeight: 500 }}>
-              {subView.title}
-            </DialogBodyText>
-          </PanelSectionRow>
-        )}
+        <PanelSectionRow>
+          {subView && <ButtonItem onClick={goBack}>← Back</ButtonItem>}
+          <DialogLabel style={{ flex: 1, minWidth: 0 }}>
+            {subView?.title || (activeTab === 'recentlyAdded' ? 'Recently Added' : activeTab === 'recent' ? 'Recently Played' : activeTab === 'playlists' ? 'Playlists' : activeTab === 'search' ? 'Search' : activeTab === 'tracks' ? 'Songs' : activeTab[0].toUpperCase() + activeTab.slice(1))}
+          </DialogLabel>
+          {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
+          {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
+            <Button onClick={handlePlayCollection} disabled={loading}>
+              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
+            </Button>
+          )}
+        </PanelSectionRow>
 
         {!subView && activeTab === 'search' && (
           <PanelSectionRow>
             <Focusable flow-children="horizontal" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
                 label=""
-                style={{ flex: '1 1 0', minWidth: '240px', width: '100%', boxSizing: 'border-box' }}
+                style={{ flex: '1 1 32rem', minWidth: '320px', width: '32rem', maxWidth: '70vw', boxSizing: 'border-box' }}
                 value={searchQuery}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
                 placeholder="Search artists, albums, tracks..."
@@ -426,29 +512,43 @@ export function BrowserPage() {
           </PanelSectionRow>
         )}
 
-        {loading && (
-          <PanelSectionRow>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-              <Spinner />
-              <DialogBodyText>Loading...</DialogBodyText>
-            </div>
-          </PanelSectionRow>
-        )}
-
         {error && (
           <PanelSectionRow>
             <DialogBodyText style={{ color: '#ff6b6b' }}>{error}</DialogBodyText>
           </PanelSectionRow>
         )}
 
+        {gridView && items.length > 0 && (
+          <PanelSectionRow>
+            <SliderField
+              label={`Grid columns: ${gridColumns}`}
+              min={3}
+              max={8}
+              step={1}
+              value={gridColumns}
+              onChange={(value: number) => setGridColumns(Math.round(value))}
+              showValue={false}
+            />
+          </PanelSectionRow>
+        )}
+
         {!loading && !error && items.length > 0 && (
           <PanelSectionRow>
-            <div style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
-            {items.map((item, idx) => {
-              const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
-              return renderItemRow(item, idx, handleClick);
-            })}
-            </div>
+            {gridView ? (
+              <Focusable flow-children="grid" style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
+                {items.map((item, idx) => {
+                  const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
+                  return renderItemRow(item, idx, handleClick);
+                })}
+              </Focusable>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
+                {items.map((item, idx) => {
+                  const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
+                  return renderItemRow(item, idx, handleClick);
+                })}
+              </div>
+            )}
           </PanelSectionRow>
         )}
 
@@ -464,17 +564,28 @@ export function BrowserPage() {
             <DialogBodyText style={{ opacity: 0.5 }}>No results found.</DialogBodyText>
           </PanelSectionRow>
         )}
+        {!loading && !error && items.length === 0 && subView?.type === 'albums' && (
+          <PanelSectionRow>
+            <DialogBodyText style={{ opacity: 0.5 }}>No albums found for this artist.</DialogBodyText>
+          </PanelSectionRow>
+        )}
+        {!loading && !error && items.length === 0 && subView?.type === 'tracks' && (
+          <PanelSectionRow>
+            <DialogBodyText style={{ opacity: 0.5 }}>No tracks found.</DialogBodyText>
+          </PanelSectionRow>
+        )}
       </PanelSection>
     );
   };
 
   // SidebarNavigation pages - each tab triggers setActiveTab via effect
-  const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'recent', 'playlists', 'search'];
+  const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'recent', 'recentlyAdded', 'playlists', 'search'];
   const tabConfig = [
     { title: 'Artists', icon: <FaUser /> },
     { title: 'Albums', icon: <FaCompactDisc /> },
     { title: 'Songs', icon: <FaMusic /> },
     { title: 'Recently Played', icon: <FaHistory /> },
+    { title: 'Recently Added', icon: <FaCompactDisc /> },
     { title: 'Playlists', icon: <FaListUl /> },
     { title: 'Search', icon: <FaSearch /> },
   ];
