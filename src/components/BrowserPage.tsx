@@ -48,6 +48,7 @@ interface BrowserHistoryEntry {
   items: LibraryItem[];
   subView: BrowserSubView;
   searchQuery: string;
+  focusedItemId?: string;
 }
 
 export function BrowserPage() {
@@ -64,6 +65,7 @@ export function BrowserPage() {
   const [gridColumns, setGridColumns] = useState(5);
   const [gridPreferenceSet, setGridPreferenceSet] = useState(false);
   const [artworkRevision, setArtworkRevision] = useState(0);
+  const [restoreFocusTick, setRestoreFocusTick] = useState(0);
   const itemCache = useRef(new Map<string, ItemCacheEntry>());
   const firstItemRef = useRef<HTMLDivElement | null>(null);
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
@@ -72,6 +74,10 @@ export function BrowserPage() {
   const actionDialogRef = useRef<{ Close: () => void } | null>(null);
   const focusZone = useRef<'sidebar' | 'content'>('content');
   const sidebarRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const focusedItemId = useRef<string | undefined>(undefined);
+  const pendingFocusId = useRef<string | undefined>(undefined);
+  const enterContentPending = useRef(false);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cached = itemCache.current.get(key);
@@ -96,6 +102,9 @@ export function BrowserPage() {
       setItems(previous.items);
       setSubView(previous.subView);
       setSearchQuery(previous.searchQuery);
+      focusedItemId.current = previous.focusedItemId;
+      pendingFocusId.current = previous.focusedItemId;
+      setRestoreFocusTick(value => value + 1);
     } else {
       Navigation.NavigateBack();
     }
@@ -167,13 +176,31 @@ export function BrowserPage() {
   }, [connected]);
 
   useEffect(() => {
-    if (loading || items.length === 0) return;
+    if (loading || focusZone.current === 'sidebar') return;
     const frame = window.requestAnimationFrame(() => {
-      if (subView?.type === 'tracks') playCollectionRef.current?.focus();
-      else firstItemRef.current?.focus();
+      if (pendingFocusId.current) {
+        const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
+          .find(element => element.dataset.browserItemId === pendingFocusId.current);
+        if (target) {
+          target.focus();
+          pendingFocusId.current = undefined;
+          return;
+        }
+      }
+      if (enterContentPending.current) {
+        enterContentPending.current = false;
+        if (subView?.type === 'tracks') playCollectionRef.current?.focus();
+        else if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+        else firstItemRef.current?.focus();
+        return;
+      }
+      if (items.length > 0 && (subView?.type === 'tracks' || subView?.type === 'albums')) {
+        if (subView.type === 'tracks') playCollectionRef.current?.focus();
+        else firstItemRef.current?.focus();
+      }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [loading, items, subView, activeTab]);
+  }, [loading, items, subView, activeTab, restoreFocusTick]);
 
   const saveGridColumns = useCallback(async (columns = gridColumns) => {
     try {
@@ -267,7 +294,7 @@ export function BrowserPage() {
   }, [selectedSection, cachedItems]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'albums', title: artistName || 'Albums', id: artistId });
@@ -287,7 +314,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: playlistName || 'Playlist', id: playlistId, queueLabel: 'Play Playlist' });
@@ -304,7 +331,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: albumName || 'Tracks', id: albumId, queueLabel: 'Play Album' });
@@ -325,7 +352,7 @@ export function BrowserPage() {
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
-    setHistory(previous => [...previous, { items, subView, searchQuery }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'search', title: 'Search Results' });
@@ -446,6 +473,8 @@ export function BrowserPage() {
         <Focusable
           key={idx}
           ref={idx === 0 ? firstItemRef : undefined}
+          data-browser-item-id={item.id}
+          onFocus={() => { focusedItemId.current = item.id; }}
           onActivate={onClick}
           onClick={onClick}
           onCancel={handleCancel}
@@ -531,6 +560,8 @@ export function BrowserPage() {
         <Focusable
             key={idx}
             ref={idx === 0 ? firstItemRef : undefined}
+            data-browser-item-id={item.id}
+            onFocus={() => { focusedItemId.current = item.id; }}
             onActivate={onClick}
             onClick={onClick}
             onCancel={handleCancel}
@@ -547,7 +578,8 @@ export function BrowserPage() {
       );
     }
     return (
-      <Focusable key={idx} ref={idx === 0 ? firstItemRef : undefined} onActivate={onClick} onClick={onClick}
+      <Focusable key={idx} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id}
+        onFocus={() => { focusedItemId.current = item.id; }} onActivate={onClick} onClick={onClick}
         onCancel={handleCancel} style={rowStyle}>
         {rowDetails}
       </Focusable>
@@ -687,7 +719,15 @@ export function BrowserPage() {
       }}
       style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0, overflow: 'hidden' }}
     >
-      <div data-browser-zone="sidebar" ref={sidebarRef} style={{ width: '22%', minWidth: '180px', maxWidth: '260px', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)', padding: '0.35rem 0.45rem 0.5rem 0.2rem', overflowY: 'auto' }}>
+      <div data-browser-zone="sidebar" ref={sidebarRef}
+        onFocusCapture={(event) => {
+          const button = event.target instanceof HTMLElement ? event.target.closest('button,[role="button"]') : null;
+          const buttons = Array.from(sidebarRef.current?.querySelectorAll('button,[role="button"]') || []);
+          const index = button ? buttons.indexOf(button) : -1;
+          if (index >= 0 && tabKeys[index] !== activeTab) setActiveTab(tabKeys[index]);
+          focusZone.current = 'sidebar';
+        }}
+        style={{ width: '22%', minWidth: '180px', maxWidth: '260px', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)', padding: '0.35rem 0.45rem 0.5rem 0.2rem', overflowY: 'auto' }}>
         <DialogLabel style={{ display: 'block', padding: '0.5rem 0.65rem 0.8rem' }}>DeckyPlex</DialogLabel>
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
           {tabConfig.map((config, idx) => (
@@ -697,12 +737,20 @@ export function BrowserPage() {
               icon={config.icon}
               layout="inline"
               bottomSeparator="none"
-              onClick={() => setActiveTab(tabKeys[idx])}
+              onClick={() => {
+                focusZone.current = 'content';
+                enterContentPending.current = true;
+                if (!loading && items.length > 0) {
+                  enterContentPending.current = false;
+                  if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+                  else firstItemRef.current?.focus();
+                }
+              }}
             />
           ))}
         </Focusable>
       </div>
-      <div data-browser-zone="content" style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '0.35rem' }}>
+      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '0.35rem' }}>
         {renderContent()}
       </div>
     </div>

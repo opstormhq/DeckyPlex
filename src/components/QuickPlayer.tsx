@@ -340,7 +340,7 @@ export function QuickPlayer() {
             <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
               {queue.slice(Math.max(0, queueIndex)).map((queuedTrack, index) => {
                 const actualIndex = Math.max(0, queueIndex) + index;
-                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', minHeight: '40px', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
+                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', minHeight: '0', height: '30px', padding: '0.05rem 0.35rem', fontSize: '0.82rem', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
                   <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
                 </Button>;
               })}
