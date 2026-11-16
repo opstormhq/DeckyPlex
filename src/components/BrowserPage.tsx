@@ -76,6 +76,7 @@ export function BrowserPage() {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
+  const pendingSearchFocus = useRef(false);
   const enterContentPending = useRef(false);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
@@ -184,29 +185,40 @@ export function BrowserPage() {
 
   useEffect(() => {
     if (loading || focusZone.current === 'sidebar') return;
+    let secondFrame = 0;
     const frame = window.requestAnimationFrame(() => {
-      if (pendingFocusId.current) {
-        const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
-          .find(element => element.dataset.browserItemId === pendingFocusId.current);
-        if (target) {
-          target.focus();
-          pendingFocusId.current = undefined;
+      secondFrame = window.requestAnimationFrame(() => {
+        if (pendingFocusId.current) {
+          const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
+            .find(element => element.dataset.browserItemId === pendingFocusId.current);
+          if (target) {
+            target.focus();
+            pendingFocusId.current = undefined;
+            return;
+          }
+        }
+        if (pendingSearchFocus.current) {
+          pendingSearchFocus.current = false;
+          firstItemRef.current?.focus();
           return;
         }
-      }
-      if (enterContentPending.current) {
-        enterContentPending.current = false;
-        if (subView?.type === 'tracks') playCollectionRef.current?.focus();
-        else if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
-        else firstItemRef.current?.focus();
-        return;
-      }
-      if (items.length > 0 && (subView?.type === 'tracks' || subView?.type === 'albums')) {
-        if (subView.type === 'tracks') playCollectionRef.current?.focus();
-        else firstItemRef.current?.focus();
-      }
+        if (enterContentPending.current) {
+          enterContentPending.current = false;
+          if (subView?.type === 'tracks') playCollectionRef.current?.focus();
+          else if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+          else firstItemRef.current?.focus();
+          return;
+        }
+        if (items.length > 0 && (subView?.type === 'tracks' || subView?.type === 'albums')) {
+          if (subView.type === 'tracks') playCollectionRef.current?.focus();
+          else firstItemRef.current?.focus();
+        }
+      });
     });
-    return () => window.cancelAnimationFrame(frame);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
   }, [loading, items, subView, activeTab, restoreFocusTick]);
 
   const saveGridColumns = useCallback(async (columns = gridColumns) => {
@@ -360,6 +372,7 @@ export function BrowserPage() {
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    pendingSearchFocus.current = true;
     setLoading(true);
     setError(null);
     setSubView({ type: 'search', title: 'Search Results' });
@@ -368,6 +381,9 @@ export function BrowserPage() {
       const result: any = await cachedItems(cacheKey, 30000, () => call("search_library", searchQuery, selectedSection, 30));
       if (Array.isArray(result.items)) {
         setItems(result.items);
+        if (result.items.length === 0) pendingSearchFocus.current = false;
+      } else {
+        pendingSearchFocus.current = false;
       }
     } catch (e) {
       setError("Search failed.");
@@ -478,7 +494,7 @@ export function BrowserPage() {
     if (gridView) {
       return (
         <Focusable
-          key={idx}
+          key={item.id}
           ref={idx === 0 ? firstItemRef : undefined}
           data-browser-item-id={item.id}
           onFocus={() => { focusedItemId.current = item.id; }}
@@ -559,7 +575,7 @@ export function BrowserPage() {
       const trackInfo = { id: item.id, sectionId: selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: versionArtwork(item.thumb || '', artworkRevision) };
       return (
         <Focusable
-            key={idx}
+          key={item.id}
             ref={idx === 0 ? firstItemRef : undefined}
             data-browser-item-id={item.id}
             onFocus={() => { focusedItemId.current = item.id; }}
@@ -579,7 +595,7 @@ export function BrowserPage() {
       );
     }
     return (
-      <Focusable key={idx} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id}
+      <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id}
         onFocus={() => { focusedItemId.current = item.id; }} onActivate={onClick} onClick={onClick}
         onCancel={handleCancel} style={rowStyle}>
         {rowDetails}
@@ -624,6 +640,7 @@ export function BrowserPage() {
 
         {!subView && activeTab === 'search' && (
           <PanelSectionRow>
+            <div style={{ width: '100%', padding: '0.55rem 0 0.7rem', boxSizing: 'border-box' }}>
               <Focusable flow-children="horizontal" onCancel={handleCancel} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
                 label=""
@@ -642,6 +659,7 @@ export function BrowserPage() {
                 <FaSearch />
               </Button>
             </Focusable>
+            </div>
           </PanelSectionRow>
         )}
 
@@ -657,6 +675,7 @@ export function BrowserPage() {
 
         {!loading && !error && items.length > 0 && (
           <PanelSectionRow>
+            <div style={{ width: '100%', paddingTop: subView?.type === 'search' ? '0.45rem' : 0, boxSizing: 'border-box' }}>
             {gridView ? (
               <Focusable flow-children="geometric" onCancel={handleCancel} style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
                 {items.map((item, idx) => {
@@ -672,13 +691,14 @@ export function BrowserPage() {
                 })}
               </Focusable>
             )}
+            </div>
           </PanelSectionRow>
         )}
 
-        {!loading && !error && items.length === 0 && !subView && (
+        {!loading && !error && items.length === 0 && !subView && activeTab !== 'search' && (
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.5 }}>
-              {activeTab === 'search' ? 'Enter a search term above to find music.' : 'No items found.'}
+              No items found.
             </DialogBodyText>
           </PanelSectionRow>
         )}
@@ -744,7 +764,7 @@ export function BrowserPage() {
               }}
               onActivate={enterContent}
               onClick={enterContent}
-              style={{ display: 'inline-flex', alignSelf: 'flex-start', width: 'fit-content', maxWidth: '100%', alignItems: 'center', gap: '0.55rem', padding: '0.4rem 0.55rem', whiteSpace: 'nowrap' }}
+              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', borderRadius: '4px', whiteSpace: 'nowrap' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{config.icon}</span>
               <span style={{ fontWeight: activeTab === tabKeys[idx] ? 600 : 400 }}>{config.title}</span>
