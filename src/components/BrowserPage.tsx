@@ -48,6 +48,7 @@ interface BrowserHistoryEntry {
   subView: BrowserSubView;
   searchQuery: string;
   focusedItemId?: string;
+  scrollTop: number;
 }
 
 export function BrowserPage() {
@@ -79,6 +80,7 @@ export function BrowserPage() {
   const contentRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
+  const pendingScrollTop = useRef<number | undefined>(undefined);
   const pendingSearchFocus = useRef(false);
   const loadingMoreRef = useRef(false);
   const enterContentPending = useRef(false);
@@ -115,6 +117,7 @@ export function BrowserPage() {
       setSearchQuery(previous.searchQuery);
       focusedItemId.current = previous.focusedItemId;
       pendingFocusId.current = previous.focusedItemId;
+      pendingScrollTop.current = previous.scrollTop;
       setRestoreFocusTick(value => value + 1);
     } else {
       Navigation.NavigateBack();
@@ -196,7 +199,11 @@ export function BrowserPage() {
           const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
             .find(element => element.dataset.browserItemId === pendingFocusId.current);
           if (target) {
-            target.focus();
+            if (pendingScrollTop.current != null && contentRef.current) {
+              contentRef.current.scrollTop = pendingScrollTop.current;
+              pendingScrollTop.current = undefined;
+            }
+            target.focus({ preventScroll: true });
             pendingFocusId.current = undefined;
             return;
           }
@@ -347,7 +354,7 @@ export function BrowserPage() {
   }, [tabHasMore, selectedSection, subView, activeTab, items.length, cachedItems]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
@@ -368,7 +375,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
@@ -386,7 +393,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
     setError(null);
@@ -408,7 +415,7 @@ export function BrowserPage() {
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current }]);
+    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     pendingSearchFocus.current = true;
     setLoading(true);
     setError(null);
@@ -495,6 +502,7 @@ export function BrowserPage() {
   }, [subView, cachedItems, startTrackQueue, items]);
 
   const handleItemClick = useCallback((item: LibraryItem) => {
+    focusedItemId.current = item.id;
     if (item.type === 'artist') {
       loadAlbums(item.id, item.title);
     } else if (item.type === 'album') {
@@ -507,6 +515,7 @@ export function BrowserPage() {
   }, [loadAlbums, loadTracks, loadPlaylistTracks, handlePlayTrack]);
 
   const handleSearchItemClick = useCallback((item: LibraryItem) => {
+    focusedItemId.current = item.id;
     if (item.type === 'track') {
       handlePlayTrack(item);
     } else if (item.type === 'album') {
@@ -807,15 +816,15 @@ export function BrowserPage() {
               }}
               onActivate={enterContent}
               onClick={enterContent}
-              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', borderRadius: '4px', whiteSpace: 'nowrap' }}
+              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tabKeys[idx] ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tabKeys[idx] ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px', whiteSpace: 'nowrap' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{config.icon}</span>
-              <span style={{ fontWeight: activeTab === tabKeys[idx] ? 600 : 400 }}>{config.title}</span>
+              <span style={{ fontWeight: 400 }}>{config.title}</span>
             </Focusable>
           ))}
         </Focusable>
       </div>
-      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '0.35rem' }}>
+      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, overflowY: 'auto', padding: '0.55rem 0.35rem 0 0', boxSizing: 'border-box' }}>
         {renderContent()}
       </div>
     </div>
