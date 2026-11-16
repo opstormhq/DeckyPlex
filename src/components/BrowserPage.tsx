@@ -4,14 +4,15 @@ import {
   PanelSectionRow,
   DialogBodyText,
   DialogLabel,
-  ButtonItem,
   Button,
   Focusable,
   SliderField,
   TextField,
   Spinner,
   SidebarNavigation,
+  ModalRoot,
   Navigation,
+  showModal,
 } from '@decky/ui';
 import { call } from '@decky/api';
 import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay } from 'react-icons/fa';
@@ -36,6 +37,8 @@ interface LibraryItem {
 }
 
 type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search';
+const BROWSER_ROUTE = '/deckyplex-browser';
+const browserTabRoute = (tab: BrowserTab) => `${BROWSER_ROUTE}/${tab}`;
 type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string; id?: string; queueLabel?: string } | null;
 interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; }
 
@@ -50,7 +53,7 @@ interface BrowserHistoryEntry {
 }
 
 export function BrowserPage() {
-  const { playTrack } = usePlayer();
+  const { playTrack, playRemoteQueue, remoteMode, remotePlayerName, addToQueue } = usePlayer();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -60,24 +63,16 @@ export function BrowserPage() {
   const [connected, setConnected] = useState(false);
   const [subView, setSubView] = useState<BrowserSubView>(null);
   const [history, setHistory] = useState<BrowserHistoryEntry[]>([]);
-  const [gridColumns, setGridColumns] = useState(() => {
-    try {
-      const saved = Number(window.localStorage.getItem('deckyplex-grid-columns'));
-      return Number.isInteger(saved) && saved >= 3 && saved <= 8 ? saved : 5;
-    } catch {
-      return 5;
-    }
-  });
+  const [gridColumns, setGridColumns] = useState(5);
+  const [gridPreferenceSet, setGridPreferenceSet] = useState(false);
   const [artworkRevision, setArtworkRevision] = useState(0);
   const itemCache = useRef(new Map<string, ItemCacheEntry>());
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem('deckyplex-grid-columns', String(gridColumns));
-    } catch (e) {
-      console.warn('[DeckyPlex] Could not save grid column preference:', e);
-    }
-  }, [gridColumns]);
+  const firstItemRef = useRef<HTMLDivElement | null>(null);
+  const playCollectionRef = useRef<HTMLDivElement | null>(null);
+  const gridDialogRef = useRef<{ Close: () => void } | null>(null);
+  const gridPromptShown = useRef(false);
+  const focusedTrackButton = useRef<HTMLDivElement | null>(null);
+  const queueActionHasFocus = useRef(false);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cached = itemCache.current.get(key);
@@ -107,27 +102,57 @@ export function BrowserPage() {
     }
   }, [history]);
 
+  const handleCancel = useCallback((event: Event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if (history.length > 0) goBack();
+    else Navigation.NavigateBack();
+  }, [history.length, goBack]);
+
+  const handleTrackRowCancel = useCallback((event: Event) => {
+    if (queueActionHasFocus.current && focusedTrackButton.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      queueActionHasFocus.current = false;
+      focusedTrackButton.current.focus();
+      return;
+    }
+    handleCancel(event);
+  }, [handleCancel]);
+
   useEffect(() => {
     const onBackKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && history.length > 0) {
-        event.preventDefault();
-        event.stopPropagation();
-        event.stopImmediatePropagation();
-        goBack();
-      }
+      if (event.key === 'Escape') handleCancel(event);
     };
     window.addEventListener('keydown', onBackKey, true);
     return () => window.removeEventListener('keydown', onBackKey, true);
-  }, [history, goBack]);
+  }, [handleCancel]);
 
   // Check connection status periodically
   useEffect(() => {
     const checkConnection = async () => {
       try {
         const result: any = await call("get_settings");
+        const savedColumns = Number(result.grid_columns);
+        setGridPreferenceSet(Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 8);
+        if (Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 8) {
+          setGridColumns(savedColumns);
+        } else {
+          try {
+            const previousColumns = Number(window.localStorage.getItem('deckyplex-grid-columns'));
+            if (Number.isInteger(previousColumns) && previousColumns >= 3 && previousColumns <= 8) {
+              setGridColumns(previousColumns);
+            }
+          } catch {}
+        }
+        // The old release kept this preference in webview localStorage. Migrate
+        // it once so uninstalling DeckyPlex cannot leave a stale value behind.
+        try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
         const wasConnected = connected;
-        setConnected(!!(result.plex_token && result.selected_server_id));
-        if (!wasConnected && result.plex_token && result.selected_server_id) {
+        setConnected(!!(result.has_plex_token && result.selected_server_id));
+        if (!wasConnected && result.has_plex_token && result.selected_server_id) {
           loadSections();
         }
       } catch (e) {
@@ -138,6 +163,41 @@ export function BrowserPage() {
     const interval = setInterval(checkConnection, 15000);
     return () => clearInterval(interval);
   }, [connected]);
+
+  useEffect(() => {
+    if (loading || items.length === 0) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (subView?.type === 'tracks') playCollectionRef.current?.focus();
+      else firstItemRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [loading, items, subView, activeTab]);
+
+  const saveGridColumns = useCallback(async (columns = gridColumns) => {
+    try {
+      const result: any = await call('set_settings', { grid_columns: columns });
+      if (result?.error) throw new Error(result.error);
+      setGridColumns(columns);
+      setGridPreferenceSet(true);
+    } catch {
+      setError('Could not save browser layout preference. You can change it later in Settings > Browser.');
+    }
+  }, [gridColumns]);
+
+  const openGridColumnsDialog = useCallback(() => {
+    const close = () => gridDialogRef.current?.Close();
+    const cancel = () => setGridColumns(gridColumns);
+    gridDialogRef.current = showModal(<GridColumnsDialog initialColumns={gridColumns} onSave={saveGridColumns}
+      onPreview={setGridColumns} onCancel={cancel} onClose={close} />,
+      window, { strTitle: 'Browser layout', bNeverPopOut: true });
+  }, [gridColumns, saveGridColumns]);
+
+  useEffect(() => {
+    if (!connected || gridPreferenceSet || gridPromptShown.current) return;
+    gridPromptShown.current = true;
+    const timer = window.setTimeout(openGridColumnsDialog, 300);
+    return () => window.clearTimeout(timer);
+  }, [connected, gridPreferenceSet, openGridColumnsDialog]);
 
   const loadSections = useCallback(async () => {
     try {
@@ -282,6 +342,11 @@ export function BrowserPage() {
       if (!trackQueue.length) throw new Error('No tracks found to play.');
       const trackInfo = trackQueue.find(track => track.id === startId) || trackQueue[0];
       itemCache.current.delete(`tab:${selectedSection}:recent`);
+      if (remoteMode) {
+        const result = await playRemoteQueue(trackQueue, trackInfo.id);
+        if (!result.success) setError(result.error || 'Could not start playback on the selected remote player.');
+        return;
+      }
       // Get stream URL first, then play — playTrack must be called with a valid URL
       // so audio.play() can start immediately from this call stack.
       const result: any = await call("play_track", trackInfo.id, selectedSection);
@@ -302,7 +367,7 @@ export function BrowserPage() {
       console.error(`[DeckyPlex] play_track exception:`, e);
       setError("Failed to play track.");
     }
-  }, [selectedSection, playTrack, artworkRevision]);
+  }, [selectedSection, playTrack, playRemoteQueue, remoteMode, artworkRevision]);
 
   const handlePlayTrack = useCallback((item: LibraryItem) => {
     void startTrackQueue(items, item.id);
@@ -366,8 +431,10 @@ export function BrowserPage() {
       return (
         <Focusable
           key={idx}
+          ref={idx === 0 ? firstItemRef : undefined}
           onActivate={onClick}
           onClick={onClick}
+          onCancel={handleCancel}
           style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0.35rem', gap: '0.3rem' }}
         >
           <div style={{ width: '100%', aspectRatio: '1 / 1', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -387,23 +454,8 @@ export function BrowserPage() {
         </Focusable>
       );
     }
-    return (
-      <Focusable
-        key={idx}
-        flow-children="horizontal"
-        onActivate={onClick}
-        onClick={onClick}
-        style={{
-          display: 'flex', alignItems: 'center', width: '100%', gap: '0.75rem',
-          padding: '0.45rem 0.5rem', borderBottom: '1px solid rgba(255,255,255,0.08)',
-        }}
-      >
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '0.5rem',
-            width: '100%',
-          }}>
+    const rowDetails = (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
             {imageUrl ? (
               <div style={{
                 width: '40px',
@@ -456,7 +508,37 @@ export function BrowserPage() {
                 {formatDuration(item.duration)}
               </DialogBodyText>
             )}
+      </div>
+    );
+    const rowStyle = { display: 'flex', alignItems: 'center', width: '100%', gap: '0.75rem', padding: '0.45rem 0.5rem', borderBottom: '1px solid rgba(255,255,255,0.08)' };
+    if (item.type === 'track') {
+      const trackInfo = { id: item.id, sectionId: selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: versionArtwork(item.thumb || '', artworkRevision) };
+      return (
+        <Focusable key={idx} flow-children="horizontal" onCancel={handleTrackRowCancel} style={rowStyle}>
+          <Focusable
+            flow-children="horizontal"
+            ref={idx === 0 ? firstItemRef : undefined}
+            onActivate={onClick}
+            onClick={onClick}
+            onCancel={handleTrackRowCancel}
+            onFocus={() => { queueActionHasFocus.current = false; }}
+            style={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}
+          >
+            {rowDetails}
+          </Focusable>
+          <div onFocus={(event) => { queueActionHasFocus.current = true; focusedTrackButton.current = event.currentTarget.querySelector('button,[role="button"]'); }}>
+            <Button onClick={(event: MouseEvent) => { event.stopPropagation(); addToQueue(trackInfo, true); }}>Play Next</Button>
           </div>
+          <div onFocus={(event) => { queueActionHasFocus.current = true; focusedTrackButton.current = event.currentTarget.querySelector('button,[role="button"]'); }}>
+            <Button onClick={(event: MouseEvent) => { event.stopPropagation(); addToQueue(trackInfo); }}>+ Queue</Button>
+          </div>
+        </Focusable>
+      );
+    }
+    return (
+      <Focusable key={idx} ref={idx === 0 ? firstItemRef : undefined} onActivate={onClick} onClick={onClick}
+        onCancel={handleCancel} style={rowStyle}>
+        {rowDetails}
       </Focusable>
     );
   };
@@ -477,21 +559,30 @@ export function BrowserPage() {
     return (
       <PanelSection>
         <PanelSectionRow>
-          {subView && <ButtonItem onClick={goBack}>← Back</ButtonItem>}
           <DialogLabel style={{ flex: 1, minWidth: 0 }}>
             {subView?.title || (activeTab === 'recentlyAdded' ? 'Recently Added' : activeTab === 'recent' ? 'Recently Played' : activeTab === 'playlists' ? 'Playlists' : activeTab === 'search' ? 'Search' : activeTab === 'tracks' ? 'Songs' : activeTab[0].toUpperCase() + activeTab.slice(1))}
           </DialogLabel>
           {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
           {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
+            <Focusable ref={playCollectionRef} onCancel={handleCancel} style={{ display: 'contents' }}>
             <Button onClick={handlePlayCollection} disabled={loading}>
-              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
+              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
             </Button>
+            </Focusable>
           )}
         </PanelSectionRow>
 
+        {remoteMode && (
+          <PanelSectionRow>
+            <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem' }}>
+              Playback target: {remotePlayerName || 'remote Plex player'}
+            </DialogBodyText>
+          </PanelSectionRow>
+        )}
+
         {!subView && activeTab === 'search' && (
           <PanelSectionRow>
-            <Focusable flow-children="horizontal" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
+              <Focusable flow-children="horizontal" onCancel={handleCancel} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
                 label=""
                 style={{ flex: '1 1 32rem', minWidth: '320px', width: '32rem', maxWidth: '70vw', boxSizing: 'border-box' }}
@@ -518,36 +609,26 @@ export function BrowserPage() {
           </PanelSectionRow>
         )}
 
-        {gridView && items.length > 0 && (
-          <PanelSectionRow>
-            <SliderField
-              label={`Grid columns: ${gridColumns}`}
-              min={3}
-              max={8}
-              step={1}
-              value={gridColumns}
-              onChange={(value: number) => setGridColumns(Math.round(value))}
-              showValue={false}
-            />
-          </PanelSectionRow>
+        {gridView && !gridPreferenceSet && (
+          <PanelSectionRow><Button onClick={openGridColumnsDialog}>Choose browser grid width</Button></PanelSectionRow>
         )}
 
         {!loading && !error && items.length > 0 && (
           <PanelSectionRow>
             {gridView ? (
-              <Focusable flow-children="grid" style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
+              <Focusable flow-children="geometric" onCancel={handleCancel} style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
                 {items.map((item, idx) => {
                   const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
                 })}
               </Focusable>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
+              <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
                 {items.map((item, idx) => {
                   const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
                 })}
-              </div>
+              </Focusable>
             )}
           </PanelSectionRow>
         )}
@@ -578,7 +659,6 @@ export function BrowserPage() {
     );
   };
 
-  // SidebarNavigation pages - each tab triggers setActiveTab via effect
   const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'recent', 'recentlyAdded', 'playlists', 'search'];
   const tabConfig = [
     { title: 'Artists', icon: <FaUser /> },
@@ -593,27 +673,54 @@ export function BrowserPage() {
   const pages = tabConfig.map((config, idx) => ({
     title: config.title,
     icon: config.icon,
-    content: (
-      <TabActivator tab={tabKeys[idx]} onActivate={setActiveTab}>
-        {renderContent()}
-      </TabActivator>
-    ),
+    identifier: tabKeys[idx],
+    route: browserTabRoute(tabKeys[idx]),
+    content: renderContent(),
   }));
 
   return (
     <div style={{ marginTop: '40px', height: 'calc(100% - 40px)' }}>
-      <SidebarNavigation
-        title="DeckyPlex"
-        showTitle
-        pages={pages}
-      />
+      <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
+        <SidebarNavigation
+          title="DeckyPlex"
+          showTitle
+          pages={pages}
+          page={browserTabRoute(activeTab)}
+          onPageRequested={(page) => {
+            const prefix = `${BROWSER_ROUTE}/`;
+            const requestedTab = page.startsWith(prefix) ? page.slice(prefix.length) : page;
+            if (tabKeys.includes(requestedTab as BrowserTab)) setActiveTab(requestedTab as BrowserTab);
+          }}
+        />
+      </Focusable>
     </div>
   );
 }
 
-function TabActivator({ tab, onActivate, children }: { tab: BrowserTab; onActivate: (t: BrowserTab) => void; children: React.ReactNode }) {
-  useEffect(() => {
-    onActivate(tab);
-  }, [tab, onActivate]);
-  return <>{children}</>;
+function GridColumnsDialog({ initialColumns, onSave, onPreview, onCancel, onClose }: {
+  initialColumns: number;
+  onSave: (columns: number) => void;
+  onPreview: (columns: number) => void;
+  onCancel: () => void;
+  onClose: () => void;
+}) {
+  const [columns, setColumns] = useState(initialColumns);
+  const close = onClose;
+  const cancel = () => { onCancel(); close(); };
+  return (
+    <ModalRoot closeModal={cancel} onCancel={cancel}>
+      <PanelSection title="Choose grid width">
+        <PanelSectionRow>
+          <SliderField label={`${columns} columns`} min={3} max={8} step={1} value={columns}
+            onChange={(value: number) => { const next = Math.round(value); setColumns(next); onPreview(next); }} />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', width: '100%' }}>
+            <Button onClick={cancel}>Cancel</Button>
+            <Button onClick={() => { onSave(columns); close(); }}>Save</Button>
+          </Focusable>
+        </PanelSectionRow>
+      </PanelSection>
+    </ModalRoot>
+  );
 }

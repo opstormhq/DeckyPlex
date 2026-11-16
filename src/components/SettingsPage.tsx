@@ -5,27 +5,37 @@ import {
   PanelSectionRow,
   DialogBodyText,
   ButtonItem,
+  Button,
+  TextField,
+  SliderField,
+  DialogCheckbox,
   SidebarNavigation,
 } from '@decky/ui';
 import { call } from '@decky/api';
-import { FaUser, FaServer, FaMusic } from 'react-icons/fa';
+import { FaUser, FaServer, FaMusic, FaCog, FaTh } from 'react-icons/fa';
 
 interface Settings {
   plexamp_url: string;
   plex_server_url: string;
   plex_token: string;
+  has_plex_token: boolean;
   selected_server_id: string;
   selected_server_name: string;
   selected_server_url: string;
   selected_player_id: string;
+  selected_player_name: string;
   logged_in_username: string;
   server_access_token: string;
+  manual_server_url: string;
+  playback_target: 'local' | 'remote';
+  connection_timeout: number;
+  verify_tls: boolean;
+  grid_columns: number;
 }
 
 interface Server {
   id: string;
   name: string;
-  access_token?: string;
   base_url?: string;
 }
 
@@ -34,18 +44,26 @@ interface Player {
   product: string;
   machineIdentifier: string;
   state: string;
+  platform?: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
   plexamp_url: "",
   plex_server_url: "",
   plex_token: "",
+  has_plex_token: false,
   selected_server_id: "",
   selected_server_name: "",
   selected_server_url: "",
   selected_player_id: "",
+  selected_player_name: "",
   logged_in_username: "",
   server_access_token: "",
+  manual_server_url: "",
+  playback_target: "local",
+  connection_timeout: 8,
+  verify_tls: false,
+  grid_columns: 0,
 };
 
 export function SettingsPage() {
@@ -56,6 +74,7 @@ export function SettingsPage() {
   const [pinCode, setPinCode] = useState<string>("");
   const [pinUrl, setPinUrl] = useState<string>("");
   const [loggingIn, setLoggingIn] = useState(false);
+  const [refreshingPlayers, setRefreshingPlayers] = useState(false);
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -64,48 +83,47 @@ export function SettingsPage() {
     return call("set_settings", s).then((result: any) => {
       if (result?.error) {
         setStatus("Failed to save settings: " + result.error);
+      } else {
+        window.dispatchEvent(new Event('deckyplex-settings-change'));
       }
+      return result;
     }).catch(() => {
       setStatus("Failed to save settings.");
+      return { error: "Failed to save settings." };
     });
   }, []);
 
   const callWithTimeout = (method: string, timeoutMs: number = 5000, ...args: any[]): Promise<any> => {
-    return Promise.race([
-      call(method, ...args),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error(`Backend call timed out (${timeoutMs/1000}s): ${method}`)), timeoutMs)
-      ),
-    ]);
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(
+        () => reject(new Error(`Backend call timed out (${timeoutMs / 1000}s): ${method}`)), timeoutMs,
+      );
+      call(method, ...args).then(resolve, reject).finally(() => window.clearTimeout(timeout));
+    });
   };
 
   // Load settings on mount
   useEffect(() => {
     callWithTimeout("get_settings", 10000)
       .then((result: any) => {
+        settingsRef.current = result;
         setSettings(result);
-        // If no token, nothing to validate
-        if (!result.plex_token) return;
-
-        // If we have a token and server URL, just load servers in the background
-        if (result.selected_server_url) {
-          (async () => {
-            try {
-              const discoverResult: any = await callWithTimeout("discover_servers", 15000);
-              if (discoverResult.servers && discoverResult.servers.length > 0) {
-                setServers(discoverResult.servers);
-                if (discoverResult.players) setPlayers(discoverResult.players);
-                if (discoverResult.plexamp_url) {
-                  const updated = { ...settingsRef.current, plexamp_url: discoverResult.plexamp_url };
-                  setSettings(updated);
-                }
-              }
-            } catch (e: any) {
-              console.error("[DeckyPlex] Server discovery error:", e);
-              // Don't clear login — server discovery from plex.tv can fail if internet is slow
+        if (!result.has_plex_token) return;
+        void (async () => {
+          try {
+            const discoverResult: any = await callWithTimeout("discover_servers", 15000);
+            if (discoverResult.servers) setServers(discoverResult.servers);
+            if (discoverResult.plexamp_url) {
+              const updated = { ...settingsRef.current, plexamp_url: discoverResult.plexamp_url };
+              settingsRef.current = updated;
+              setSettings(updated);
             }
-          })();
-        }
+            const playersResult: any = await callWithTimeout("discover_players", 30000);
+            if (playersResult.players) setPlayers(playersResult.players);
+          } catch (e: any) {
+            console.error("[DeckyPlex] Plex discovery error:", e);
+          }
+        })();
       })
       .catch(() => {
         // Backend not responding — show UI with defaults
@@ -135,41 +153,26 @@ export function SettingsPage() {
   // Poll for PIN approval after showing the code
   useEffect(() => {
     if (!pinCode) return;
-
+    let polling = false;
     const interval = setInterval(async () => {
+      if (polling) return;
+      polling = true;
       try {
         const result: any = await callWithTimeout("plex_login_poll", 15000);
-        if (result.token) {
+        if (result.logged_in) {
           // Login successful — save settings and update UI
           clearInterval(interval);
           setPinCode("");
           setPinUrl("");
 
-          const newSettings: Settings = {
-            ...settingsRef.current,
-            plex_token: result.token,
-            logged_in_username: result.username || "",
-            selected_player_id: result.player_id || "",
-            plexamp_url: result.plexamp_url || "",
-          };
-          setSettings(newSettings);
-          await saveSettings(newSettings);
-
-          if (result.servers && result.servers.length > 0) {
-            setServers(result.servers);
-            // Auto-select first server
-            const server = result.servers[0];
-            newSettings.selected_server_id = server.id;
-            newSettings.selected_server_name = server.name || "";
-            newSettings.selected_server_url = server.base_url || "";
-            newSettings.server_access_token = server.access_token || "";
-            setSettings(newSettings);
-            await saveSettings(newSettings);
-          }
+          const savedSettings: any = await callWithTimeout("get_settings", 10000);
+          settingsRef.current = savedSettings;
+          setSettings(savedSettings);
+          setServers(result.servers || []);
 
           // Load players
           try {
-            const playersResult: any = await callWithTimeout("discover_players", 10000);
+            const playersResult: any = await callWithTimeout("discover_players", 30000);
             if (playersResult.players) {
               setPlayers(playersResult.players);
             }
@@ -185,6 +188,8 @@ export function SettingsPage() {
         // Empty result means still waiting — keep polling
       } catch (e: any) {
         console.error("[DeckyPlex] Poll error:", e);
+      } finally {
+        polling = false;
       }
     }, 2000);
 
@@ -192,40 +197,96 @@ export function SettingsPage() {
   }, [pinCode]);
 
   const handleLogout = useCallback(() => {
-    const cleared: Settings = { ...DEFAULT_SETTINGS };
-    setSettings(cleared);
-    saveSettings(cleared);
+    call("logout").then((cleared: any) => {
+      settingsRef.current = cleared;
+      setSettings(cleared);
+      window.dispatchEvent(new Event('deckyplex-settings-change'));
+    });
     setServers([]);
     setPlayers([]);
     setStatus("Logged out.");
-  }, [saveSettings]);
+  }, []);
 
   const handleSelectServer = useCallback((serverId: string) => {
     const server = servers.find(s => s.id === serverId);
     if (server) {
-      const updated = {
-        ...settingsRef.current,
-        selected_server_id: server.id,
-        selected_server_name: server.name || "",
-        selected_server_url: server.base_url || "",
-        server_access_token: server.access_token || "",
-      };
-      setSettings(updated);
-      saveSettings(updated);
-      setStatus(`Selected server: ${server.name}`);
+      callWithTimeout("select_server", 15000, server.id).then((result: any) => {
+        if (!result?.success) throw new Error(result?.error || "Could not select Plex server.");
+        settingsRef.current = result.settings;
+        setSettings(result.settings);
+        window.dispatchEvent(new Event('deckyplex-settings-change'));
+        setStatus(`Selected server: ${server.name}`);
+      }).catch((e: any) => setStatus(e?.message || "Could not select Plex server."));
     }
-  }, [servers, saveSettings]);
+  }, [servers]);
 
   const handleSelectPlayer = useCallback((playerId: string) => {
-    const updated = { ...settingsRef.current, selected_player_id: playerId };
+    const player = players.find(p => p.machineIdentifier === playerId);
+    const updated = {
+      ...settingsRef.current,
+      selected_player_id: playerId,
+      selected_player_name: player?.name || '',
+      playback_target: playerId ? settingsRef.current.playback_target : 'local',
+    };
+    settingsRef.current = updated;
     setSettings(updated);
     saveSettings(updated);
+  }, [players, saveSettings]);
+
+  const handleRefreshPlayers = useCallback(async () => {
+    setRefreshingPlayers(true);
+    try {
+      const result: any = await callWithTimeout("discover_players", 30000);
+      if (result.error) throw new Error(result.error);
+      const nextPlayers = result.players || [];
+      setPlayers(nextPlayers);
+      if (settingsRef.current.selected_player_id && !nextPlayers.some((p: Player) => p.machineIdentifier === settingsRef.current.selected_player_id)) {
+        const updated = { ...settingsRef.current, selected_player_id: "", selected_player_name: "", playback_target: "local" as const };
+        settingsRef.current = updated;
+        setSettings(updated);
+        await saveSettings(updated);
+      }
+      setStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s), including account-registered devices.` : "No Plex players were found through the server or account device list.");
+    } catch (e: any) {
+      setStatus(e?.message || "Could not refresh Plex players.");
+    } finally {
+      setRefreshingPlayers(false);
+    }
+  }, [saveSettings]);
+
+  const updateSetting = useCallback((key: keyof Settings, value: any) => {
+    const updated = { ...settingsRef.current, [key]: value };
+    settingsRef.current = updated;
+    setSettings(updated);
+    return updated;
+  }, []);
+
+  const saveAdvancedSettings = useCallback(async () => {
+    const result: any = await saveSettings(settingsRef.current);
+    if (!result?.error) setStatus("Advanced settings saved.");
+  }, [saveSettings]);
+
+  const saveBrowserSettings = useCallback(async () => {
+    const result: any = await saveSettings(settingsRef.current);
+    if (!result?.error) setStatus("Browser settings saved.");
+  }, [saveSettings]);
+
+  const testServerConnection = useCallback(async () => {
+    setStatus("Testing Plex server connection...");
+    try {
+      const saved: any = await saveSettings(settingsRef.current);
+      if (saved?.error) throw new Error(saved.error);
+      const result: any = await callWithTimeout("validate_connection", 15000);
+      setStatus(result.valid ? `Connected to ${result.serverName || "Plex Media Server"}.` : `Connection failed: ${result.error}`);
+    } catch (e: any) {
+      setStatus(e?.message || "Connection test failed.");
+    }
   }, [saveSettings]);
 
   // Login page content
   const renderLoginPage = () => (
     <PanelSection>
-      {!settings.plex_token && !pinCode && (
+      {!settings.has_plex_token && !pinCode && (
         <PanelSectionRow>
           <ButtonItem onClick={handlePlexLogin} disabled={loggingIn}>
             {loggingIn ? "Requesting..." : "Login with Plex"}
@@ -297,18 +358,55 @@ export function SettingsPage() {
           <DialogBodyText>Current: {settings.selected_server_name}</DialogBodyText>
         </PanelSectionRow>
       )}
+      <PanelSectionRow>
+        <DialogBodyText style={{ opacity: 0.65 }}>
+          Use Advanced settings to enter a local IP address when automatic server discovery chooses an unreachable address.
+        </DialogBodyText>
+      </PanelSectionRow>
     </PanelSection>
   );
 
   // Players page content
   const renderPlayersPage = () => (
     <PanelSection>
+      <PanelSectionRow>
+        <DialogBodyText style={{ opacity: 0.75 }}>
+          Choose where DeckyPlex sends playback. The list includes server-connected clients and devices registered to your Plex account. A registered device may need to be opened or started before it can accept playback.
+        </DialogBodyText>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ width: '100%' }}>
+          <DialogBodyText style={{ marginBottom: '0.25rem' }}>Playback target</DialogBodyText>
+          <Dropdown
+            rgOptions={[
+              { label: 'This Decky device', data: 'local' },
+              { label: 'Selected remote Plex player', data: 'remote' },
+            ]}
+            selectedOption={settings.playback_target}
+            disabled={!settings.selected_player_id}
+            onChange={(option: any) => {
+              const updated: Settings = { ...settingsRef.current, playback_target: option.data === 'remote' ? 'remote' : 'local' };
+              settingsRef.current = updated;
+              setSettings(updated);
+              saveSettings(updated);
+            }}
+          />
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem onClick={handleRefreshPlayers} disabled={refreshingPlayers}>
+          {refreshingPlayers ? "Refreshing players..." : "Refresh players"}
+        </ButtonItem>
+      </PanelSectionRow>
       {players.length > 0 && (
         <PanelSectionRow>
           <div style={{ width: '100%' }}>
-            <DialogBodyText style={{ marginBottom: '0.25rem' }}>Player</DialogBodyText>
+              <DialogBodyText style={{ marginBottom: '0.25rem' }}>Remote player</DialogBodyText>
             <Dropdown
-              rgOptions={players.map(p => ({ label: `${p.name} (${p.product})`, data: p.machineIdentifier }))}
+              rgOptions={[
+                { label: 'No remote player selected', data: '' },
+                ...players.map(p => ({ label: `${p.name} (${p.product})${p.state && p.state !== 'idle' ? ` — ${p.state}` : ''}`, data: p.machineIdentifier })),
+              ]}
               selectedOption={settings.selected_player_id}
               onChange={(option: any) => handleSelectPlayer(option.data)}
             />
@@ -317,9 +415,72 @@ export function SettingsPage() {
       )}
       {players.length === 0 && (
         <PanelSectionRow>
-          <DialogBodyText style={{ opacity: 0.5 }}>No players discovered. Open Plexamp on another device to see it here.</DialogBodyText>
+          <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>
         </PanelSectionRow>
       )}
+    </PanelSection>
+  );
+
+  const renderBrowserPage = () => (
+    <PanelSection>
+      <PanelSectionRow>
+        <DialogBodyText>Choose how many album and artist tiles fit across the music browser.</DialogBodyText>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label={`Grid columns: ${settings.grid_columns || 5}`}
+          min={3}
+          max={8}
+          step={1}
+          value={settings.grid_columns || 5}
+          onChange={(value: number) => updateSetting('grid_columns', Math.round(value))}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Button onClick={saveBrowserSettings}>Save browser settings</Button>
+      </PanelSectionRow>
+      {status && <PanelSectionRow><DialogBodyText>{status}</DialogBodyText></PanelSectionRow>}
+    </PanelSection>
+  );
+
+  const renderAdvancedPage = () => (
+    <PanelSection>
+      <PanelSectionRow>
+        <DialogBodyText>
+          Optional local address override. Enter an IP address such as 192.168.1.20 or a full URL. Leave blank to use automatic Plex discovery.
+        </DialogBodyText>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <TextField
+          label="Plex server IP or URL"
+          value={settings.manual_server_url}
+          placeholder="192.168.1.20:32400"
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => updateSetting('manual_server_url', e.target.value)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label={`Connection timeout: ${settings.connection_timeout}s`}
+          value={settings.connection_timeout}
+          min={4}
+          max={30}
+          step={1}
+          onChange={(value: number) => updateSetting('connection_timeout', Math.round(value))}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DialogCheckbox
+          label="Verify HTTPS certificates"
+          description="Turn off only for a server with an invalid or self-signed certificate."
+          checked={settings.verify_tls}
+          onChange={(checked: boolean) => updateSetting('verify_tls', checked)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Button onClick={saveAdvancedSettings}>Save advanced settings</Button>
+        <Button style={{ marginLeft: '0.5rem' }} onClick={testServerConnection}>Test connection</Button>
+      </PanelSectionRow>
+      {status && <PanelSectionRow><DialogBodyText>{status}</DialogBodyText></PanelSectionRow>}
     </PanelSection>
   );
 
@@ -327,12 +488,12 @@ export function SettingsPage() {
     {
       title: 'Account',
       icon: <FaUser />,
-      content: settings.plex_token ? renderAccountPage() : renderLoginPage(),
+      content: settings.has_plex_token ? renderAccountPage() : renderLoginPage(),
     },
     {
       title: 'Server',
       icon: <FaServer />,
-      content: settings.plex_token ? renderServerPage() : (
+      content: settings.has_plex_token ? renderServerPage() : (
         <PanelSection>
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.5 }}>Log in first to select a server.</DialogBodyText>
@@ -343,7 +504,7 @@ export function SettingsPage() {
     {
       title: 'Players',
       icon: <FaMusic />,
-      content: settings.plex_token ? renderPlayersPage() : (
+      content: settings.has_plex_token ? renderPlayersPage() : (
         <PanelSection>
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.5 }}>
@@ -351,6 +512,20 @@ export function SettingsPage() {
             </DialogBodyText>
           </PanelSectionRow>
         </PanelSection>
+      ),
+    },
+    {
+      title: 'Browser',
+      icon: <FaTh />,
+      content: settings.has_plex_token ? renderBrowserPage() : (
+        <PanelSection><PanelSectionRow><DialogBodyText style={{ opacity: 0.5 }}>Log in first to change browser settings.</DialogBodyText></PanelSectionRow></PanelSection>
+      ),
+    },
+    {
+      title: 'Advanced',
+      icon: <FaCog />,
+      content: settings.has_plex_token ? renderAdvancedPage() : (
+        <PanelSection><PanelSectionRow><DialogBodyText style={{ opacity: 0.5 }}>Log in first to change connection settings.</DialogBodyText></PanelSectionRow></PanelSection>
       ),
     },
   ];

@@ -7,6 +7,8 @@ A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) music player
 - **Music browser**: Browse artists, albums, tracks, and search a selected Plex music library.
 - **Quick player**: Play, pause, seek, and adjust volume from the Decky sidebar.
 - **Plex login**: Sign in with a Plex PIN and select a server.
+- **Remote Plex players**: Start music on and control connected Plex clients such as Plexamp on a phone.
+- **Advanced connection settings**: Override automatic discovery with a local server IP, set a connection timeout, and configure HTTPS certificate verification.
 
 ## Prerequisites
 
@@ -29,12 +31,19 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 1. Open the Decky menu and navigate to **DeckyPlex > Settings**.
 2. Sign in with the Plex PIN.
 3. Select a Plex server with a music library.
+4. To play on another Plex client, open **Settings > Players**, refresh the list, select a connected player, and choose it as the playback target.
+5. If automatic discovery selected an unreachable server address, open **Settings > Advanced** and enter the server's local IP address.
 
 ## Usage
 
 - Open **Browse Music** from the Decky sidebar to browse and play tracks.
 - Use the quick player in the sidebar for playback and volume controls.
 - Open **Settings** to sign in to Plex and select a server.
+- Select a remote player in **Settings > Players** to send playback and controls to Plexamp or another online Plex client.
+
+### Using Plexamp on a phone as a remote
+
+DeckyPlex currently plays locally in the Decky webview. Plexamp on a phone cannot yet select DeckyPlex as a receiver. The PlexAPI SDK supports controlling connected Plex players, which DeckyPlex uses for remote playback targets, but it does not implement advertising DeckyPlex as a player or handling incoming Plex Companion commands. Phone-to-Decky control requires a separate Plex Companion receiver implementation.
 
 ## Development
 

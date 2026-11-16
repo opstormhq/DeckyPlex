@@ -17,6 +17,7 @@ import {
   FaStepForward,
   FaStepBackward,
   FaStop,
+  FaRandom,
 } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 
@@ -29,6 +30,9 @@ function formatTime(seconds: number): string {
 
 export function QuickPlayer() {
   const [plexConnected, setPlexConnected] = useState(false);
+  const [shufflingAll, setShufflingAll] = useState(false);
+  const [shuffleError, setShuffleError] = useState('');
+  const [showQueue, setShowQueue] = useState(false);
   const {
     playbackState,
     track,
@@ -36,6 +40,10 @@ export function QuickPlayer() {
     error,
     progress,
     duration,
+    remoteMode,
+    remotePlayerName,
+    playTrack,
+    playRemoteQueue,
     play,
     pause,
     stop,
@@ -43,6 +51,9 @@ export function QuickPlayer() {
     skipPrevious,
     setVolume,
     seek,
+    queue,
+    queueIndex,
+    playQueueIndex,
   } = usePlayer();
 
   useEffect(() => {
@@ -51,7 +62,7 @@ export function QuickPlayer() {
       try {
         const settings: any = await call('get_settings');
         if (mounted) {
-          setPlexConnected(Boolean(settings?.plex_token && settings?.selected_server_id && settings?.selected_server_url));
+          setPlexConnected(Boolean(settings?.has_plex_token && settings?.selected_server_id && settings?.selected_server_url));
         }
       } catch {
         if (mounted) setPlexConnected(false);
@@ -71,16 +82,78 @@ export function QuickPlayer() {
 
   const albumArtUrl = track?.thumb || null;
 
+  const shuffleAllSongs = async () => {
+    if (shufflingAll) return;
+    setShufflingAll(true);
+    setShuffleError('');
+    try {
+      const sectionsResult: any = await call('get_library_sections');
+      if (sectionsResult?.error) throw new Error(sectionsResult.error);
+      const section = sectionsResult?.sections?.[0];
+      if (!section) throw new Error('No Plex music library was found.');
+      const firstPage: any = await call('get_track_page', section.id, 0, 25);
+      if (firstPage?.error) throw new Error(firstPage.error);
+      const toTrack = (item: any) => ({
+        id: String(item.id),
+        sectionId: String(section.id),
+        title: item.title || 'Unknown',
+        artist: item.grandparentTitle || item.artist || '',
+        album: item.parentTitle || '',
+        duration: item.duration || 0,
+        thumb: item.thumb || '',
+      });
+      const queue = (firstPage.items || []).filter((item: any) => item.type === 'track').map(toTrack);
+      if (!queue.length) throw new Error('No songs were found in your music library.');
+
+      if (remoteMode) {
+        const all: any = await call('get_shuffled_tracks', section.id);
+        if (all?.error) throw new Error(all.error);
+        const remoteQueue = (all.items || []).filter((item: any) => item.type === 'track').map(toTrack);
+        const result = await playRemoteQueue(remoteQueue, remoteQueue[0]?.id);
+        if (!result.success) throw new Error(result.error || 'Could not start shuffled playback.');
+      } else {
+        let pageOffset = 25;
+        let morePages = firstPage.has_more !== false;
+        const loadMore = async () => {
+          if (!morePages) return [];
+          const page: any = await call('get_track_page', section.id, pageOffset, 25);
+          if (page?.error) throw new Error(page.error);
+          pageOffset += 25;
+          morePages = page.has_more === true;
+          const tracks = (page.items || []).filter((item: any) => item.type === 'track').map(toTrack);
+          for (let i = tracks.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+          }
+          return tracks;
+        };
+        for (let i = queue.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [queue[i], queue[j]] = [queue[j], queue[i]];
+        }
+        const stream: any = await call('play_track', queue[0].id, section.id);
+        if (!stream?.success || !stream.stream_url) {
+          throw new Error(stream?.error || 'Plex did not return a playable audio stream.');
+        }
+        playTrack(stream.stream_url, queue[0], queue, stream.fallback_stream_url || '', loadMore);
+      }
+    } catch (e: any) {
+      setShuffleError(e?.message || 'Could not shuffle the music library.');
+    } finally {
+      setShufflingAll(false);
+    }
+  };
+
   // Status: green=playing, orange=paused, blue=ready (default), red=error
   const hasTrack = !!track;
   const statusColor = !plexConnected ? '#777777' : isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : error ? '#ff4444' : '#4488ff';
   const statusText = !plexConnected ? 'Not connected to Plex' : isPlaying ? 'Playing' : isPaused ? 'Paused' : error ? error : 'Ready';
 
   return (
-    <PanelSection title="Quick Player">
-      {/* Status Indicator */}
+    <PanelSection title="">
       <PanelSectionRow>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '0.2rem 0.25rem 0.45rem' }}><DialogLabel>Quick Player</DialogLabel>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
           <div
             style={{
               width: '8px',
@@ -89,11 +162,18 @@ export function QuickPlayer() {
               backgroundColor: statusColor,
             }}
           />
-          <DialogBodyText>
-            {statusText}
-          </DialogBodyText>
+          <span style={{ fontSize: '0.75rem', opacity: 0.8, fontWeight: 400 }}>{statusText}</span>
+          </div>
         </div>
       </PanelSectionRow>
+
+      {remoteMode && (
+        <PanelSectionRow>
+          <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem' }}>
+            Controlling {remotePlayerName || 'remote Plex player'}
+          </DialogBodyText>
+        </PanelSectionRow>
+      )}
 
       {/* Error Message */}
       {error && (
@@ -104,9 +184,15 @@ export function QuickPlayer() {
         </PanelSectionRow>
       )}
 
+      {shuffleError && (
+        <PanelSectionRow>
+          <DialogBodyText style={{ color: '#ff6b6b' }}>{shuffleError}</DialogBodyText>
+        </PanelSectionRow>
+      )}
+
       {/* Track Info */}
       <PanelSectionRow>
-        <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+        <div style={{ display: 'flex', gap: '1.1rem', alignItems: 'center', width: '100%', padding: '0.5rem 0.65rem 0.35rem', marginTop: '0.2rem' }}>
           {/* Album Art */}
           <div
             style={{
@@ -133,12 +219,15 @@ export function QuickPlayer() {
           </div>
 
           {/* Track Details */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', minWidth: 0 }}>
+          <div style={{ display: 'flex', flex: 1, flexDirection: 'column', justifyContent: 'center', gap: '0.3rem', minWidth: 0, paddingRight: '0.25rem' }}>
             <DialogLabel
               style={{
                 overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
+                display: '-webkit-box',
+                WebkitBoxOrient: 'vertical',
+                WebkitLineClamp: 2,
+                whiteSpace: 'normal',
+                lineHeight: 1.15,
               }}
             >
               {track?.title || 'No track selected'}
@@ -212,7 +301,7 @@ export function QuickPlayer() {
 
       {/* Playback Controls */}
       <PanelSectionRow>
-        <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
+        <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'center', gap: '1rem', padding: '0.65rem 0.55rem', marginTop: '0.4rem' }}>
           <Button onClick={() => skipPrevious()} disabled={!hasTrack}>
             <FaStepBackward />
           </Button>
@@ -234,16 +323,42 @@ export function QuickPlayer() {
         </Focusable>
       </PanelSectionRow>
 
+      <PanelSectionRow>
+        <div style={{ width: '100%', padding: '0.3rem 0.5rem 0.75rem', boxSizing: 'border-box' }}>
+          <Button onClick={shuffleAllSongs} disabled={!plexConnected || shufflingAll} style={{ width: '100%' }}>
+            <FaRandom />
+            <span style={{ marginLeft: '0.5rem' }}>{shufflingAll ? 'Starting shuffle…' : 'Shuffle all songs'}</span>
+          </Button>
+        </div>
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <div style={{ width: '100%', padding: '0 0.5rem', boxSizing: 'border-box' }}>
+          <Button onClick={() => setShowQueue(value => !value)} disabled={!queue.length} style={{ width: '100%' }}>
+            <span>{showQueue ? 'Hide queue' : `Queue${queue.length ? ` · ${queueIndex + 1}/${queue.length}` : ''}`}</span>
+          </Button>
+        </div>
+      </PanelSectionRow>
+      {showQueue && queue.slice(Math.max(0, queueIndex), Math.max(0, queueIndex) + 12).map((queuedTrack, index) => {
+        const actualIndex = Math.max(0, queueIndex) + index;
+        return <PanelSectionRow key={`${queuedTrack.id}-${actualIndex}`}>
+          <Button onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
+          </Button>
+        </PanelSectionRow>;
+      })}
+
       {/* Volume Control */}
+      <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
-          <SliderField
+          <div style={{ width: '100%', padding: '0.3rem 0.55rem 0.1rem', marginTop: '0.2rem', boxSizing: 'border-box' }}><SliderField
             label="Volume"
             min={0}
             max={100}
             value={volume}
             onChange={(value: number) => setVolume(value)}
-          />
+          /></div>
         ) : (
           <DialogBodyText style={{ opacity: 0.5 }}>
             Volume: {volume}%
@@ -251,20 +366,6 @@ export function QuickPlayer() {
         )}
       </PanelSectionRow>
 
-      {/* Instructions */}
-      {isStopped && !hasTrack && (
-        <PanelSectionRow>
-          <DialogBodyText
-            style={{
-              opacity: 0.5,
-              fontStyle: 'italic',
-              textAlign: 'center',
-            }}
-          >
-            Browse music and select a track to play.
-          </DialogBodyText>
-        </PanelSectionRow>
-      )}
     </PanelSection>
   );
 }
