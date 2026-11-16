@@ -291,12 +291,21 @@ export function BrowserPage() {
   }, [activeTab, connected, selectedSection, subView]);
 
   const loadTabData = useCallback(async (tab: BrowserTab) => {
-    setLoading(true);
-    setTabHasMore(false);
     setError(null);
+    const cacheKey = `tab:${selectedSection}:${tab}`;
+    const cached = itemCache.current.get(cacheKey);
+    const cacheIsFresh = !!cached && cached.expiresAt > Date.now();
+    if (cached) {
+      setItems(cached.items);
+      setTabHasMore(Boolean(cached.hasMore));
+    } else {
+      setItems([]);
+      setTabHasMore(false);
+    }
+    setLoading(!cacheIsFresh);
+    if (cacheIsFresh) return;
     try {
       let result: any;
-      const cacheKey = `tab:${selectedSection}:${tab}`;
       const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
       if (tab === 'recent') {
         result = await cachedItems(cacheKey, ttl, () => call('get_recently_played', selectedSection, 100));
@@ -310,16 +319,20 @@ export function BrowserPage() {
         setTabHasMore(Boolean(result.has_more));
       }
       if (result.error) {
-        setError(result.error);
-        setItems([]);
+        if (!cached) {
+          setError(result.error);
+          setItems([]);
+        }
       } else if (Array.isArray(result.items)) {
         setItems(result.items);
       } else {
         setItems([]);
       }
     } catch (e) {
-      setError("Failed to load items.");
-      setItems([]);
+      if (!cached) {
+        setError("Failed to load items.");
+        setItems([]);
+      }
     } finally {
       setLoading(false);
     }
