@@ -32,30 +32,32 @@ export default definePlugin(() => {
     content: (
       <PlayerProvider>
         <QuickPlayer />
-        <PanelSection>
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              onClick={() => {
-                Navigation.Navigate(BROWSER_ROUTE);
-                Navigation.CloseSideMenus();
-              }}
-            >
-              Browse Music
-            </ButtonItem>
-          </PanelSectionRow>
-          <PanelSectionRow>
-            <ButtonItem
-              layout="below"
-              onClick={() => {
-                Navigation.Navigate(SETTINGS_ROUTE);
-                Navigation.CloseSideMenus();
-              }}
-            >
-              Settings
-            </ButtonItem>
-          </PanelSectionRow>
-        </PanelSection>
+        <div style={{ marginTop: '-0.35rem' }}>
+          <PanelSection>
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                onClick={() => {
+                  Navigation.Navigate(BROWSER_ROUTE);
+                  Navigation.CloseSideMenus();
+                }}
+              >
+                Browse Music
+              </ButtonItem>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                onClick={() => {
+                  Navigation.Navigate(SETTINGS_ROUTE);
+                  Navigation.CloseSideMenus();
+                }}
+              >
+                Settings
+              </ButtonItem>
+            </PanelSectionRow>
+          </PanelSection>
+        </div>
       </PlayerProvider>
     ),
     onDismount() {
