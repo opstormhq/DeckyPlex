@@ -86,6 +86,22 @@ export function BrowserPage() {
   const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
 
+  const keepFocusedElementVisible = (element: HTMLElement) => {
+    window.requestAnimationFrame(() => {
+      const viewport = contentRef.current;
+      if (!viewport || !viewport.contains(element)) return;
+      const item = element.closest<HTMLElement>('[data-browser-item-id]') || element;
+      const itemRect = item.getBoundingClientRect();
+      const viewportRect = viewport.getBoundingClientRect();
+      const edgePadding = 18;
+      if (itemRect.bottom > viewportRect.bottom - edgePadding) {
+        viewport.scrollTop += itemRect.bottom - (viewportRect.bottom - edgePadding);
+      } else if (itemRect.top < viewportRect.top + edgePadding) {
+        viewport.scrollTop -= (viewportRect.top + edgePadding) - itemRect.top;
+      }
+    });
+  };
+
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cached = itemCache.current.get(key);
     if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore };
@@ -832,6 +848,9 @@ export function BrowserPage() {
     <div
       onFocusCapture={(event) => {
         focusZone.current = event.target instanceof HTMLElement && event.target.closest('[data-browser-zone="sidebar"]') ? 'sidebar' : 'content';
+        if (focusZone.current === 'content' && event.target instanceof HTMLElement) {
+          keepFocusedElementVisible(event.target);
+        }
       }}
       style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0, overflow: 'hidden' }}
     >
