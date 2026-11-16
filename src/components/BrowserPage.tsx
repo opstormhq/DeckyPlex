@@ -490,16 +490,16 @@ export function BrowserPage() {
           <div style={{ width: '100%', aspectRatio: '1 / 1', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {imageUrl ? <img src={imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
           </div>
-          <DialogBodyText style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <div style={{ fontWeight: 500, lineHeight: '1.2', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
             {item.title || '(unknown)'}
-          </DialogBodyText>
+          </div>
           {(item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle)) && (
-            <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ fontSize: '0.75rem', lineHeight: '1.15', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
               {item.artist || item.grandparentTitle || item.parentTitle}
-            </DialogBodyText>
+            </div>
           )}
           {item.type === 'playlist' && item.leafCount != null && (
-            <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65 }}>{item.leafCount} tracks</DialogBodyText>
+            <div style={{ fontSize: '0.75rem', lineHeight: '1.15', opacity: 0.65, margin: 0 }}>{item.leafCount} tracks</div>
           )}
         </Focusable>
       );
@@ -522,35 +522,29 @@ export function BrowserPage() {
                 {fallbackIcon}
               </div>
             )}
-            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
-              <DialogBodyText style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <div style={{ display: 'flex', flex: 1, minWidth: 0, flexDirection: 'column', justifyContent: 'center', gap: '0.1rem', overflow: 'hidden' }}>
+              <div style={{ fontWeight: 500, lineHeight: '1.15', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
                 {item.title || '(unknown)'}
-              </DialogBodyText>
+              </div>
               {item.type === 'track' && (item.grandparentTitle || item.artist || item.parentTitle) && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                <div style={{ fontSize: '0.75rem', lineHeight: '1.1', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
                   {[item.grandparentTitle || item.artist, item.parentTitle].filter(Boolean).join(' · ')}
-                </DialogBodyText>
+                </div>
               )}
               {item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle) && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
-                  {item.artist || item.grandparentTitle || item.parentTitle}
-                </DialogBodyText>
-              )}
-              {item.type === 'album' && item.leafCount != null && item.leafCount > 0 && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
-                  {item.leafCount} track{item.leafCount === 1 ? '' : 's'}
-                  {item.year ? ` • ${item.year}` : ''}
-                </DialogBodyText>
+                <div style={{ fontSize: '0.75rem', lineHeight: '1.1', opacity: 0.6, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
+                  {[item.artist || item.grandparentTitle || item.parentTitle, item.leafCount != null ? `${item.leafCount} tracks` : '', item.year || ''].filter(Boolean).join(' · ')}
+                </div>
               )}
               {item.type === 'playlist' && item.leafCount != null && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
+                <div style={{ fontSize: '0.75rem', lineHeight: '1.1', opacity: 0.6, margin: 0 }}>
                   {item.leafCount} track{item.leafCount === 1 ? '' : 's'}
-                </DialogBodyText>
+                </div>
               )}
               {item.type !== 'album' && item.year && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
+                <div style={{ fontSize: '0.75rem', lineHeight: '1.1', opacity: 0.6, margin: 0 }}>
                   {item.year}
-                </DialogBodyText>
+                </div>
               )}
             </div>
             {item.type === 'track' && item.duration && (
@@ -560,7 +554,7 @@ export function BrowserPage() {
             )}
       </div>
     );
-    const rowStyle = { display: 'flex', alignItems: 'center', width: '100%', gap: '0.75rem', padding: '0.45rem 0.5rem', borderBottom: '1px solid rgba(255,255,255,0.08)' };
+    const rowStyle = { display: 'block', width: '100%', boxSizing: 'border-box' as const, padding: '0.1rem 0.35rem', borderBottom: '1px solid rgba(255,255,255,0.08)' };
     if (item.type === 'track') {
       const trackInfo = { id: item.id, sectionId: selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: versionArtwork(item.thumb || '', artworkRevision) };
       return (
