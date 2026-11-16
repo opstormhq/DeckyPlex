@@ -10,6 +10,8 @@ import {
 import { call } from '@decky/api';
 
 interface TrackInfo {
+  id: string;
+  sectionId: string;
   title: string;
   artist: string;
   album: string;
@@ -27,7 +29,7 @@ interface PlayerState {
 }
 
 interface PlayerContextType extends PlayerState {
-  playTrack: (streamUrl: string, trackInfo: TrackInfo) => void;
+  playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[]) => void;
   play: () => void;
   pause: () => void;
   skipNext: () => void;
@@ -43,6 +45,8 @@ const PlayerContext = createContext<PlayerContextType | null>(null);
 const sharedAudio = new Audio();
 sharedAudio.volume = 0.5;
 let sharedTrack: TrackInfo | null = null;
+let sharedQueue: TrackInfo[] = [];
+let sharedQueueIndex = -1;
 
 // Send a debug message from the browser to the backend log file
 function logToBackend(message: string) {
@@ -64,8 +68,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     audioRef.current = sharedAudio;
 
-    const onPlay = () => setState(s => ({ ...s, playbackState: "playing" }));
-    const onPause = () => setState(s => ({ ...s, playbackState: "paused" }));
+    const onPlay = () => setState(s => ({ ...s, playbackState: "playing", error: null }));
+    const onPause = () => {
+      if (sharedAudio.paused) setState(s => ({ ...s, playbackState: "paused" }));
+    };
     const onEnded = () => setState(s => ({ ...s, playbackState: "stopped", progress: 0 }));
     const onError = (e: Event) => {
       const audio = e.target as HTMLAudioElement;
@@ -76,12 +82,22 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     };
     const onTimeUpdate = () => setState(s => ({
       ...s,
-      progress: sharedAudio.currentTime,
-      duration: isNaN(sharedAudio.duration) ? 0 : sharedAudio.duration,
+      progress: Number.isFinite(sharedAudio.currentTime) ? sharedAudio.currentTime : 0,
+      duration: Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+        ? sharedAudio.duration
+        : (sharedTrack?.duration || 0) / 1000,
     }));
     const onLoadedMetadata = () => setState(s => ({
       ...s,
-      duration: isNaN(sharedAudio.duration) ? 0 : sharedAudio.duration,
+      duration: Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+        ? sharedAudio.duration
+        : (sharedTrack?.duration || 0) / 1000,
+    }));
+    const onDurationChange = () => setState(s => ({
+      ...s,
+      duration: Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+        ? sharedAudio.duration
+        : (sharedTrack?.duration || 0) / 1000,
     }));
     const onTrackChange = () => setState(s => ({ ...s, track: sharedTrack }));
 
@@ -91,7 +107,17 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     sharedAudio.addEventListener('error', onError);
     sharedAudio.addEventListener('timeupdate', onTimeUpdate);
     sharedAudio.addEventListener('loadedmetadata', onLoadedMetadata);
+    sharedAudio.addEventListener('durationchange', onDurationChange);
     window.addEventListener('deckyplex-track-change', onTrackChange);
+    setState(s => ({
+      ...s,
+      track: sharedTrack,
+      playbackState: sharedTrack ? (sharedAudio.paused ? "paused" : "playing") : "stopped",
+      progress: Number.isFinite(sharedAudio.currentTime) ? sharedAudio.currentTime : 0,
+      duration: Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+        ? sharedAudio.duration
+        : (sharedTrack?.duration || 0) / 1000,
+    }));
 
     return () => {
       sharedAudio.removeEventListener('play', onPlay);
@@ -100,11 +126,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       sharedAudio.removeEventListener('error', onError);
       sharedAudio.removeEventListener('timeupdate', onTimeUpdate);
       sharedAudio.removeEventListener('loadedmetadata', onLoadedMetadata);
+      sharedAudio.removeEventListener('durationchange', onDurationChange);
       window.removeEventListener('deckyplex-track-change', onTrackChange);
     };
   }, []);
 
-  const playTrack = useCallback((streamUrl: string, trackInfo: TrackInfo) => {
+  const playTrack = useCallback((streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[]) => {
     const audio = audioRef.current;
     if (!audio) {
       logToBackend(`playTrack: audio element not initialized`);
@@ -113,8 +140,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     logToBackend(`playTrack: URL = ${streamUrl.substring(0, 120)}...`);
     sharedTrack = trackInfo;
+    if (queue?.length) {
+      sharedQueue = queue;
+      sharedQueueIndex = Math.max(0, sharedQueue.findIndex(item => item.id === trackInfo.id));
+    } else if (!sharedQueue.some(item => item.id === trackInfo.id)) {
+      sharedQueue = [trackInfo];
+      sharedQueueIndex = 0;
+    }
     window.dispatchEvent(new Event('deckyplex-track-change'));
-    setState(s => ({ ...s, error: null, playbackState: "paused", track: trackInfo, progress: 0 }));
+    setState(s => ({ ...s, error: null, playbackState: "paused", track: trackInfo, progress: 0, duration: (trackInfo.duration || 0) / 1000 }));
 
     // Stop any current playback
     audio.pause();
@@ -148,26 +182,30 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const skipNext = useCallback(() => {
-    // Skip ahead 10 seconds (full next track requires play queue integration)
-    if (audioRef.current) {
-      audioRef.current.currentTime = Math.min(
-        audioRef.current.currentTime + 10,
-        audioRef.current.duration || 0
-      );
+  const playQueueIndex = useCallback(async (index: number) => {
+    const nextTrack = sharedQueue[index];
+    if (!nextTrack) return;
+    try {
+      const result: any = await call('play_track', nextTrack.id, nextTrack.sectionId);
+      if (!result?.success || !result.stream_url) throw new Error(result?.error || 'Could not load track');
+      sharedQueueIndex = index;
+      playTrack(result.stream_url, nextTrack);
+    } catch (e: any) {
+      setState(s => ({ ...s, error: e?.message || 'Could not load track' }));
     }
-  }, []);
+  }, [playTrack]);
+
+  const skipNext = useCallback(() => {
+    if (sharedQueueIndex + 1 < sharedQueue.length) void playQueueIndex(sharedQueueIndex + 1);
+  }, [playQueueIndex]);
 
   const skipPrevious = useCallback(() => {
-    // Skip back 10 seconds (or restart if near beginning)
-    if (audioRef.current) {
-      if (audioRef.current.currentTime > 3) {
-        audioRef.current.currentTime = 0;
-      } else {
-        audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - 10);
-      }
+    if (audioRef.current && audioRef.current.currentTime > 3) {
+      audioRef.current.currentTime = 0;
+      return;
     }
-  }, []);
+    if (sharedQueueIndex > 0) void playQueueIndex(sharedQueueIndex - 1);
+  }, [playQueueIndex]);
 
   const setVolume = useCallback((volume: number) => {
     setState(s => ({ ...s, volume }));

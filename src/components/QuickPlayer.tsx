@@ -7,6 +7,7 @@ import {
   PanelSectionRow,
   DialogLabel,
   DialogBodyText,
+  Focusable,
 } from '@decky/ui';
 import {
   FaPlay,
@@ -17,7 +18,7 @@ import {
 import { usePlayer } from '../context/PlayerContext';
 
 function formatTime(seconds: number): string {
-  if (!seconds || isNaN(seconds)) return '0:00';
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
   const mins = Math.floor(seconds / 60);
   const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, '0')}`;
@@ -190,7 +191,7 @@ export function QuickPlayer() {
             >
               <div
                 style={{
-                  width: `${duration ? (progress / duration) * 100 : 0}%`,
+                width: `${duration > 0 ? Math.min(100, Math.max(0, (progress / duration) * 100)) : 0}%`,
                   height: '100%',
                   backgroundColor: '#4a9eff',
                   borderRadius: '2px',
@@ -207,7 +208,7 @@ export function QuickPlayer() {
 
       {/* Playback Controls */}
       <PanelSectionRow>
-        <div style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
+        <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
           <Button onClick={() => skipPrevious()} disabled={!hasTrack}>
             <FaBackward />
           </Button>
@@ -217,7 +218,7 @@ export function QuickPlayer() {
           <Button onClick={() => skipNext()} disabled={!hasTrack}>
             <FaForward />
           </Button>
-        </div>
+        </Focusable>
       </PanelSectionRow>
 
       {/* Volume Control */}

@@ -79,7 +79,10 @@ export function BrowserPage() {
 
   // Load data when tab changes
   useEffect(() => {
-    if (!connected || !selectedSection || subView) return;
+    if (!connected || !selectedSection || subView || activeTab === 'search') {
+      if (activeTab === 'search') setItems([]);
+      return;
+    }
     loadTabData(activeTab);
   }, [activeTab, connected, selectedSection, subView]);
 
@@ -166,7 +169,18 @@ export function BrowserPage() {
   const handlePlayTrack = useCallback(async (item: LibraryItem) => {
     try {
       console.log(`[DeckyPlex] Playing track: ${item.title} (id: ${item.id})`);
+      const trackQueue = items.filter(entry => entry.type === 'track').map(entry => ({
+        id: entry.id,
+        sectionId: selectedSection,
+        title: entry.title || 'Unknown',
+        artist: entry.grandparentTitle || '',
+        album: entry.parentTitle || '',
+        duration: entry.duration || 0,
+        thumb: entry.thumb || '',
+      }));
       const trackInfo = {
+        id: item.id,
+        sectionId: selectedSection,
         title: item.title || 'Unknown',
         artist: item.grandparentTitle || '',
         album: item.parentTitle || '',
@@ -185,7 +199,7 @@ export function BrowserPage() {
       }
       if (result.stream_url) {
         console.log(`[DeckyPlex] Got stream URL, starting playback`);
-        playTrack(result.stream_url, trackInfo);
+        playTrack(result.stream_url, trackInfo, trackQueue);
       } else {
         setError("Plex returned no audio stream URL.");
       }
@@ -193,7 +207,7 @@ export function BrowserPage() {
       console.error(`[DeckyPlex] play_track exception:`, e);
       setError("Failed to play track.");
     }
-  }, [selectedSection, playTrack]);
+  }, [selectedSection, playTrack, items]);
 
   const handleItemClick = useCallback((item: LibraryItem) => {
     if (item.type === 'artist') {
@@ -231,13 +245,13 @@ export function BrowserPage() {
   const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
     const imageUrl = (item.type === 'artist' || item.type === 'album') ? (item.art || item.thumb) : item.thumb;
     return (
-      <PanelSectionRow key={idx}>
-        <ButtonItem onClick={onClick}>
+      <ButtonItem key={idx} onClick={onClick}>
           <div style={{
             display: 'flex',
             alignItems: 'center',
             gap: '0.5rem',
             width: '100%',
+            padding: '0.25rem 0',
           }}>
             {imageUrl ? (
               <div style={{
@@ -289,8 +303,7 @@ export function BrowserPage() {
               </DialogBodyText>
             )}
           </div>
-        </ButtonItem>
-      </PanelSectionRow>
+      </ButtonItem>
     );
   };
 
@@ -323,14 +336,17 @@ export function BrowserPage() {
             <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
               <TextField
                 label=""
+                style={{ flex: 1, minWidth: 0, width: '100%' }}
                 value={searchQuery}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
                 placeholder="Search artists, albums, tracks..."
-                onSubmit={handleSearch}
+                onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleSearch();
+                  }
+                }}
               />
-              <ButtonItem onClick={handleSearch}>
-                <FaSearch />
-              </ButtonItem>
             </div>
           </PanelSectionRow>
         )}
@@ -351,12 +367,14 @@ export function BrowserPage() {
         )}
 
         {!loading && !error && items.length > 0 && (
-          <>
+          <PanelSectionRow>
+            <div style={{ display: 'flex', flexDirection: 'column', width: '100%', gap: '2px' }}>
             {items.map((item, idx) => {
               const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
               return renderItemRow(item, idx, handleClick);
             })}
-          </>
+            </div>
+          </PanelSectionRow>
         )}
 
         {!loading && !error && items.length === 0 && !subView && (
