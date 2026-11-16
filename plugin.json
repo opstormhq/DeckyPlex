@@ -1,0 +1,11 @@
+{
+  "name": "DeckyPlex",
+  "author": "Junie",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["music", "plexamp", "streaming"],
+    "description": "Integrates Plexamp music streaming into Steam Machine via Decky Loader.",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-plugin-template"
+  }
+}

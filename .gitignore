@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build output
+dist/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Bundled Python dependencies — console scripts not needed at runtime
+defaults/bin/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.tsbuildinfo
