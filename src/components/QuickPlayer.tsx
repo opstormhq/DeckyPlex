@@ -91,9 +91,9 @@ export function QuickPlayer() {
       if (sectionsResult?.error) throw new Error(sectionsResult.error);
       const section = sectionsResult?.sections?.[0];
       if (!section) throw new Error('No Plex music library was found.');
-      const firstPage: any = await call('get_track_page', section.id, 0, 25);
+      const firstPage: any = await call('get_track_page', section.id, 0, 25, true);
       if (firstPage?.error) throw new Error(firstPage.error);
-      const toTrack = (item: any) => ({
+      const toTrack = (item: any): { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string } => ({
         id: String(item.id),
         sectionId: String(section.id),
         title: item.title || 'Unknown',
@@ -102,25 +102,20 @@ export function QuickPlayer() {
         duration: item.duration || 0,
         thumb: item.thumb || '',
       });
-      const queue = (firstPage.items || []).filter((item: any) => item.type === 'track').map(toTrack);
+      const queue: ReturnType<typeof toTrack>[] = (firstPage.items || []).filter((item: any) => item.type === 'track').map(toTrack);
       if (!queue.length) throw new Error('No songs were found in your music library.');
 
       if (remoteMode) {
-        const all: any = await call('get_shuffled_tracks', section.id);
-        if (all?.error) throw new Error(all.error);
-        const remoteQueue = (all.items || []).filter((item: any) => item.type === 'track').map(toTrack);
-        const result = await playRemoteQueue(remoteQueue, remoteQueue[0]?.id);
+        const result = await playRemoteQueue(queue, queue[0]?.id);
         if (!result.success) throw new Error(result.error || 'Could not start shuffled playback.');
       } else {
-        let pageOffset = 25;
-        let morePages = firstPage.has_more !== false;
+        const seenIds = new Set(queue.map(item => item.id));
         const loadMore = async () => {
-          if (!morePages) return [];
-          const page: any = await call('get_track_page', section.id, pageOffset, 25);
+          const page: any = await call('get_track_page', section.id, 0, 25, true);
           if (page?.error) throw new Error(page.error);
-          pageOffset += 25;
-          morePages = page.has_more === true;
-          const tracks = (page.items || []).filter((item: any) => item.type === 'track').map(toTrack);
+          const tracks = (page.items || []).filter((item: any) => item.type === 'track')
+            .map(toTrack).filter((item: any) => !seenIds.has(item.id));
+          for (const item of tracks) seenIds.add(item.id);
           for (let i = tracks.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
@@ -339,14 +334,20 @@ export function QuickPlayer() {
           </Button>
         </div>
       </PanelSectionRow>
-      {showQueue && queue.slice(Math.max(0, queueIndex), Math.max(0, queueIndex) + 12).map((queuedTrack, index) => {
-        const actualIndex = Math.max(0, queueIndex) + index;
-        return <PanelSectionRow key={`${queuedTrack.id}-${actualIndex}`}>
-          <Button onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
-          </Button>
-        </PanelSectionRow>;
-      })}
+      {showQueue && (
+        <PanelSectionRow>
+          <div style={{ width: '100%', maxHeight: 'min(390px, 42vh)', overflowY: 'auto', overscrollBehavior: 'contain', padding: '0 0.5rem', boxSizing: 'border-box' }}>
+            <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
+              {queue.slice(Math.max(0, queueIndex)).map((queuedTrack, index) => {
+                const actualIndex = Math.max(0, queueIndex) + index;
+                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', minHeight: '40px', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
+                </Button>;
+              })}
+            </Focusable>
+          </div>
+        </PanelSectionRow>
+      )}
 
       {/* Volume Control */}
       <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>

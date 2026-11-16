@@ -213,16 +213,18 @@ class PlexHTTP:
             logger.debug("Could not discover registered Plex devices: %s", e)
         return list(players.values())
 
-    def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25) -> Dict[str, Any]:
+    def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25,
+                       randomize: bool = False) -> Dict[str, Any]:
         """Fetch one SDK-paginated page of tracks for shuffle playback."""
         section = self.sdk.library.sectionByID(int(section_id))
         if getattr(section, "type", "") != "artist":
             raise ValueError("Selected library is not a music library")
         limit = max(1, min(int(limit), 100))
-        offset = max(0, int(offset))
+        offset = max(0, int(offset)) if not randomize else 0
         # Fetch only one SDK page. Avoid a separate count request here because
         # some Plex servers treat a zero-sized container as their default size.
-        tracks = section.search(libtype="track", sort="titleSort:asc", container_start=offset,
+        sort = "random" if randomize else "titleSort:asc"
+        tracks = section.search(libtype="track", sort=sort, container_start=offset,
                                 container_size=limit, maxresults=limit)
         items = [self._item_dict(item) for item in tracks if getattr(item, "type", "") == "track"]
         return {"items": items, "has_more": len(items) == limit}
@@ -945,12 +947,13 @@ class Plugin:
             logger.error("Failed to load shuffle-all tracks: %s", e, exc_info=True)
             return {"items": [], "error": str(e)}
 
-    async def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25) -> Dict[str, Any]:
+    async def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25,
+                             randomize: bool = False) -> Dict[str, Any]:
         plex = self._get_plex()
         if not plex:
             return {"items": [], "total": 0, "error": "Not connected to Plex server"}
         try:
-            return plex.get_track_page(section_id, offset, limit)
+            return plex.get_track_page(section_id, offset, limit, randomize)
         except Exception as e:
             logger.error("Failed to load shuffle page: %s", e, exc_info=True)
             return {"items": [], "total": 0, "error": str(e)}

@@ -19,10 +19,7 @@ function BrowserPageWithProvider() {
 }
 
 export default definePlugin(() => {
-  // SidebarNavigation adds a route segment for each browser tab. Keep those
-  // routes inside this plugin route so tab selection does not fall back to
-  // the default Artists page or leave the plugin.
-  routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: false });
+  routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: true });
   routerHook.addRoute(SETTINGS_ROUTE, SettingsPage, { exact: true });
 
   return {

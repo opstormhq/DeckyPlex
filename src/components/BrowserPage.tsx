@@ -5,11 +5,11 @@ import {
   DialogBodyText,
   DialogLabel,
   Button,
+  ButtonItem,
   Focusable,
   SliderField,
   TextField,
   Spinner,
-  SidebarNavigation,
   ModalRoot,
   Navigation,
   showModal,
@@ -37,8 +37,6 @@ interface LibraryItem {
 }
 
 type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search';
-const BROWSER_ROUTE = '/deckyplex-browser';
-const browserTabRoute = (tab: BrowserTab) => `${BROWSER_ROUTE}/${tab}`;
 type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string; id?: string; queueLabel?: string } | null;
 interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; }
 
@@ -71,8 +69,9 @@ export function BrowserPage() {
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
   const gridDialogRef = useRef<{ Close: () => void } | null>(null);
   const gridPromptShown = useRef(false);
-  const focusedTrackButton = useRef<HTMLDivElement | null>(null);
-  const queueActionHasFocus = useRef(false);
+  const actionDialogRef = useRef<{ Close: () => void } | null>(null);
+  const focusZone = useRef<'sidebar' | 'content'>('content');
+  const sidebarRef = useRef<HTMLDivElement | null>(null);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cached = itemCache.current.get(key);
@@ -103,24 +102,27 @@ export function BrowserPage() {
   }, [history]);
 
   const handleCancel = useCallback((event: Event) => {
+    if (history.length === 0 && focusZone.current === 'content') {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      window.setTimeout(() => {
+        sidebarRef.current?.querySelectorAll<HTMLElement>('button, [role="button"]')[tabKeys.indexOf(activeTab)]?.focus();
+      }, 0);
+      return;
+    }
+    if (history.length === 0 && focusZone.current === 'sidebar') {
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      Navigation.NavigateBack();
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
     if (history.length > 0) goBack();
-    else Navigation.NavigateBack();
-  }, [history.length, goBack]);
-
-  const handleTrackRowCancel = useCallback((event: Event) => {
-    if (queueActionHasFocus.current && focusedTrackButton.current) {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      queueActionHasFocus.current = false;
-      focusedTrackButton.current.focus();
-      return;
-    }
-    handleCancel(event);
-  }, [handleCancel]);
+  }, [history.length, goBack, activeTab]);
 
   useEffect(() => {
     const onBackKey = (event: KeyboardEvent) => {
@@ -184,13 +186,25 @@ export function BrowserPage() {
     }
   }, [gridColumns]);
 
+  const previewGridColumns = useCallback((columns: number) => {
+    setGridColumns(columns);
+    void saveGridColumns(columns);
+  }, [saveGridColumns]);
+
   const openGridColumnsDialog = useCallback(() => {
     const close = () => gridDialogRef.current?.Close();
-    const cancel = () => setGridColumns(gridColumns);
-    gridDialogRef.current = showModal(<GridColumnsDialog initialColumns={gridColumns} onSave={saveGridColumns}
-      onPreview={setGridColumns} onCancel={cancel} onClose={close} />,
+    gridDialogRef.current = showModal(<GridColumnsDialog initialColumns={gridColumns}
+      onPreview={previewGridColumns} onClose={close} />,
       window, { strTitle: 'Browser layout', bNeverPopOut: true });
-  }, [gridColumns, saveGridColumns]);
+  }, [gridColumns, previewGridColumns]);
+
+  const openTrackOptions = useCallback((track: {
+    id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string;
+  }) => {
+    const close = () => actionDialogRef.current?.Close();
+    actionDialogRef.current = showModal(<TrackOptionsDialog track={track} addToQueue={addToQueue} onClose={close} />,
+      window, { strTitle: track.title, bNeverPopOut: true });
+  }, [addToQueue]);
 
   useEffect(() => {
     if (!connected || gridPreferenceSet || gridPromptShown.current) return;
@@ -455,7 +469,7 @@ export function BrowserPage() {
       );
     }
     const rowDetails = (
-      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
             {imageUrl ? (
               <div style={{
                 width: '40px',
@@ -472,13 +486,13 @@ export function BrowserPage() {
                 {fallbackIcon}
               </div>
             )}
-            <div style={{ flex: 1, overflow: 'hidden' }}>
-              <DialogBodyText style={{ fontWeight: 500 }}>
+            <div style={{ flex: 1, minWidth: 0, overflow: 'hidden' }}>
+              <DialogBodyText style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {item.title || '(unknown)'}
               </DialogBodyText>
-              {item.type === 'track' && item.parentTitle && (
-                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
-                  {item.parentTitle}
+              {item.type === 'track' && (item.grandparentTitle || item.artist || item.parentTitle) && (
+                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {[item.grandparentTitle || item.artist, item.parentTitle].filter(Boolean).join(' · ')}
                 </DialogBodyText>
               )}
               {item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle) && (
@@ -504,7 +518,7 @@ export function BrowserPage() {
               )}
             </div>
             {item.type === 'track' && item.duration && (
-              <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6, minWidth: '3rem', textAlign: 'right' }}>
+              <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6, minWidth: '3rem', textAlign: 'right', flexShrink: 0 }}>
                 {formatDuration(item.duration)}
               </DialogBodyText>
             )}
@@ -514,24 +528,21 @@ export function BrowserPage() {
     if (item.type === 'track') {
       const trackInfo = { id: item.id, sectionId: selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: versionArtwork(item.thumb || '', artworkRevision) };
       return (
-        <Focusable key={idx} flow-children="horizontal" onCancel={handleTrackRowCancel} style={rowStyle}>
-          <Focusable
-            flow-children="horizontal"
+        <Focusable
+            key={idx}
             ref={idx === 0 ? firstItemRef : undefined}
             onActivate={onClick}
             onClick={onClick}
-            onCancel={handleTrackRowCancel}
-            onFocus={() => { queueActionHasFocus.current = false; }}
-            style={{ display: 'flex', alignItems: 'center', flex: 1, minWidth: 0 }}
+            onCancel={handleCancel}
+            onSecondaryActionDescription="Options"
+            onSecondaryButton={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              openTrackOptions(trackInfo);
+            }}
+            style={rowStyle}
           >
             {rowDetails}
-          </Focusable>
-          <div onFocus={(event) => { queueActionHasFocus.current = true; focusedTrackButton.current = event.currentTarget.querySelector('button,[role="button"]'); }}>
-            <Button onClick={(event: MouseEvent) => { event.stopPropagation(); addToQueue(trackInfo, true); }}>Play Next</Button>
-          </div>
-          <div onFocus={(event) => { queueActionHasFocus.current = true; focusedTrackButton.current = event.currentTarget.querySelector('button,[role="button"]'); }}>
-            <Button onClick={(event: MouseEvent) => { event.stopPropagation(); addToQueue(trackInfo); }}>+ Queue</Button>
-          </div>
         </Focusable>
       );
     }
@@ -564,11 +575,9 @@ export function BrowserPage() {
           </DialogLabel>
           {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
           {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
-            <Focusable ref={playCollectionRef} onCancel={handleCancel} style={{ display: 'contents' }}>
-            <Button onClick={handlePlayCollection} disabled={loading}>
+            <Button ref={playCollectionRef} onClick={handlePlayCollection} onCancelButton={handleCancel} disabled={loading}>
               <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
             </Button>
-            </Focusable>
           )}
         </PanelSectionRow>
 
@@ -670,56 +679,69 @@ export function BrowserPage() {
     { title: 'Search', icon: <FaSearch /> },
   ];
 
-  const pages = tabConfig.map((config, idx) => ({
-    title: config.title,
-    icon: config.icon,
-    identifier: tabKeys[idx],
-    route: browserTabRoute(tabKeys[idx]),
-    content: renderContent(),
-  }));
-
   return (
-    <div style={{ marginTop: '40px', height: 'calc(100% - 40px)' }}>
-      <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
-        <SidebarNavigation
-          title="DeckyPlex"
-          showTitle
-          pages={pages}
-          page={browserTabRoute(activeTab)}
-          onPageRequested={(page) => {
-            const prefix = `${BROWSER_ROUTE}/`;
-            const requestedTab = page.startsWith(prefix) ? page.slice(prefix.length) : page;
-            if (tabKeys.includes(requestedTab as BrowserTab)) setActiveTab(requestedTab as BrowserTab);
-          }}
-        />
-      </Focusable>
+    <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
+    <div
+      onFocusCapture={(event) => {
+        focusZone.current = event.target instanceof HTMLElement && event.target.closest('[data-browser-zone="sidebar"]') ? 'sidebar' : 'content';
+      }}
+      style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0, overflow: 'hidden' }}
+    >
+      <div data-browser-zone="sidebar" ref={sidebarRef} style={{ width: '22%', minWidth: '180px', maxWidth: '260px', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)', padding: '0.35rem 0.45rem 0.5rem 0.2rem', overflowY: 'auto' }}>
+        <DialogLabel style={{ display: 'block', padding: '0.5rem 0.65rem 0.8rem' }}>DeckyPlex</DialogLabel>
+        <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
+          {tabConfig.map((config, idx) => (
+            <ButtonItem
+              key={tabKeys[idx]}
+              label={<span style={{ fontWeight: activeTab === tabKeys[idx] ? 600 : 400 }}>{config.title}{activeTab === tabKeys[idx] ? '  •' : ''}</span>}
+              icon={config.icon}
+              layout="inline"
+              bottomSeparator="none"
+              onClick={() => setActiveTab(tabKeys[idx])}
+            />
+          ))}
+        </Focusable>
+      </div>
+      <div data-browser-zone="content" style={{ flex: 1, minWidth: 0, overflowY: 'auto', paddingRight: '0.35rem' }}>
+        {renderContent()}
+      </div>
     </div>
+    </Focusable>
   );
 }
 
-function GridColumnsDialog({ initialColumns, onSave, onPreview, onCancel, onClose }: {
+function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
   initialColumns: number;
-  onSave: (columns: number) => void;
   onPreview: (columns: number) => void;
-  onCancel: () => void;
   onClose: () => void;
 }) {
   const [columns, setColumns] = useState(initialColumns);
-  const close = onClose;
-  const cancel = () => { onCancel(); close(); };
   return (
-    <ModalRoot closeModal={cancel} onCancel={cancel}>
+    <ModalRoot closeModal={onClose} onCancel={onClose} onOK={onClose}>
       <PanelSection title="Choose grid width">
         <PanelSectionRow>
           <SliderField label={`${columns} columns`} min={3} max={8} step={1} value={columns}
             onChange={(value: number) => { const next = Math.round(value); setColumns(next); onPreview(next); }} />
         </PanelSectionRow>
         <PanelSectionRow>
-          <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', width: '100%' }}>
-            <Button onClick={cancel}>Cancel</Button>
-            <Button onClick={() => { onSave(columns); close(); }}>Save</Button>
-          </Focusable>
+          <DialogBodyText style={{ opacity: 0.7 }}>You can change this later in Settings → Browser.</DialogBodyText>
         </PanelSectionRow>
+      </PanelSection>
+    </ModalRoot>
+  );
+}
+
+function TrackOptionsDialog({ track, addToQueue, onClose }: {
+  track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string };
+  addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => void;
+  onClose: () => void;
+}) {
+  return (
+    <ModalRoot closeModal={onClose} onCancel={onClose}>
+      <PanelSection title={track.title}>
+        <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
+        <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
+        <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
       </PanelSection>
     </ModalRoot>
   );
