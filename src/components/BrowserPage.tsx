@@ -83,6 +83,7 @@ export function BrowserPage() {
   const pendingScrollTop = useRef<number | undefined>(undefined);
   const pendingSearchFocus = useRef(false);
   const loadingMoreRef = useRef(false);
+  const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
@@ -111,6 +112,7 @@ export function BrowserPage() {
   const goBack = useCallback(() => {
     const previous = history[history.length - 1];
     if (previous) {
+      restoringHistoryRef.current = previous.subView === null;
       setHistory(history.slice(0, -1));
       setItems(previous.items);
       setSubView(previous.subView);
@@ -286,6 +288,10 @@ export function BrowserPage() {
   // Load data when tab changes
   useEffect(() => {
     if (!connected || !selectedSection || subView) return;
+    if (restoringHistoryRef.current) {
+      restoringHistoryRef.current = false;
+      return;
+    }
     if (activeTab === 'search') { setItems([]); return; }
     loadTabData(activeTab);
   }, [activeTab, connected, selectedSection, subView]);
@@ -295,6 +301,7 @@ export function BrowserPage() {
     const cacheKey = `tab:${selectedSection}:${tab}`;
     const cached = itemCache.current.get(cacheKey);
     const cacheIsFresh = !!cached && cached.expiresAt > Date.now();
+    const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
     if (cached) {
       setItems(cached.items);
       setTabHasMore(Boolean(cached.hasMore));
@@ -306,7 +313,6 @@ export function BrowserPage() {
     if (cacheIsFresh) return;
     try {
       let result: any;
-      const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
       if (tab === 'recent') {
         result = await cachedItems(cacheKey, ttl, () => call('get_recently_played', selectedSection, 100));
       } else if (tab === 'recentlyAdded') {
@@ -324,7 +330,16 @@ export function BrowserPage() {
           setItems([]);
         }
       } else if (Array.isArray(result.items)) {
-        setItems(result.items);
+        const firstPageIds = new Set(result.items.map((item: LibraryItem) => item.id));
+        const mergedItems = cached
+          ? [...result.items, ...cached.items.filter(item => !firstPageIds.has(item.id))]
+          : result.items;
+        setItems(mergedItems);
+        itemCache.current.set(cacheKey, {
+          items: mergedItems,
+          hasMore: Boolean(result.has_more),
+          expiresAt: Date.now() + ttl,
+        });
       } else {
         setItems([]);
       }
@@ -353,11 +368,16 @@ export function BrowserPage() {
         return;
       }
       const nextPage: LibraryItem[] = Array.isArray(result.items) ? result.items : [];
-      setItems(previous => {
-        const existing = new Set(previous.map(item => item.id));
-        return [...previous, ...nextPage.filter(item => !existing.has(item.id))];
-      });
+      const existing = new Set(items.map(item => item.id));
+      const mergedItems = [...items, ...nextPage.filter(item => !existing.has(item.id))];
+      setItems(mergedItems);
       setTabHasMore(Boolean(result.has_more));
+      const baseKey = `tab:${selectedSection}:${activeTab}`;
+      itemCache.current.set(baseKey, {
+        items: mergedItems,
+        hasMore: Boolean(result.has_more),
+        expiresAt: Date.now() + 300000,
+      });
     } catch (e) {
       setError('Could not load more music library items.');
     } finally {
