@@ -14,6 +14,9 @@ import {
   FaPause,
   FaForward,
   FaBackward,
+  FaStepForward,
+  FaStepBackward,
+  FaStop,
 } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 
@@ -35,6 +38,7 @@ export function QuickPlayer() {
     duration,
     play,
     pause,
+    stop,
     skipNext,
     skipPrevious,
     setVolume,
@@ -210,13 +214,22 @@ export function QuickPlayer() {
       <PanelSectionRow>
         <Focusable flow-children="horizontal" style={{ display: 'flex', justifyContent: 'center', gap: '1rem' }}>
           <Button onClick={() => skipPrevious()} disabled={!hasTrack}>
+            <FaStepBackward />
+          </Button>
+          <Button onClick={() => seek(Math.max(0, progress - 10))} disabled={!hasTrack}>
             <FaBackward />
           </Button>
           <Button onClick={() => isPlaying ? pause() : play()} disabled={!hasTrack}>
             {isPlaying ? <FaPause /> : <FaPlay />}
           </Button>
-          <Button onClick={() => skipNext()} disabled={!hasTrack}>
+          <Button onClick={() => seek(Math.min(duration, progress + 10))} disabled={!hasTrack}>
             <FaForward />
+          </Button>
+          <Button onClick={() => skipNext()} disabled={!hasTrack}>
+            <FaStepForward />
+          </Button>
+          <Button onClick={() => stop()} disabled={!hasTrack || isStopped}>
+            <FaStop />
           </Button>
         </Focusable>
       </PanelSectionRow>

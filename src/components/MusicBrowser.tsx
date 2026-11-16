@@ -230,7 +230,7 @@ export function MusicBrowser({ onBack }: MusicBrowserProps) {
 
   // Render a single clickable item row
   const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
-    const imageUrl = (item.type === 'artist' || item.type === 'album') ? (item.art || item.thumb) : item.thumb;
+    const imageUrl = item.type === 'artist' ? (item.art || item.thumb) : (item.thumb || item.art);
     return (
       <PanelSectionRow key={idx}>
         <div

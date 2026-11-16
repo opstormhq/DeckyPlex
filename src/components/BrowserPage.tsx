@@ -4,12 +4,15 @@ import {
   PanelSectionRow,
   DialogBodyText,
   ButtonItem,
+  Button,
+  Focusable,
   TextField,
   Spinner,
   SidebarNavigation,
+  Navigation,
 } from '@decky/ui';
 import { call } from '@decky/api';
-import { FaSearch, FaMusic, FaCompactDisc, FaUser } from 'react-icons/fa';
+import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 
 interface LibraryItem {
@@ -29,7 +32,13 @@ interface LibraryItem {
   duration?: number;
 }
 
-type BrowserTab = 'artists' | 'albums' | 'tracks' | 'search';
+type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'playlists' | 'search';
+type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string } | null;
+interface BrowserHistoryEntry {
+  items: LibraryItem[];
+  subView: BrowserSubView;
+  searchQuery: string;
+}
 
 export function BrowserPage() {
   const { playTrack } = usePlayer();
@@ -40,10 +49,41 @@ export function BrowserPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSection, setSelectedSection] = useState<string>('');
   const [connected, setConnected] = useState(false);
-  const [subView, setSubView] = useState<{ type: 'albums' | 'tracks' | 'search'; title: string } | null>(null);
+  const [subView, setSubView] = useState<BrowserSubView>(null);
+  const [history, setHistory] = useState<BrowserHistoryEntry[]>([]);
 
   const activeTabRef = useRef(activeTab);
   activeTabRef.current = activeTab;
+
+  useEffect(() => {
+    setHistory([]);
+    setSubView(null);
+  }, [activeTab]);
+
+  const goBack = useCallback(() => {
+    const previous = history[history.length - 1];
+    if (previous) {
+      setHistory(history.slice(0, -1));
+      setItems(previous.items);
+      setSubView(previous.subView);
+      setSearchQuery(previous.searchQuery);
+    } else {
+      Navigation.NavigateBack();
+    }
+  }, [history]);
+
+  useEffect(() => {
+    const onBackKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && history.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        goBack();
+      }
+    };
+    window.addEventListener('keydown', onBackKey, true);
+    return () => window.removeEventListener('keydown', onBackKey, true);
+  }, [history, goBack]);
 
   // Check connection status periodically
   useEffect(() => {
@@ -79,10 +119,8 @@ export function BrowserPage() {
 
   // Load data when tab changes
   useEffect(() => {
-    if (!connected || !selectedSection || subView || activeTab === 'search') {
-      if (activeTab === 'search') setItems([]);
-      return;
-    }
+    if (!connected || !selectedSection || subView) return;
+    if (activeTab === 'search') { setItems([]); return; }
     loadTabData(activeTab);
   }, [activeTab, connected, selectedSection, subView]);
 
@@ -90,11 +128,15 @@ export function BrowserPage() {
     setLoading(true);
     setError(null);
     try {
-      let typeFilter = '';
-      if (tab === 'artists') typeFilter = 'artist';
-      else if (tab === 'albums') typeFilter = 'album';
-      else if (tab === 'tracks') typeFilter = 'track';
-      const result: any = await call("get_section_contents", selectedSection, typeFilter, 100);
+      let result: any;
+      if (tab === 'recent') {
+        result = await call('get_recently_played', selectedSection, 100);
+      } else if (tab === 'playlists') {
+        result = await call('get_audio_playlists', 100);
+      } else {
+        const typeFilter = tab === 'artists' ? 'artist' : tab === 'albums' ? 'album' : 'track';
+        result = await call("get_section_contents", selectedSection, typeFilter, 100);
+      }
       if (result.items) {
         setItems(result.items);
       } else if (result.error) {
@@ -112,6 +154,7 @@ export function BrowserPage() {
   }, [selectedSection]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
+    setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'albums', title: artistName || 'Albums' });
@@ -128,9 +171,27 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [items, subView, searchQuery]);
+
+  const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
+    setHistory(previous => [...previous, { items, subView, searchQuery }]);
+    setLoading(true);
+    setError(null);
+    setSubView({ type: 'tracks', title: playlistName || 'Playlist' });
+    try {
+      const result: any = await call('get_playlist_tracks', playlistId, 200);
+      if (result.items) setItems(result.items);
+      else { setItems([]); if (result.error) setError(result.error); }
+    } catch {
+      setError('Failed to load playlist tracks.');
+      setItems([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [items, subView, searchQuery]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
+    setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: albumName || 'Tracks' });
@@ -147,10 +208,11 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [items, subView, searchQuery]);
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
+    setHistory(previous => [...previous, { items, subView, searchQuery }]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'search', title: 'Search Results' });
@@ -164,7 +226,7 @@ export function BrowserPage() {
     } finally {
       setLoading(false);
     }
-  }, [searchQuery, selectedSection]);
+  }, [searchQuery, selectedSection, items, subView]);
 
   const handlePlayTrack = useCallback(async (item: LibraryItem) => {
     try {
@@ -214,10 +276,12 @@ export function BrowserPage() {
       loadAlbums(item.id, item.title);
     } else if (item.type === 'album') {
       loadTracks(item.id, item.title);
+    } else if (item.type === 'playlist') {
+      loadPlaylistTracks(item.id, item.title);
     } else if (item.type === 'track') {
       handlePlayTrack(item);
     }
-  }, [loadAlbums, loadTracks, handlePlayTrack]);
+  }, [loadAlbums, loadTracks, loadPlaylistTracks, handlePlayTrack]);
 
   const handleSearchItemClick = useCallback((item: LibraryItem) => {
     if (item.type === 'track') {
@@ -229,12 +293,6 @@ export function BrowserPage() {
     }
   }, [loadAlbums, loadTracks, handlePlayTrack]);
 
-  const goBack = useCallback(() => {
-    setSubView(null);
-    setItems([]);
-    setSearchQuery('');
-  }, []);
-
   const formatDuration = (ms: number) => {
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
@@ -243,15 +301,23 @@ export function BrowserPage() {
   };
 
   const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
-    const imageUrl = (item.type === 'artist' || item.type === 'album') ? (item.art || item.thumb) : item.thumb;
+    const imageUrl = item.type === 'artist' ? (item.art || item.thumb) : (item.thumb || item.art);
     return (
-      <ButtonItem key={idx} onClick={onClick}>
+      <Focusable
+        key={idx}
+        flow-children="horizontal"
+        onActivate={onClick}
+        onClick={onClick}
+        style={{
+          display: 'flex', alignItems: 'center', width: '100%', gap: '0.75rem',
+          padding: '0.45rem 0.5rem', borderBottom: '1px solid rgba(255,255,255,0.08)',
+        }}
+      >
           <div style={{
             display: 'flex',
             alignItems: 'center',
             gap: '0.5rem',
             width: '100%',
-            padding: '0.25rem 0',
           }}>
             {imageUrl ? (
               <div style={{
@@ -269,6 +335,7 @@ export function BrowserPage() {
                 {item.type === 'track' && <FaMusic size={12} />}
                 {item.type === 'album' && <FaCompactDisc size={12} />}
                 {item.type === 'artist' && <FaUser size={12} />}
+                {item.type === 'playlist' && <FaListUl size={12} />}
               </div>
             )}
             <div style={{ flex: 1, overflow: 'hidden' }}>
@@ -291,6 +358,11 @@ export function BrowserPage() {
                   {item.year ? ` • ${item.year}` : ''}
                 </DialogBodyText>
               )}
+              {item.type === 'playlist' && item.leafCount != null && (
+                <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
+                  {item.leafCount} track{item.leafCount === 1 ? '' : 's'}
+                </DialogBodyText>
+              )}
               {item.type !== 'album' && item.year && (
                 <DialogBodyText style={{ fontSize: '0.75rem', opacity: 0.6 }}>
                   {item.year}
@@ -303,7 +375,7 @@ export function BrowserPage() {
               </DialogBodyText>
             )}
           </div>
-      </ButtonItem>
+      </Focusable>
     );
   };
 
@@ -333,10 +405,10 @@ export function BrowserPage() {
 
         {!subView && activeTab === 'search' && (
           <PanelSectionRow>
-            <div style={{ display: 'flex', gap: '0.5rem', width: '100%' }}>
+            <Focusable flow-children="horizontal" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
                 label=""
-                style={{ flex: 1, minWidth: 0, width: '100%' }}
+                style={{ flex: '1 1 0', minWidth: '240px', width: '100%', boxSizing: 'border-box' }}
                 value={searchQuery}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
                 placeholder="Search artists, albums, tracks..."
@@ -347,7 +419,10 @@ export function BrowserPage() {
                   }
                 }}
               />
-            </div>
+              <Button onClick={handleSearch}>
+                <FaSearch />
+              </Button>
+            </Focusable>
           </PanelSectionRow>
         )}
 
@@ -368,7 +443,7 @@ export function BrowserPage() {
 
         {!loading && !error && items.length > 0 && (
           <PanelSectionRow>
-            <div style={{ display: 'flex', flexDirection: 'column', width: '100%', gap: '2px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
             {items.map((item, idx) => {
               const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
               return renderItemRow(item, idx, handleClick);
@@ -394,11 +469,13 @@ export function BrowserPage() {
   };
 
   // SidebarNavigation pages - each tab triggers setActiveTab via effect
-  const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'search'];
+  const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'recent', 'playlists', 'search'];
   const tabConfig = [
     { title: 'Artists', icon: <FaUser /> },
     { title: 'Albums', icon: <FaCompactDisc /> },
     { title: 'Songs', icon: <FaMusic /> },
+    { title: 'Recently Played', icon: <FaHistory /> },
+    { title: 'Playlists', icon: <FaListUl /> },
     { title: 'Search', icon: <FaSearch /> },
   ];
 

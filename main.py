@@ -162,6 +162,35 @@ class PlexHTTP:
         item = self.sdk.fetchItem(int(metadata_id))
         return [self._item_dict(child) for child in item.fetchItems(f"{item.key}/children")]
 
+    def get_recently_played(self, section_id: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        """Return recently played tracks using PlexAPI's server history endpoint."""
+        history = self.sdk.history(
+            maxresults=max(1, min(int(limit), 100)),
+            librarySectionID=int(section_id) if section_id else None,
+        )
+        return [self._item_dict(item) for item in history if getattr(item, "type", "") == "track"]
+
+    def get_audio_playlists(self, limit: int = 100) -> List[Dict[str, Any]]:
+        playlists = self.sdk.playlists(playlistType="audio", sort="titleSort:asc")
+        result = []
+        for playlist in playlists[:max(1, min(int(limit), 100))]:
+            composite = getattr(playlist, "composite", "") or ""
+            result.append({
+                "id": str(playlist.ratingKey), "key": playlist.key,
+                "title": playlist.title or "Untitled playlist", "type": "playlist",
+                "thumb": self.sdk.url(composite, includeToken=True) if composite else "",
+                "summary": playlist.summary or "", "leafCount": playlist.leafCount or 0,
+                "duration": playlist.duration or 0,
+            })
+        return result
+
+    def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        playlists = self.sdk.playlists(playlistType="audio")
+        playlist = next((item for item in playlists if str(item.ratingKey) == str(playlist_id)), None)
+        if playlist is None:
+            raise ValueError("Audio playlist not found")
+        return [self._item_dict(item) for item in playlist.items(libtype="track")[:max(1, min(int(limit), 200))]]
+
     def search_library(self, query: str, section_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
         if section_id:
             results = self.sdk.library.sectionByID(int(section_id)).search(title=query, maxresults=limit)
@@ -539,6 +568,36 @@ class Plugin:
             logger.error(f"Failed to get metadata children: {e}")
             return {"items": [], "error": str(e)}
 
+    async def get_recently_played(self, section_id: str = "", limit: int = 50) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            return {"items": plex.get_recently_played(section_id, limit)}
+        except Exception as e:
+            logger.error(f"Failed to get recently played tracks: {e}")
+            return {"items": [], "error": str(e)}
+
+    async def get_audio_playlists(self, limit: int = 100) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            return {"items": plex.get_audio_playlists(limit)}
+        except Exception as e:
+            logger.error(f"Failed to get audio playlists: {e}")
+            return {"items": [], "error": str(e)}
+
+    async def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            return {"items": plex.get_playlist_tracks(playlist_id, limit)}
+        except Exception as e:
+            logger.error(f"Failed to get tracks from playlist {playlist_id}: {e}")
+            return {"items": [], "error": str(e)}
+
     async def search_library(self, query: str, section_id: str = "", limit: int = 20) -> Dict[str, Any]:
         """Search the library for tracks, albums, or artists."""
         plex = self._get_plex()
@@ -613,6 +672,27 @@ class Plugin:
             }
         except Exception as e:
             logger.error(f"Failed to get stream for track: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
+
+    async def report_playback(self, rating_key: str, time_ms: int, state: str,
+                              duration_ms: int = 0) -> Dict[str, Any]:
+        """Report this local player's timeline through PlexAPI for sessions/history."""
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        if state not in ("playing", "paused", "stopped"):
+            return {"success": False, "error": "Invalid playback state"}
+        try:
+            track = plex.sdk.fetchItem(int(rating_key))
+            track.updateTimeline(
+                max(0, int(time_ms)),
+                state=state,
+                duration=max(0, int(duration_ms)) or None,
+            )
+            logger.debug(f"Reported Plex timeline: track={rating_key}, state={state}, time={time_ms}")
+            return {"success": True}
+        except Exception as e:
+            logger.warning(f"Failed to report Plex timeline for track {rating_key}: {e}")
             return {"success": False, "error": str(e)}
 
     async def plex_login(self) -> Dict[str, Any]:

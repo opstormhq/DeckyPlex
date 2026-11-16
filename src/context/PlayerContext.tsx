@@ -32,6 +32,7 @@ interface PlayerContextType extends PlayerState {
   playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[]) => void;
   play: () => void;
   pause: () => void;
+  stop: () => void;
   skipNext: () => void;
   skipPrevious: () => void;
   setVolume: (volume: number) => void;
@@ -47,10 +48,28 @@ sharedAudio.volume = 0.5;
 let sharedTrack: TrackInfo | null = null;
 let sharedQueue: TrackInfo[] = [];
 let sharedQueueIndex = -1;
+let lastTimelineReportAt = 0;
+let lastTimelineReportKey = '';
+let explicitlyStopped = false;
 
 // Send a debug message from the browser to the backend log file
 function logToBackend(message: string) {
   call("log_message", message).catch(() => {});
+}
+
+function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) {
+  if (!sharedTrack?.id) return;
+  const now = Date.now();
+  const reportKey = `${sharedTrack.id}:${state}`;
+  if (reportKey === lastTimelineReportKey && now - lastTimelineReportAt < (state === 'playing' ? 9000 : 750)) return;
+  if (!force && state === 'playing' && now - lastTimelineReportAt < 9000 && lastTimelineReportKey.startsWith(`${sharedTrack.id}:`)) return;
+  lastTimelineReportAt = now;
+  lastTimelineReportKey = reportKey;
+  const duration = Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+    ? sharedAudio.duration
+    : (sharedTrack.duration || 0) / 1000;
+  call('report_playback', sharedTrack.id, Math.round((sharedAudio.currentTime || 0) * 1000), state,
+    Math.round(duration * 1000)).catch(() => {});
 }
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
@@ -68,16 +87,27 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     audioRef.current = sharedAudio;
 
-    const onPlay = () => setState(s => ({ ...s, playbackState: "playing", error: null }));
-    const onPause = () => {
-      if (sharedAudio.paused) setState(s => ({ ...s, playbackState: "paused" }));
+    const onPlay = () => {
+      reportTimeline('playing');
+      setState(s => ({ ...s, playbackState: "playing", error: null }));
     };
-    const onEnded = () => setState(s => ({ ...s, playbackState: "stopped", progress: 0 }));
+    const onPause = () => {
+      if (sharedAudio.paused && !explicitlyStopped) {
+        setState(s => ({ ...s, playbackState: "paused" }));
+      }
+    };
+    const onEnded = () => {
+      explicitlyStopped = true;
+      reportTimeline('stopped', true);
+      setState(s => ({ ...s, playbackState: "stopped", progress: 0 }));
+    };
     const onError = (e: Event) => {
       const audio = e.target as HTMLAudioElement;
       const mediaError = audio.error;
       const msg = mediaError ? mediaError.message : "Playback error";
       logToBackend(`audio error: code=${mediaError?.code} ${msg}`);
+      explicitlyStopped = true;
+      reportTimeline('stopped', true);
       setState(s => ({ ...s, playbackState: "stopped", error: msg }));
     };
     const onTimeUpdate = () => setState(s => ({
@@ -109,6 +139,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     sharedAudio.addEventListener('loadedmetadata', onLoadedMetadata);
     sharedAudio.addEventListener('durationchange', onDurationChange);
     window.addEventListener('deckyplex-track-change', onTrackChange);
+    const timelineTimer = window.setInterval(() => {
+      if (!sharedAudio.paused) reportTimeline('playing');
+    }, 10000);
     setState(s => ({
       ...s,
       track: sharedTrack,
@@ -128,6 +161,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       sharedAudio.removeEventListener('loadedmetadata', onLoadedMetadata);
       sharedAudio.removeEventListener('durationchange', onDurationChange);
       window.removeEventListener('deckyplex-track-change', onTrackChange);
+      window.clearInterval(timelineTimer);
     };
   }, []);
 
@@ -139,6 +173,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
 
     logToBackend(`playTrack: URL = ${streamUrl.substring(0, 120)}...`);
+    explicitlyStopped = false;
     sharedTrack = trackInfo;
     if (queue?.length) {
       sharedQueue = queue;
@@ -170,6 +205,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const play = useCallback(() => {
     if (audioRef.current) {
+      explicitlyStopped = false;
       audioRef.current.play().catch((e: Error) => {
         setState(s => ({ ...s, error: e.message || "Failed to play" }));
       });
@@ -178,8 +214,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const pause = useCallback(() => {
     if (audioRef.current) {
+      reportTimeline('paused', true);
       audioRef.current.pause();
     }
+  }, []);
+
+  const stop = useCallback(() => {
+    const audio = audioRef.current;
+    explicitlyStopped = true;
+    reportTimeline('stopped', true);
+    if (audio) {
+      audio.pause();
+      try { audio.currentTime = 0; } catch { /* Metadata may not be available yet. */ }
+    }
+    setState(s => ({ ...s, playbackState: "stopped", progress: 0 }));
   }, []);
 
   const playQueueIndex = useCallback(async (index: number) => {
@@ -227,6 +275,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         playTrack,
         play,
         pause,
+        stop,
         skipNext,
         skipPrevious,
         setVolume,
