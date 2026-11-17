@@ -17,6 +17,8 @@ interface TrackInfo {
   album: string;
   duration: number;
   thumb: string;
+  key?: string;
+  playQueueItemID?: string;
 }
 
 interface PlayerState {
@@ -58,7 +60,7 @@ const engine: any = (window as any).__deckyPlexPlaybackEngine || ((window as any
   audio: new Audio(), track: null, queue: [], queueIndex: -1, queueLoader: null,
   queueLoadInProgress: false, requestId: 0, pendingRequestId: 0, failedRequestId: 0,
   timelineAt: 0, timelineKey: '', explicitlyStopped: false, diagnosedSource: '',
-  remoteActive: false, listenersInitialized: false,
+  remoteActive: false, companionActive: false, listenersInitialized: false,
 });
 const sharedAudio: HTMLAudioElement = engine.audio;
 if (!engine.audioInitialized) {
@@ -72,6 +74,19 @@ function logToBackend(message: string) {
 }
 
 function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) {
+  if (engine.companionActive && engine.track?.id) {
+    const now = Date.now();
+    if (force || now - (engine.companionTimelineAt || 0) >= 900) {
+      engine.companionTimelineAt = now;
+      const duration = Number.isFinite(sharedAudio.duration) && sharedAudio.duration > 0
+        ? sharedAudio.duration : (engine.track.duration || 0) / 1000;
+      void call('report_companion_timeline', engine.track.id,
+        Math.round((sharedAudio.currentTime || 0) * 1000), Math.round(duration * 1000), state,
+        Math.round((sharedAudio.volume || 0) * 100), engine.companionPlayQueueId || '',
+        engine.track.playQueueItemID || '', engine.companionContainerKey || '',
+        engine.companionPlayQueueVersion || '');
+    }
+  }
   if (engine.remoteActive || !engine.track?.id) return;
   const now = Date.now();
   const reportKey = `${engine.track.id}:${state}`;
@@ -214,7 +229,7 @@ sharedAudio.addEventListener('ended', () => {
 });
 window.setInterval(() => {
   if (!sharedAudio.paused) reportTimeline('playing');
-}, 10000);
+}, 1000);
 }
 
 async function loadMoreQueue() {
@@ -237,6 +252,128 @@ async function loadMoreQueue() {
     engine.queueLoadInProgress = false;
   }
 }
+
+async function startCompanionTrack(params: Record<string, string[]>) {
+  const requestedKey = params.key?.[0] || '';
+  if (engine.companionActive && !sharedAudio.paused && engine.track?.key === requestedKey) {
+    logToBackend(`Plex Companion repeated current playMedia; keeping ${engine.track.title} active`);
+    return;
+  }
+  const prepared: any = await call('prepare_companion_playback', requestedKey, params.containerKey?.[0] || '');
+  if (!prepared?.success || !prepared.track || !prepared.stream_url) {
+    window.dispatchEvent(new CustomEvent('deckyplex-playback-error', {
+      detail: { message: prepared?.error || 'Plexamp sent an unsupported track.' },
+    }));
+    return;
+  }
+  const toTrack = (item: any): TrackInfo => ({
+    id: String(item.id || ''), sectionId: String(item.sectionId || ''), title: item.title || 'Unknown',
+    artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '',
+    duration: Number(item.duration) || 0, thumb: item.thumb || '',
+    key: item.key || '', playQueueItemID: item.playQueueItemID || '',
+  });
+  const queue = (prepared.queue || [prepared.track]).map(toTrack).filter((item: TrackInfo) => item.id);
+  const selected = toTrack(prepared.track);
+  const requestId = ++engine.requestId;
+  if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
+  engine.companionActive = true;
+  engine.companionPlayQueueId = prepared.play_queue_id || '';
+  engine.companionContainerKey = prepared.container_key || '';
+  engine.companionPlayQueueVersion = prepared.play_queue_version || '';
+  engine.remoteActive = false;
+  engine.pendingRequestId = requestId;
+  engine.failedRequestId = 0;
+  engine.explicitlyStopped = true;
+  sharedAudio.pause();
+  sharedAudio.removeAttribute('src');
+  sharedAudio.load();
+  engine.track = selected;
+  engine.queue = queue.length ? queue : [selected];
+  engine.queueIndex = Math.max(0, engine.queue.findIndex((item: TrackInfo) => item.id === selected.id));
+  engine.queueLoader = null;
+  engine.queueLoadInProgress = false;
+  window.dispatchEvent(new Event('deckyplex-queue-change'));
+  window.dispatchEvent(new Event('deckyplex-track-change'));
+  logToBackend(`Plex Companion starting ${selected.title} (${engine.queue.length} queued track(s))`);
+  try {
+    const started = await playStreamWithFallback(prepared.stream_url, prepared.fallback_stream_url || '', selected.title, requestId);
+    if (requestId !== engine.requestId || !started) return;
+    window.dispatchEvent(new Event('deckyplex-track-change'));
+    const offset = Number(params.offset?.[0] || 0);
+    if (offset > 0) window.setTimeout(() => {
+      if (engine.track?.id === selected.id && Number.isFinite(sharedAudio.duration)) sharedAudio.currentTime = offset / 1000;
+    }, 500);
+  } catch (error: any) {
+    if (requestId !== engine.requestId) return;
+    const message = error?.message || 'Could not start incoming Plex playback.';
+    logToBackend(`Plex Companion playback failed: ${message}`);
+    window.dispatchEvent(new CustomEvent('deckyplex-playback-error', { detail: { message, requestId } }));
+  }
+}
+
+function handleCompanionCommand(entry: any) {
+  const params: Record<string, string[]> = entry.params || {};
+  const value = (key: string) => Number(params[key]?.[0] || 0);
+  switch (entry.command) {
+    case 'playMedia': void startCompanionTrack(params); break;
+    case 'play':
+      engine.explicitlyStopped = false;
+      void sharedAudio.play().catch((error: any) => logToBackend(`Plex Companion resume failed: ${error?.message || error}`));
+      break;
+    case 'pause':
+      logToBackend('Plex Companion pause command received');
+      sharedAudio.pause();
+      reportTimeline('paused', true);
+      break;
+    case 'stop':
+      logToBackend('Plex Companion stop command received');
+      stopSharedPlayback(true);
+      engine.companionActive = false;
+      window.dispatchEvent(new Event('deckyplex-companion-stop'));
+      break;
+    case 'next':
+      if (engine.queueIndex + 1 < engine.queue.length) void playQueuedIndex(engine.queueIndex + 1);
+      break;
+    case 'previous': {
+      const previous = sharedAudio.currentTime > 3 ? engine.queueIndex : engine.queueIndex - 1;
+      if (previous >= 0 && previous < engine.queue.length) void playQueuedIndex(previous);
+      else sharedAudio.currentTime = 0;
+      break;
+    }
+    case 'seek':
+      sharedAudio.currentTime = Math.max(0, value('offset') / 1000);
+      reportTimeline(sharedAudio.paused ? 'paused' : 'playing', true);
+      break;
+    case 'parameters': {
+      const volume = params.volume?.[0];
+      if (volume != null) {
+        sharedAudio.volume = Math.max(0, Math.min(100, Number(volume) || 0)) / 100;
+        window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: Math.round(sharedAudio.volume * 100) }));
+      }
+      break;
+    }
+  }
+}
+
+function startCompanionCommandPolling() {
+  if (engine.companionPolling) return;
+  engine.companionPolling = true;
+  let polling = false;
+  window.setInterval(async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const response: any = await call('poll_companion_commands');
+      for (const entry of response?.commands || []) handleCompanionCommand(entry);
+    } catch (error: any) {
+      logToBackend(`Plex Companion command poll failed: ${error?.message || error}`);
+    } finally {
+      polling = false;
+    }
+  }, 500);
+}
+
+startCompanionCommandPolling();
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -327,10 +464,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       track: engine.track,
       progress: 0,
       duration: engine.track ? (engine.track.duration || 0) / 1000 : 0,
-      playbackState: s.remoteMode ? s.playbackState : engine.track ? 'paused' : 'stopped',
+      remoteMode: engine.companionActive ? false : s.remoteMode,
+      playbackState: engine.companionActive ? (sharedAudio.paused ? 'paused' : 'playing') : s.remoteMode ? s.playbackState : engine.track ? 'paused' : 'stopped',
       error: null,
     }));
     const onQueueChange = () => setState(s => ({ ...s, queue: engine.queue.slice(), queueIndex: engine.queueIndex }));
+    const onVolumeChange = (event: Event) => {
+      const volume = Number((event as CustomEvent<number>).detail);
+      if (Number.isFinite(volume)) setState(s => ({ ...s, volume }));
+    };
     const onPlaybackError = (event: Event) => {
       const detail = (event as CustomEvent<{ message?: string; requestId?: number }>).detail;
       if (detail?.requestId != null && detail.requestId !== engine.requestId) return;
@@ -347,6 +489,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     sharedAudio.addEventListener('durationchange', onDurationChange);
     window.addEventListener('deckyplex-track-change', onTrackChange);
     window.addEventListener('deckyplex-queue-change', onQueueChange);
+    window.addEventListener('deckyplex-volume-change', onVolumeChange);
     window.addEventListener('deckyplex-playback-error', onPlaybackError);
     setState(s => ({
       ...s,
@@ -368,6 +511,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       sharedAudio.removeEventListener('durationchange', onDurationChange);
       window.removeEventListener('deckyplex-track-change', onTrackChange);
       window.removeEventListener('deckyplex-queue-change', onQueueChange);
+      window.removeEventListener('deckyplex-volume-change', onVolumeChange);
       window.removeEventListener('deckyplex-playback-error', onPlaybackError);
     };
   }, []);
@@ -389,11 +533,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         }
         setState(s => ({
           ...s,
-          remoteMode: settings.playback_target === 'remote' && !!settings.selected_player_id,
+          remoteMode: !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id,
           remotePlayerId: settings.selected_player_id || '',
           remotePlayerName: settings.selected_player_name || '',
         }));
-        engine.remoteActive = settings.playback_target === 'remote' && !!settings.selected_player_id;
+        engine.remoteActive = !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id;
       } catch {}
     };
     refreshTarget();

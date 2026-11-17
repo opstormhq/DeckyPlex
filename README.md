@@ -8,6 +8,7 @@ A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) music player
 - **Quick player**: Play, pause, seek, and adjust volume from the Decky sidebar.
 - **Plex login**: Sign in with a Plex PIN and select a server.
 - **Remote Plex players**: Start music on and control connected Plex clients such as Plexamp on a phone.
+- **Plex Companion receiver**: Advertise DeckyPlex on the local network so Plexamp can send music to the Steam Machine.
 - **Advanced connection settings**: Override automatic discovery with a local server IP, set a connection timeout, and configure HTTPS certificate verification.
 
 ## Prerequisites
@@ -33,6 +34,7 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 3. Select a Plex server with a music library.
 4. To play on another Plex client, open **Settings > Players**, refresh the list, select a connected player, and choose it as the playback target.
 5. If automatic discovery selected an unreachable server address, open **Settings > Advanced** and enter the server's local IP address.
+6. Plexamp can discover DeckyPlex as a receiver when both devices are on the same LAN and local GDM discovery is allowed. DeckyPlex listens on TCP 32435 and UDP 32412 for Plex Companion traffic.
 
 ## Usage
 
@@ -43,7 +45,7 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 
 ### Using Plexamp on a phone as a remote
 
-DeckyPlex currently plays locally in the Decky webview. Plexamp on a phone cannot yet select DeckyPlex as a receiver. The PlexAPI SDK supports controlling connected Plex players, which DeckyPlex uses for remote playback targets, but it does not implement advertising DeckyPlex as a player or handling incoming Plex Companion commands. Phone-to-Decky control requires a separate Plex Companion receiver implementation.
+DeckyPlex advertises a local Plex Companion player endpoint and routes received track, playback, seek, and volume commands to the Decky audio engine. Incoming playback uses the Plex server selected in Settings. Plex Companion discovery requires the devices to share a local network; GDM uses UDP discovery and the receiver uses TCP 32435. The receiver status appears in **Settings > Players**.
 
 ## Development
 

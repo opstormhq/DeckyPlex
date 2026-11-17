@@ -1,9 +1,17 @@
 import json
+import html
+import ipaddress
 import os
 import random
+import re
 import secrets
+import socket
 import sys
+import threading
+import time
 import urllib.parse
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 # Add py_modules to Python path so bundled dependencies (plexapi, requests) are available
@@ -47,6 +55,7 @@ DEFAULT_SETTINGS = {
     "verify_tls": False,
     "logged_in_username": "",
     "server_access_token": "",
+    "companion_id": "",
 }
 
 # Settings file path — Decky provides this directory
@@ -97,6 +106,269 @@ def _save_settings(settings: Dict[str, Any]) -> None:
 _pin_state: Dict[str, Any] = {}
 _plex_cache_key = None
 _plex_cache_instance = None
+_companion_receiver = None
+
+
+class PlexCompanionReceiver:
+    """Minimal local Plex Companion player endpoint for Plexamp casting."""
+    HTTP_PORT = int(os.environ.get("DECKYPLEX_COMPANION_PORT", "32435"))
+    GDM_PORT = 32412
+
+    def __init__(self, machine_id: str):
+        self.machine_id = machine_id
+        self.httpd = None
+        self.http_thread = None
+        self.gdm_socket = None
+        self.gdm_thread = None
+        self.lock = threading.Lock()
+        self.commands: List[Dict[str, Any]] = []
+        self.controllers: Dict[str, Dict[str, Any]] = {}
+        self.timeline: Dict[str, Any] = {"state": "stopped", "time": 0, "duration": 0}
+        self.error = ""
+
+    def _response_headers(self) -> bytes:
+        return ("HTTP/1.0 200 OK\r\n"
+                "Content-Type: plex/media-player\r\n"
+                "Name: DeckyPlex\r\n"
+                f"Port: {self.HTTP_PORT}\r\n"
+                "Product: DeckyPlex\r\n"
+                "Protocol: plex\r\n"
+                "Protocol-Version: 1\r\n"
+                "Protocol-Capabilities: timeline,playback\r\n"
+                f"Resource-Identifier: {self.machine_id}\r\n"
+                "Device-Class: stb\r\n"
+                "Version: 1.0.0\r\n\r\n").encode("utf-8")
+
+    def enqueue(self, name: str, params: Dict[str, Any], client_host: str = "", client_id: str = "") -> None:
+        try:
+            command_id = int(params.get("commandID", ["0"])[0])
+        except (TypeError, ValueError):
+            command_id = 0
+        with self.lock:
+            self.commands.append({"command": name, "params": params, "client_host": client_host,
+                                  "client_id": client_id, "received_at": time.time()})
+            self.commands = self.commands[-32:]
+            if client_id in self.controllers:
+                self.controllers[client_id]["commandId"] = command_id
+            else:
+                for controller in self.controllers.values():
+                    if controller.get("host") == client_host:
+                        controller["commandId"] = command_id
+        if name == "playMedia":
+            logger.info("Companion received playMedia from %s: key=%s containerKey=%s",
+                        client_host, params.get("key", [""])[0], params.get("containerKey", [""])[0])
+        else:
+            logger.info("Companion received %s from %s (commandID=%s)", name, client_host, command_id)
+
+    def drain_commands(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            commands, self.commands = self.commands, []
+        return commands
+
+    def subscribe(self, host: str, params: Dict[str, Any], client_id: str = "") -> None:
+        try:
+            port = int(params.get("port", [""])[0])
+        except (TypeError, ValueError):
+            return
+        if host and port:
+            try:
+                command_id = int(params.get("commandID", ["0"])[0])
+            except (TypeError, ValueError):
+                command_id = 0
+            controller = {"host": host, "port": port, "clientId": client_id, "commandId": command_id,
+                          "protocol": params.get("protocol", ["http"])[0]}
+            with self.lock:
+                self.controllers[client_id or f"{host}:{port}"] = controller
+                timeline = dict(self.timeline)
+            self._notify_controllers([controller], timeline)
+
+    def set_timeline(self, timeline: Dict[str, Any]) -> None:
+        with self.lock:
+            self.timeline = dict(timeline)
+            controllers = list(self.controllers.values())
+        self._notify_controllers(controllers, timeline)
+
+    def _notify_controllers(self, controllers: List[Dict[str, Any]], timeline: Dict[str, Any]) -> None:
+        if not controllers:
+            return
+        try:
+            import requests
+            for controller in controllers:
+                scheme = "https" if controller.get("protocol") == "https" else "http"
+                url = f"{scheme}://{controller['host']}:{controller['port']}/:/timeline"
+                media = self._timeline_xml(timeline, controller.get("commandId", 0))
+                try:
+                    requests.post(url, data=media, timeout=0.35,
+                                  headers={"Content-Type": "application/xml",
+                                           "X-Plex-Client-Identifier": self.machine_id,
+                                           "X-Plex-Device-Name": "DeckyPlex"})
+                except Exception as exc:
+                    logger.debug("Companion timeline delivery failed: %s", exc)
+        except Exception as exc:
+            logger.debug("Could not publish Companion timeline: %s", exc)
+
+    @staticmethod
+    def _timeline_xml(state: Dict[str, Any], command_id: int = 0) -> bytes:
+        attrs = {
+            "type": "music", "state": state.get("state", "stopped"),
+            "time": int(state.get("time", 0)), "duration": int(state.get("duration", 0)),
+            "key": state.get("key", ""), "machineIdentifier": state.get("serverId", ""),
+            "address": state.get("address", ""), "port": state.get("port", 32400),
+            "protocol": state.get("protocol", "http"), "token": state.get("token", ""),
+            "volume": int(state.get("volume", 50)),
+            "controllable": "volume,seekTo,skipNext,skipPrevious,stop,playPause",
+        }
+        if state.get("playQueueID"):
+            attrs["playQueueID"] = state["playQueueID"]
+            attrs["playQueueItemID"] = state.get("playQueueItemID", "")
+            attrs["containerKey"] = state.get("containerKey", "")
+            if state.get("playQueueVersion"):
+                attrs["playQueueVersion"] = state["playQueueVersion"]
+        values = " ".join(f'{name}=\"{html.escape(str(value), quote=True)}\"' for name, value in attrs.items())
+        return (f'<MediaContainer location="fullScreenMusic" commandID="{int(command_id)}"><Timeline {values}/></MediaContainer>').encode("utf-8")
+
+    def start(self) -> None:
+        receiver = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                logger.debug("Companion HTTP: " + fmt, *args)
+
+            def _send(self, body: bytes = b"", content_type: str = "text/plain", status: int = 200):
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def _is_lan_client(self) -> bool:
+                try:
+                    return ipaddress.ip_address(self.client_address[0]).is_private or ipaddress.ip_address(self.client_address[0]).is_loopback
+                except ValueError:
+                    return False
+
+            def _local_address(self) -> str:
+                try:
+                    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        probe.connect((self.client_address[0], 9))
+                        return probe.getsockname()[0]
+                    finally:
+                        probe.close()
+                except Exception:
+                    return "127.0.0.1"
+
+            def do_OPTIONS(self):
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Plex-Client-Identifier")
+                self.end_headers()
+
+            def do_GET(self):
+                if not self._is_lan_client():
+                    return self._send(b"Local network clients only", status=403)
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path in ("/", "/resources"):
+                    local_address = self._local_address()
+                    root = (f'<MediaContainer friendlyName="DeckyPlex" machineIdentifier="{receiver.machine_id}">'
+                            f'<Player title="DeckyPlex" machineIdentifier="{receiver.machine_id}" '
+                            'product="DeckyPlex" version="1.0.0" platform="SteamOS" '
+                            'protocolVersion="1" protocolCapabilities="timeline,playback" deviceClass="stb">'
+                            f'<Connection protocol="http" address="{local_address}" port="{receiver.HTTP_PORT}" '
+                            f'uri="http://{local_address}:{receiver.HTTP_PORT}" />'
+                            '</Player></MediaContainer>').encode("utf-8")
+                    return self._send(root, "application/xml")
+                if parsed.path == "/player/timeline/subscribe":
+                    receiver.subscribe(self.client_address[0], urllib.parse.parse_qs(parsed.query),
+                                       self.headers.get("X-Plex-Client-Identifier", ""))
+                    return self._send(b"", "application/xml")
+                if parsed.path == "/player/timeline/unsubscribe":
+                    with receiver.lock:
+                        client_id = self.headers.get("X-Plex-Client-Identifier", "")
+                        if client_id:
+                            receiver.controllers.pop(client_id, None)
+                        else:
+                            receiver.controllers = {key: value for key, value in receiver.controllers.items()
+                                                    if value.get("host") != self.client_address[0]}
+                    return self._send(b"", "application/xml")
+                if parsed.path == "/player/timeline/poll":
+                    with receiver.lock:
+                        state = dict(receiver.timeline)
+                    try:
+                        command_id = int(urllib.parse.parse_qs(parsed.query).get("commandID", ["0"])[0])
+                    except (TypeError, ValueError):
+                        command_id = 0
+                    body = receiver._timeline_xml(state, command_id)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/xml")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("X-Plex-Client-Identifier", receiver.machine_id)
+                    self.send_header("Access-Control-Expose-Headers", "X-Plex-Client-Identifier")
+                    self.end_headers()
+                    return self.wfile.write(body)
+                if parsed.path.startswith("/player/playback/"):
+                    command = parsed.path.rsplit("/", 1)[-1]
+                    aliases = {"playMedia": "playMedia", "play": "play", "pause": "pause",
+                               "stop": "stop", "skipNext": "next", "skipPrevious": "previous",
+                               "seekTo": "seek", "setParameters": "parameters"}
+                    if command not in aliases:
+                        return self._send(b"", status=404)
+                    receiver.enqueue(aliases[command], urllib.parse.parse_qs(parsed.query), self.client_address[0],
+                                     self.headers.get("X-Plex-Client-Identifier", ""))
+                    return self._send(b"", "application/xml")
+                return self._send(b"", status=404)
+
+            def do_POST(self):
+                return self.do_GET()
+
+        try:
+            self.httpd = ThreadingHTTPServer(("0.0.0.0", self.HTTP_PORT), Handler)
+            self.httpd.daemon_threads = True
+            self.http_thread = threading.Thread(target=self.httpd.serve_forever, name="DeckyPlex-Companion-HTTP", daemon=True)
+            self.http_thread.start()
+            self.gdm_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.gdm_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.gdm_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.gdm_socket.bind(("0.0.0.0", self.GDM_PORT))
+            self.gdm_thread = threading.Thread(target=self._serve_gdm, name="DeckyPlex-Companion-GDM", daemon=True)
+            self.gdm_thread.start()
+            logger.info("Plex Companion receiver active on TCP %s and GDM UDP %s", self.HTTP_PORT, self.GDM_PORT)
+        except Exception as exc:
+            self.error = str(exc)
+            logger.error("Could not start Plex Companion receiver: %s", exc)
+            self.stop()
+
+    def _serve_gdm(self) -> None:
+        if not self.gdm_socket:
+            return
+        self.gdm_socket.settimeout(1.0)
+        response = self._response_headers()
+        while self.gdm_socket:
+            try:
+                packet, address = self.gdm_socket.recvfrom(2048)
+                if packet.startswith(b"M-SEARCH"):
+                    self.gdm_socket.sendto(response, address)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            except Exception as exc:
+                logger.debug("Plex GDM responder error: %s", exc)
+
+    def stop(self) -> None:
+        server, self.httpd = self.httpd, None
+        if server:
+            server.shutdown()
+            server.server_close()
+        sock, self.gdm_socket = self.gdm_socket, None
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 class PlexHTTP:
@@ -148,7 +420,7 @@ class PlexHTTP:
             "index": attr("index"), "parentTitle": attr("parentTitle"),
             "grandparentTitle": attr("grandparentTitle"),
             "leafCount": attr("leafCount", 0), "viewCount": attr("viewCount", 0),
-            "duration": attr("duration", 0),
+            "duration": attr("duration", 0), "sectionId": str(attr("librarySectionID", "") or ""),
         }
 
     def discover_players(self) -> List[Dict[str, str]]:
@@ -276,7 +548,6 @@ class PlexHTTP:
 
     def play_remote_queue(self, machine_id: str, rating_keys: List[str], start_rating_key: str) -> None:
         client = self._client(machine_id)
-        client.proxyThroughServer(True, server=self.sdk)
         track_ids = [int(key) for key in rating_keys]
         tracks = []
         # PlexAPI supports fetching multiple metadata keys in one request. Keep
@@ -287,7 +558,33 @@ class PlexHTTP:
         if not tracks:
             raise ValueError("The selected queue contains no playable tracks")
         start_item = next((track for track in tracks if str(track.ratingKey) == str(start_rating_key)), tracks[0])
-        client.createPlayQueue(self.sdk, tracks, startItem=start_item, shuffle=False, repeat=False)
+        # Modern clients expose createPlayQueue on their own Companion endpoint.
+        # Plex Media Server's /player proxy does not implement this newer command
+        # consistently (it returns 404 even for a live /clients player). Try the
+        # direct SDK client first, then use PlexAPI's legacy playMedia flow, which
+        # creates the queue on the server and sends its containerKey to the player.
+        logger.info("Sending queue to %s (%s) via direct Companion connection", client.title, machine_id)
+        try:
+            client.proxyThroughServer(False)
+            client.createPlayQueue(self.sdk, tracks, startItem=start_item, shuffle=False, repeat=False)
+            return
+        except Exception as direct_error:
+            logger.warning("Direct createPlayQueue failed for %s: %s; trying SDK playMedia", machine_id, direct_error)
+
+        play_queue = self.sdk.createPlayQueue(
+            tracks, startItem=start_item, shuffle=False, repeat=False,
+            includeChapters=False, includeRelated=False,
+        )
+        # The SDK constructs the correct /playback/playMedia command including
+        # server address, transient token, selected key and containerKey.
+        # Use server proxy as a fallback for players that aren't directly reachable.
+        try:
+            client.proxyThroughServer(False)
+            client.playMedia(play_queue)
+        except Exception as direct_error:
+            logger.warning("Direct playMedia failed for %s: %s; retrying via Plex server", machine_id, direct_error)
+            client.proxyThroughServer(True, server=self.sdk)
+            client.playMedia(play_queue)
 
     def remote_player_status(self, machine_id: str) -> Dict[str, Any]:
         client = self._client(machine_id)
@@ -318,23 +615,33 @@ class PlexHTTP:
 
     def control_remote_player(self, machine_id: str, command: str, value: int = 0) -> None:
         client = self._client(machine_id)
-        client.proxyThroughServer(True, server=self.sdk)
-        if command == "play":
-            client.play(mtype="music")
-        elif command == "pause":
-            client.pause(mtype="music")
-        elif command == "stop":
-            client.stop(mtype="music")
-        elif command == "next":
-            client.skipNext(mtype="music")
-        elif command == "previous":
-            client.skipPrevious(mtype="music")
-        elif command == "seek":
-            client.seekTo(max(0, int(value)), mtype="music")
-        elif command == "volume":
-            client.setVolume(max(0, min(100, int(value))), mtype="music")
-        else:
-            raise ValueError("Unsupported remote player command")
+        # A discovered /clients endpoint is a live Companion URL. Talk to it
+        # directly; proxying through PMS can produce false 404s for commands.
+        def send():
+            if command == "play":
+                client.play(mtype="music")
+            elif command == "pause":
+                client.pause(mtype="music")
+            elif command == "stop":
+                client.stop(mtype="music")
+            elif command == "next":
+                client.skipNext(mtype="music")
+            elif command == "previous":
+                client.skipPrevious(mtype="music")
+            elif command == "seek":
+                client.seekTo(max(0, int(value)), mtype="music")
+            elif command == "volume":
+                client.setVolume(max(0, min(100, int(value))), mtype="music")
+            else:
+                raise ValueError("Unsupported remote player command")
+        client.proxyThroughServer(False)
+        try:
+            send()
+        except Exception as direct_error:
+            logger.warning("Direct %s command failed for %s: %s; retrying via Plex server",
+                           command, machine_id, direct_error)
+            client.proxyThroughServer(True, server=self.sdk)
+            send()
 
     def get_library_sections(self) -> List[Dict[str, Any]]:
         return [{"id": str(section.key), "name": section.title, "type": section.type}
@@ -534,6 +841,49 @@ class PlexHTTP:
                 "fallback_stream_url": direct_url if codec in ("mp3", "flac") else "",
                 "stream_mode": "transcode-aac"}
 
+    def prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
+        parsed = urllib.parse.urlparse(key or "")
+        match = re.search(r"/library/metadata/(\d+)", parsed.path or key or "")
+        if not match:
+            raise ValueError("Plexamp sent an unsupported media key")
+        rating_key = match.group(1)
+        item = self.sdk.fetchItem(int(rating_key))
+        if getattr(item, "type", "") != "track":
+            raise ValueError("Plexamp target currently supports music tracks only")
+        queue = [self._item_dict(item)]
+        active_queue_id = ""
+        active_item_id = ""
+        active_queue_version = ""
+        queue_id = re.search(r"/playQueues/(\d+)", container_key or "")
+        if queue_id:
+            try:
+                from plexapi.playqueue import PlayQueue
+                play_queue = PlayQueue.get(self.sdk, int(queue_id.group(1)), window=200, includeBefore=True, includeAfter=True)
+                active_queue_id = str(play_queue.playQueueID or "")
+                active_queue_version = str(play_queue.playQueueVersion or "")
+                tracks = []
+                for track in play_queue.items:
+                    if getattr(track, "type", "") != "track":
+                        continue
+                    track_dict = self._item_dict(track)
+                    track_dict["playQueueItemID"] = str(getattr(track, "playQueueItemID", "") or "")
+                    tracks.append(track_dict)
+                    if str(track.ratingKey) == rating_key:
+                        active_item_id = track_dict["playQueueItemID"]
+                if tracks:
+                    queue = tracks
+            except Exception as exc:
+                logger.warning("Could not load incoming Plex play queue %s: %s", queue_id.group(1), exc)
+        streams = self.get_stream_urls(rating_key)
+        selected = self._item_dict(item)
+        selected["playQueueItemID"] = active_item_id
+        return {"success": True, "track": selected, "queue": queue,
+                "play_queue_id": active_queue_id,
+                "play_queue_item_id": active_item_id,
+                "play_queue_version": active_queue_version,
+                "container_key": f"/playQueues/{active_queue_id}?window=200&own=1" if active_queue_id else "",
+                **streams}
+
     def inspect_stream(self, rating_key: str, stream_url: str) -> Dict[str, Any]:
         """Read a tiny range from the exact stream URL the client rejected."""
         expected = urllib.parse.urlparse(self.sdk._baseurl)
@@ -575,9 +925,22 @@ class Plugin:
                 logger.error(f"Failed to create settings dir: {e}")
         else:
             logger.warning(f"Settings file has no directory: {_settings_file}")
+        global _companion_receiver
+        settings = _load_settings()
+        receiver_id = str(settings.get("companion_id") or "").strip()
+        if not receiver_id:
+            receiver_id = str(uuid.uuid4())
+            settings["companion_id"] = receiver_id
+            _save_settings(settings)
+        _companion_receiver = PlexCompanionReceiver(receiver_id)
+        _companion_receiver.start()
 
     async def _unload(self):
         """Called when the plugin is unloaded."""
+        global _companion_receiver
+        if _companion_receiver:
+            _companion_receiver.stop()
+            _companion_receiver = None
         logger.info("DeckyPlex plugin unloaded")
 
     async def _uninstall(self):
@@ -615,6 +978,7 @@ class Plugin:
     @staticmethod
     def _public_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(settings)
+        result.pop("companion_id", None)
         result["has_plex_token"] = bool(settings.get("plex_token"))
         result["plex_token"] = ""
         result["server_access_token"] = ""
@@ -857,6 +1221,49 @@ class Plugin:
         except Exception as e:
             logger.error(f"Failed to get current track: {e}")
             return {"error": str(e)}
+
+    async def get_companion_status(self) -> Dict[str, Any]:
+        receiver = _companion_receiver
+        if not receiver:
+            return {"active": False, "error": "Companion receiver is not running"}
+        return {"active": bool(receiver.httpd and receiver.gdm_socket),
+                "port": receiver.HTTP_PORT, "error": receiver.error}
+
+    async def poll_companion_commands(self) -> Dict[str, Any]:
+        receiver = _companion_receiver
+        return {"commands": receiver.drain_commands() if receiver else []}
+
+    async def prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Connect to a Plex server before receiving playback."}
+        try:
+            return plex.prepare_companion_playback(key, container_key)
+        except Exception as exc:
+            logger.error("Could not prepare incoming Plex playback: %s", exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    async def report_companion_timeline(self, rating_key: str, time_ms: int, duration_ms: int,
+                                        state: str, volume: int = 50,
+                                        play_queue_id: str = "", play_queue_item_id: str = "",
+                                        container_key: str = "", play_queue_version: str = "") -> Dict[str, Any]:
+        receiver = _companion_receiver
+        if receiver:
+            settings = _load_settings()
+            server_url = urllib.parse.urlparse(self._get_plex_server_url())
+            receiver.set_timeline({"key": f"/library/metadata/{rating_key}" if rating_key else "",
+                                   "state": state, "time": max(0, int(time_ms)),
+                                   "duration": max(0, int(duration_ms)),
+                                   "playQueueID": str(play_queue_id or ""),
+                                   "playQueueItemID": str(play_queue_item_id or ""),
+                                   "containerKey": str(container_key or ""),
+                                   "playQueueVersion": str(play_queue_version or ""),
+                                   "serverId": settings.get("selected_server_id", ""),
+                                   "address": server_url.hostname or "", "port": server_url.port or 32400,
+                                   "protocol": server_url.scheme or "http",
+                                   "token": self._get_server_access_token(),
+                                   "volume": max(0, min(100, int(volume)))})
+        return {"success": True}
 
     def _find_active_player(self, plex: PlexHTTP) -> Optional[Dict[str, str]]:
         """Find the player currently controlling playback.

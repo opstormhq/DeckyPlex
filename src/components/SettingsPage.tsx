@@ -73,6 +73,9 @@ export function SettingsPage() {
   const [servers, setServers] = useState<Server[]>([]);
   const [status, setStatus] = useState<string>("");
   const [serverStatus, setServerStatus] = useState("");
+  const [refreshingServers, setRefreshingServers] = useState(false);
+  const [selectingServer, setSelectingServer] = useState(false);
+  const [companionStatus, setCompanionStatus] = useState<{ active: boolean; port?: number; error?: string }>({ active: false });
   const [playersStatus, setPlayersStatus] = useState("");
   const [browserStatus, setBrowserStatus] = useState("");
   const [advancedStatus, setAdvancedStatus] = useState("");
@@ -116,7 +119,9 @@ export function SettingsPage() {
       .then((result: any) => {
         settingsRef.current = result;
         setSettings(result);
+        void callWithTimeout('get_companion_status', 5000).then(setCompanionStatus).catch(() => {});
         if (!result.has_plex_token) return;
+        setRefreshingServers(true);
         void (async () => {
           try {
             const discoverResult: any = await callWithTimeout("discover_servers", 15000);
@@ -130,6 +135,8 @@ export function SettingsPage() {
             if (playersResult.players) setPlayers(playersResult.players);
           } catch (e: any) {
             console.error("[DeckyPlex] Plex discovery error:", e);
+          } finally {
+            setRefreshingServers(false);
           }
         })();
       })
@@ -179,7 +186,9 @@ export function SettingsPage() {
             setPinUrl("");
             setStatus("Login complete. Discovering your Plex server...");
 
+            setRefreshingServers(true);
             const discovery: any = await callWithTimeout("discover_servers", 30000);
+            setRefreshingServers(false);
             setServers(discovery.servers || []);
             const connectedSettings: any = await callWithTimeout("get_settings", 10000);
             settingsRef.current = connectedSettings;
@@ -195,6 +204,7 @@ export function SettingsPage() {
               .catch(() => {})
               .finally(() => setRefreshingPlayers(false));
           } catch (e: any) {
+            setRefreshingServers(false);
             setPinCode("");
             setPinUrl("");
             setStatus(e?.message || "Plex login succeeded, but server discovery failed.");
@@ -239,13 +249,14 @@ export function SettingsPage() {
   const handleSelectServer = useCallback((serverId: string) => {
     const server = servers.find(s => s.id === serverId);
     if (server) {
+      setSelectingServer(true);
       callWithTimeout("select_server", 15000, server.id).then((result: any) => {
         if (!result?.success) throw new Error(result?.error || "Could not select Plex server.");
         settingsRef.current = result.settings;
         setSettings(result.settings);
         window.dispatchEvent(new Event('deckyplex-settings-change'));
         setServerStatus(`Selected server: ${server.name}`);
-      }).catch((e: any) => setServerStatus(e?.message || "Could not select Plex server."));
+      }).catch((e: any) => setServerStatus(e?.message || "Could not select Plex server.")).finally(() => setSelectingServer(false));
     }
   }, [servers]);
 
@@ -380,7 +391,10 @@ export function SettingsPage() {
   const renderServerPage = () => (
     <PanelSection>
       <PanelSectionRow>
-        <DialogBodyText>Servers found: {servers.length}</DialogBodyText>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {(refreshingServers || selectingServer) && <Spinner style={{ width: '16px', height: '16px' }} />}
+          <DialogBodyText>{selectingServer ? 'Connecting to selected server…' : refreshingServers ? 'Finding Plex servers…' : `Servers found: ${servers.length}`}</DialogBodyText>
+        </div>
       </PanelSectionRow>
       {serverStatus && <PanelSectionRow><DialogBodyText>{serverStatus}</DialogBodyText></PanelSectionRow>}
       {servers.length > 0 && (
@@ -411,6 +425,12 @@ export function SettingsPage() {
   // Players page content
   const renderPlayersPage = () => (
     <PanelSection>
+      <PanelSectionRow>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {companionStatus.active ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#77d98b' }} /> : <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#e7a64a' }} />}
+          <DialogBodyText>{companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : `DeckyPlex receiver unavailable${companionStatus.error ? `: ${companionStatus.error}` : '.'}`}</DialogBodyText>
+        </div>
+      </PanelSectionRow>
       <PanelSectionRow>
         <DialogBodyText style={{ opacity: 0.75 }}>
           Choose where DeckyPlex sends playback. The list includes server-connected clients and devices registered to your Plex account. A registered device may need to be opened or started before it can accept playback.

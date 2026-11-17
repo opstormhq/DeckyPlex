@@ -6,7 +6,6 @@ import {
   DialogLabel,
   Button,
   Focusable,
-  SliderField,
   TextField,
   Spinner,
   ModalRoot,
@@ -1087,15 +1086,58 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
   onClose: () => void;
 }) {
   const [columns, setColumns] = useState(initialColumns);
+  const changeColumns = (next: number) => {
+    const value = Math.max(3, Math.min(8, next));
+    setColumns(value);
+    onPreview(value);
+  };
+  const handleDirection = (event: import('@decky/ui').GamepadEvent) => {
+    if (event.detail.button === GamepadButton.DIR_LEFT) {
+      event.preventDefault();
+      changeColumns(columns - 1);
+    } else if (event.detail.button === GamepadButton.DIR_RIGHT) {
+      event.preventDefault();
+      changeColumns(columns + 1);
+    }
+  };
   return (
     <ModalRoot closeModal={onClose} onCancel={onClose} onOK={onClose}>
       <PanelSection title="Choose grid width">
         <PanelSectionRow>
-          <SliderField label={`${columns} columns`} min={3} max={8} step={1} value={columns}
-            onChange={(value: number) => { const next = Math.round(value); setColumns(next); onPreview(next); }} />
+          <Focusable
+            flow-children="horizontal"
+            onGamepadDirection={handleDirection}
+            onActivate={onClose}
+            onClick={onClose}
+            role="slider"
+            aria-label="Grid columns"
+            aria-valuemin={3}
+            aria-valuemax={8}
+            aria-valuenow={columns}
+            tabIndex={0}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                event.preventDefault();
+                changeColumns(columns + (event.key === 'ArrowRight' ? 1 : -1));
+              } else if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onClose();
+              }
+            }}
+            style={{ width: '100%', padding: '0.55rem 0.7rem', borderRadius: '4px', background: 'rgba(255,255,255,0.06)' }}
+          >
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem' }}>
+              <span>Grid columns</span><strong>{columns}</strong>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '0.28rem' }}>
+              {Array.from({ length: 6 }, (_, index) => (
+                <div key={index} style={{ height: '0.45rem', borderRadius: '3px', background: index < columns - 2 ? '#66c0f4' : 'rgba(255,255,255,0.2)' }} />
+              ))}
+            </div>
+          </Focusable>
         </PanelSectionRow>
         <PanelSectionRow>
-          <DialogBodyText style={{ opacity: 0.7 }}>You can change this later in Settings → Browser.</DialogBodyText>
+          <DialogBodyText style={{ opacity: 0.7 }}>Use left and right to adjust. Press A to save; B closes.</DialogBodyText>
         </PanelSectionRow>
       </PanelSection>
     </ModalRoot>
