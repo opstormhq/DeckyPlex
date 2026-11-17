@@ -34,6 +34,7 @@ export function QuickPlayer() {
   const [shuffleError, setShuffleError] = useState('');
   const [showQueue, setShowQueue] = useState(false);
   const queueContainerRef = useRef<HTMLDivElement | null>(null);
+  const queueToggleRef = useRef<HTMLDivElement | null>(null);
   const pendingQueueFocusId = useRef<string | null>(null);
   const {
     playbackState,
@@ -328,7 +329,7 @@ export function QuickPlayer() {
 
       <PanelSectionRow>
         <div style={{ width: '100%', padding: '0 0.5rem', boxSizing: 'border-box' }}>
-          <Button onClick={() => setShowQueue(value => !value)} disabled={!queue.length} style={{ width: '100%' }}>
+          <Button ref={queueToggleRef} onClick={() => setShowQueue(value => !value)} disabled={!queue.length} style={{ width: '100%' }}>
             <span>{showQueue ? 'Hide queue' : `Queue${queue.length ? ` · ${queueIndex < 0 ? `${queue.length} queued` : `${queueIndex + 1}/${queue.length}`}` : ''}`}</span>
           </Button>
         </div>
@@ -336,7 +337,13 @@ export function QuickPlayer() {
       {showQueue && (
         <PanelSectionRow>
           <div ref={queueContainerRef} style={{ width: '100%', maxHeight: 'min(390px, 42vh)', overflowY: 'auto', overscrollBehavior: 'contain', padding: '0 0.5rem', boxSizing: 'border-box' }}>
-            <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
+            <Focusable flow-children="column" onCancel={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              event.stopImmediatePropagation();
+              setShowQueue(false);
+              window.setTimeout(() => queueToggleRef.current?.focus(), 0);
+            }} style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
               {queue.slice(Math.max(0, queueIndex)).map((queuedTrack, index) => {
                 const actualIndex = Math.max(0, queueIndex) + index;
                 return <Button key={`${queuedTrack.id}-${actualIndex}`} ref={(element: HTMLDivElement | null) => { if (element) element.dataset.queueTrackId = queuedTrack.id; }} onClick={() => playQueueIndex(actualIndex)}

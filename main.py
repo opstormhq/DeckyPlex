@@ -435,6 +435,16 @@ class PlexHTTP:
         playlist.addItems([track])
         return {"success": True, "playlist": playlist.title}
 
+    def remove_track_from_playlist(self, playlist_id: str, rating_key: str) -> Dict[str, Any]:
+        """Remove a library track from an audio playlist using PlexAPI."""
+        playlist = next((item for item in self.sdk.playlists(playlistType="audio")
+                         if str(item.ratingKey) == str(playlist_id)), None)
+        if playlist is None:
+            raise ValueError("Audio playlist not found")
+        track = self.sdk.fetchItem(int(rating_key))
+        playlist.removeItems([track])
+        return {"success": True, "playlist": playlist.title}
+
     def create_audio_playlist(self, title: str, rating_key: str) -> Dict[str, Any]:
         """Create an audio playlist containing the requested track via PlexAPI."""
         title = str(title or "").strip()
@@ -1047,6 +1057,16 @@ class Plugin:
             return plex.add_track_to_playlist(playlist_id, rating_key)
         except Exception as e:
             logger.error(f"Failed to add track {rating_key} to playlist {playlist_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def remove_track_from_playlist(self, playlist_id: str, rating_key: str) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        try:
+            return plex.remove_track_from_playlist(playlist_id, rating_key)
+        except Exception as e:
+            logger.error(f"Failed to remove track {rating_key} from playlist {playlist_id}: {e}")
             return {"success": False, "error": str(e)}
 
     async def create_audio_playlist(self, title: str, rating_key: str) -> Dict[str, Any]:

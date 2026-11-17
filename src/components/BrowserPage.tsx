@@ -56,6 +56,8 @@ interface TabFocusPosition { itemId: string; scrollTop: number; }
 export function BrowserPage() {
   const { playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue } = usePlayer();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
+  const activeTabRef = useRef<BrowserTab>(activeTab);
+  activeTabRef.current = activeTab;
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -89,6 +91,21 @@ export function BrowserPage() {
   const tabLoadRequestId = useRef(0);
   const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
+
+  const selectTab = (tab: BrowserTab) => {
+    if (tab === activeTabRef.current) return;
+    activeTabRef.current = tab;
+    // Invalidate outstanding root and pagination requests synchronously when
+    // focus moves between categories. The effect below then loads only the new tab.
+    tabLoadRequestId.current++;
+    loadingMoreRef.current = false;
+    setLoadingMore(false);
+    setItems([]);
+    setTabHasMore(false);
+    setError(null);
+    setLoading(tab !== 'search');
+    setActiveTab(tab);
+  };
 
   const keepFocusedElementVisible = (element: HTMLElement) => {
     window.requestAnimationFrame(() => {
@@ -291,9 +308,9 @@ export function BrowserPage() {
 
   const openTrackOptions = useCallback((track: {
     id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string;
-  }) => {
+  }, playlistId?: string) => {
     const close = () => actionDialogRef.current?.Close();
-    actionDialogRef.current = showModal(<TrackOptionsDialog track={track} addToQueue={addToQueue} onClose={close} />,
+    actionDialogRef.current = showModal(<TrackOptionsDialog track={track} playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
       window, { strTitle: track.title, bNeverPopOut: true });
   }, [addToQueue]);
 
@@ -343,10 +360,17 @@ export function BrowserPage() {
     setError(null);
     const cacheKey = `tab:${selectedSection}:${tab}`;
     const cached = itemCache.current.get(cacheKey);
+    const expectedTypes: Partial<Record<BrowserTab, string[]>> = {
+      artists: ['artist'], albums: ['album'], tracks: ['track'], recent: ['track'],
+      recentlyAdded: ['album'], playlists: ['playlist'],
+    };
+    const cachedTabItems = cached && expectedTypes[tab]
+      ? cached.items.filter(item => expectedTypes[tab]?.includes(item.type))
+      : cached?.items;
     const cacheIsFresh = !!cached && cached.expiresAt > Date.now();
     const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
     if (cached) {
-      setItems(cached.items);
+      setItems(cachedTabItems || []);
       setTabHasMore(Boolean(cached.hasMore));
     } else {
       setItems([]);
@@ -375,10 +399,13 @@ export function BrowserPage() {
         }
       } else if (Array.isArray(result.items)) {
         if (requestId !== tabLoadRequestId.current) return;
-        const firstPageIds = new Set(result.items.map((item: LibraryItem) => item.id));
-        const mergedItems = cached
-          ? [...result.items, ...cached.items.filter(item => !firstPageIds.has(item.id))]
+        const tabItems = expectedTypes[tab]
+          ? result.items.filter((item: LibraryItem) => expectedTypes[tab]?.includes(item.type))
           : result.items;
+        const firstPageIds = new Set(tabItems.map((item: LibraryItem) => item.id));
+        const mergedItems = cached
+          ? [...tabItems, ...(cachedTabItems || []).filter(item => !firstPageIds.has(item.id))]
+          : tabItems;
         setItems(mergedItems);
         itemCache.current.set(cacheKey, {
           items: mergedItems,
@@ -499,6 +526,32 @@ export function BrowserPage() {
       if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [items, subView, searchQuery, cachedItems]);
+
+  useEffect(() => {
+    const refreshVisiblePlaylist = (event: Event) => {
+      const playlistId = (event as CustomEvent<{ playlistId?: string }>).detail?.playlistId;
+      if (!playlistId) return;
+      itemCache.current.delete(`playlist:${playlistId}`);
+      if (subView?.type !== 'tracks' || subView.queueLabel !== 'Play Playlist' || subView.id !== playlistId) return;
+      const requestId = ++tabLoadRequestId.current;
+      setLoading(true);
+      setError(null);
+      call('get_playlist_tracks', playlistId, 200).then((result: any) => {
+        if (requestId !== tabLoadRequestId.current) return;
+        if (result?.error) throw new Error(result.error);
+        setItems(Array.isArray(result?.items) ? result.items : []);
+        itemCache.current.set(`playlist:${playlistId}`, {
+          items: Array.isArray(result?.items) ? result.items : [], expiresAt: Date.now() + 60000,
+        });
+      }).catch((error: any) => {
+        if (requestId === tabLoadRequestId.current) setError(error?.message || 'Could not refresh playlist tracks.');
+      }).finally(() => {
+        if (requestId === tabLoadRequestId.current) setLoading(false);
+      });
+    };
+    window.addEventListener('deckyplex-playlists-change', refreshVisiblePlaylist);
+    return () => window.removeEventListener('deckyplex-playlists-change', refreshVisiblePlaylist);
+  }, [subView]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
     const requestId = ++tabLoadRequestId.current;
@@ -778,7 +831,8 @@ export function BrowserPage() {
             onSecondaryButton={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              openTrackOptions(trackInfo);
+              const playlistId = subView?.type === 'tracks' && subView.queueLabel === 'Play Playlist' ? subView.id : undefined;
+              openTrackOptions(trackInfo, playlistId);
             }}
             style={rowStyle}
           >
@@ -970,7 +1024,7 @@ export function BrowserPage() {
               data-browser-tab={tabKeys[idx]}
               onFocus={() => {
                 focusZone.current = 'sidebar';
-                if (activeTab !== tabKeys[idx]) setActiveTab(tabKeys[idx]);
+                selectTab(tabKeys[idx]);
               }}
               onActivate={enterContent}
               onClick={enterContent}
@@ -1011,8 +1065,9 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
   );
 }
 
-function TrackOptionsDialog({ track, addToQueue, onClose }: {
+function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string };
+  playlistId?: string;
   addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => void;
   onClose: () => void;
 }) {
@@ -1060,7 +1115,7 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
       const result: any = await call('add_track_to_playlist', playlistId, track.id);
       if (!result?.success) throw new Error(result?.error || 'Could not add track to playlist.');
       setMessage(`Added to ${result.playlist || 'playlist'}.`);
-      window.dispatchEvent(new Event('deckyplex-playlists-change'));
+      window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId } }));
     } catch (error: any) {
       setMessage(error?.message || 'Could not add track to playlist.');
     } finally {
@@ -1079,7 +1134,7 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
       setMessage(`Created ${result.playlist || playlistName} and added this song.`);
       setPlaylists(items => [{ id: result.id, key: '', title: result.playlist || playlistName, type: 'playlist' }, ...items]);
       setView('playlists');
-      window.dispatchEvent(new Event('deckyplex-playlists-change'));
+      window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId: result.id } }));
     } catch (error: any) {
       setMessage(error?.message || 'Could not create playlist.');
     } finally {
@@ -1088,8 +1143,37 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
     }
   };
 
+  const removeFromPlaylist = async () => {
+    if (!playlistId || playlistActionInProgress.current) return;
+    playlistActionInProgress.current = true;
+    setBusy(true);
+    try {
+      const result: any = await call('remove_track_from_playlist', playlistId, track.id);
+      if (!result?.success) throw new Error(result?.error || 'Could not remove track from playlist.');
+      setMessage(`Removed from ${result.playlist || 'playlist'}.`);
+      window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId } }));
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not remove track from playlist.');
+    } finally {
+      playlistActionInProgress.current = false;
+      setBusy(false);
+    }
+  };
+
+  const handleDialogCancel = () => {
+    if (busy) return;
+    if (view === 'new') {
+      setMessage('');
+      setView('playlists');
+    } else if (view === 'playlists') {
+      setView('actions');
+    } else {
+      onClose();
+    }
+  };
+
   return (
-    <ModalRoot closeModal={onClose} onCancel={onClose}>
+    <ModalRoot closeModal={onClose} onCancel={handleDialogCancel}>
       <div ref={menuRef}>
       <PanelSection key={view} title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
         <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
@@ -1097,20 +1181,21 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
           <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
           <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
           <PanelSectionRow><Button onClick={() => void showPlaylists()} onOKButton={(event) => { event.preventDefault(); void showPlaylists(); }}>Add to Playlist</Button></PanelSectionRow>
+          {playlistId && <PanelSectionRow><Button disabled={busy} onClick={() => void removeFromPlaylist()} onOKButton={(event) => { event.preventDefault(); void removeFromPlaylist(); }}>Remove from Playlist</Button></PanelSectionRow>}
         </>}
         {view === 'playlists' && <>
           {loading && <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Spinner style={{ width: '18px', height: '18px' }} /> Loading playlists…</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)} onOKButton={(event) => { event.preventDefault(); void addToPlaylist(playlist.id); }}>{playlist.title}</Button></PanelSectionRow>)}
-          {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
+          {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }} onOKButton={(event) => { event.preventDefault(); setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
           <PanelSectionRow><Button disabled={busy} onClick={() => setView('actions')}>Back</Button></PanelSectionRow>
         </>}
         {view === 'new' && <>
           <PanelSectionRow><TextField label="Playlist name" value={playlistName} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPlaylistName(e.target.value)} /></PanelSectionRow>
-          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()}>{busy ? 'Creating…' : 'Create Playlist'}</Button></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()} onOKButton={(event) => { event.preventDefault(); void createPlaylist(); }}>{busy ? 'Creating…' : 'Create Playlist'}</Button></PanelSectionRow>
           <PanelSectionRow><Button disabled={busy} onClick={() => setView('playlists')}>Back</Button></PanelSectionRow>
         </>}
-        {!!message && <PanelSectionRow><DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
+        {!!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
       </div>
     </ModalRoot>
