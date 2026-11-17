@@ -454,6 +454,16 @@ class PlexHTTP:
         playlist = self.sdk.createPlaylist(title, items=[track])
         return {"success": True, "playlist": playlist.title, "id": str(playlist.ratingKey)}
 
+    def delete_audio_playlist(self, playlist_id: str) -> Dict[str, Any]:
+        """Delete an audio playlist using PlexAPI."""
+        playlist = next((item for item in self.sdk.playlists(playlistType="audio")
+                         if str(item.ratingKey) == str(playlist_id)), None)
+        if playlist is None:
+            raise ValueError("Audio playlist not found")
+        title = playlist.title or "Untitled playlist"
+        playlist.delete()
+        return {"success": True, "playlist": title, "id": str(playlist_id)}
+
     def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         playlists = self.sdk.playlists(playlistType="audio")
         playlist = next((item for item in playlists if str(item.ratingKey) == str(playlist_id)), None)
@@ -1077,6 +1087,16 @@ class Plugin:
             return plex.create_audio_playlist(title, rating_key)
         except Exception as e:
             logger.error(f"Failed to create audio playlist {title!r}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def delete_audio_playlist(self, playlist_id: str) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        try:
+            return plex.delete_audio_playlist(playlist_id)
+        except Exception as e:
+            logger.error(f"Failed to delete audio playlist {playlist_id}: {e}")
             return {"success": False, "error": str(e)}
 
     async def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> Dict[str, Any]:

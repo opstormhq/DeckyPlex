@@ -10,6 +10,7 @@ import {
   TextField,
   Spinner,
   ModalRoot,
+  ConfirmModal,
   Navigation,
   GamepadButton,
   showModal,
@@ -87,6 +88,7 @@ export function BrowserPage() {
   const pendingScrollTop = useRef<number | undefined>(undefined);
   const tabFocusPositions = useRef(new Map<BrowserTab, TabFocusPosition>());
   const pendingSearchFocus = useRef(false);
+  const pendingSearchInputFocus = useRef(false);
   const loadingMoreRef = useRef(false);
   const tabLoadRequestId = useRef(0);
   const restoringHistoryRef = useRef(false);
@@ -164,13 +166,17 @@ export function BrowserPage() {
       setSubView(previous.subView);
       setSearchQuery(previous.searchQuery);
       focusedItemId.current = previous.focusedItemId;
-      pendingFocusId.current = previous.focusedItemId;
+      // Returning from a search result should restore the search form itself.
+      // Search inputs don't have a browser item id, so generic history focus
+      // restoration otherwise leaves focus nowhere and the next B exits.
+      pendingSearchInputFocus.current = activeTab === 'search' && previous.subView === null;
+      pendingFocusId.current = pendingSearchInputFocus.current ? undefined : previous.focusedItemId;
       pendingScrollTop.current = previous.scrollTop;
       setRestoreFocusTick(value => value + 1);
     } else {
       Navigation.NavigateBack();
     }
-  }, [history]);
+  }, [history, activeTab]);
 
   const handleCancel = useCallback((event: Event) => {
     if (history.length === 0 && focusZone.current === 'content') {
@@ -243,6 +249,11 @@ export function BrowserPage() {
     let secondFrame = 0;
     const frame = window.requestAnimationFrame(() => {
       secondFrame = window.requestAnimationFrame(() => {
+        if (pendingSearchInputFocus.current) {
+          pendingSearchInputFocus.current = false;
+          contentRef.current?.querySelector<HTMLElement>('input')?.focus();
+          return;
+        }
         if (pendingFocusId.current) {
           const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
             .find(element => element.dataset.browserItemId === pendingFocusId.current);
@@ -313,6 +324,19 @@ export function BrowserPage() {
     actionDialogRef.current = showModal(<TrackOptionsDialog track={track} playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
       window, { strTitle: track.title, bNeverPopOut: true });
   }, [addToQueue]);
+
+  const openPlaylistOptions = useCallback((playlist: LibraryItem) => {
+    const close = () => actionDialogRef.current?.Close();
+    const handleDeleted = (playlistId: string) => {
+      itemCache.current.delete(`tab:${selectedSection}:playlists`);
+      itemCache.current.delete(`playlist:${playlistId}`);
+      setItems(current => current.filter(item => item.id !== playlistId));
+      window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId } }));
+      close();
+    };
+    actionDialogRef.current = showModal(<PlaylistOptionsDialog playlist={playlist} onDeleted={handleDeleted} onClose={close} />,
+      window, { strTitle: playlist.title, bNeverPopOut: true });
+  }, [selectedSection]);
 
   useEffect(() => {
     if (!connected || gridPreferenceSet || gridPromptShown.current) return;
@@ -742,6 +766,12 @@ export function BrowserPage() {
           onActivate={onClick}
           onClick={onClick}
           onCancel={handleCancel}
+          onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : undefined}
+          onSecondaryButton={item.type === 'playlist' ? (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openPlaylistOptions(item);
+          } : undefined}
           style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0.35rem', gap: '0.3rem' }}
         >
           <div style={{ width: '100%', aspectRatio: '1 / 1', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -846,7 +876,14 @@ export function BrowserPage() {
           focusedItemId.current = item.id;
           if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
         }} onActivate={onClick} onClick={onClick}
-        onCancel={handleCancel} style={rowStyle}>
+        onCancel={handleCancel}
+        onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : undefined}
+        onSecondaryButton={item.type === 'playlist' ? (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          openPlaylistOptions(item);
+        } : undefined}
+        style={rowStyle}>
         {rowDetails}
       </Focusable>
     );
@@ -1065,6 +1102,64 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
   );
 }
 
+function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
+  playlist: LibraryItem;
+  onDeleted: (playlistId: string) => void;
+  onClose: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+
+  const confirmDelete = () => {
+    let confirmation: { Close: () => void } | null = null;
+    const closeConfirmation = () => confirmation?.Close();
+    const deletePlaylist = async () => {
+      if (busy) return;
+      setBusy(true);
+      try {
+        const result: any = await call('delete_audio_playlist', playlist.id);
+        if (!result?.success) throw new Error(result?.error || 'Could not delete playlist.');
+        closeConfirmation();
+        onDeleted(playlist.id);
+      } catch (error: any) {
+        setMessage(error?.message || 'Could not delete playlist.');
+        closeConfirmation();
+      } finally {
+        setBusy(false);
+      }
+    };
+    confirmation = showModal(
+      <ConfirmModal
+        strTitle="Delete Playlist"
+        strDescription={`Delete “${playlist.title}”? This cannot be undone.`}
+        strOKButtonText="Delete Playlist"
+        strCancelButtonText="Keep Playlist"
+        bAlertDialog
+        bDestructiveWarning
+        onOK={() => { void deletePlaylist(); }}
+        onCancel={closeConfirmation}
+        closeModal={closeConfirmation}
+      />,
+      window,
+      { strTitle: 'Delete Playlist', bNeverPopOut: true },
+    );
+  };
+
+  return (
+    <ModalRoot closeModal={onClose} onCancel={onClose}>
+      <PanelSection title={playlist.title}>
+        <PanelSectionRow><DialogBodyText>{playlist.leafCount ?? 0} tracks</DialogBodyText></PanelSectionRow>
+        <PanelSectionRow>
+          <Button disabled={busy} onClick={confirmDelete} onOKButton={(event) => { event.preventDefault(); confirmDelete(); }}>
+            {busy ? 'Deleting…' : 'Delete Playlist'}
+          </Button>
+        </PanelSectionRow>
+        {!!message && <PanelSectionRow><DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
+      </PanelSection>
+    </ModalRoot>
+  );
+}
+
 function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string };
   playlistId?: string;
@@ -1188,12 +1283,10 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
           {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)} onOKButton={(event) => { event.preventDefault(); void addToPlaylist(playlist.id); }}>{playlist.title}</Button></PanelSectionRow>)}
           {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }} onOKButton={(event) => { event.preventDefault(); setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
-          <PanelSectionRow><Button disabled={busy} onClick={() => setView('actions')}>Back</Button></PanelSectionRow>
         </>}
         {view === 'new' && <>
           <PanelSectionRow><TextField label="Playlist name" value={playlistName} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPlaylistName(e.target.value)} /></PanelSectionRow>
           <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()} onOKButton={(event) => { event.preventDefault(); void createPlaylist(); }}>{busy ? 'Creating…' : 'Create Playlist'}</Button></PanelSectionRow>
-          <PanelSectionRow><Button disabled={busy} onClick={() => setView('playlists')}>Back</Button></PanelSectionRow>
         </>}
         {!!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
