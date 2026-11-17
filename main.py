@@ -57,6 +57,8 @@ DEFAULT_SETTINGS = {
     "logged_in_username": "",
     "server_access_token": "",
     "companion_id": "",
+    "companion_receiver_enabled": True,
+    "allow_signed_out_companion": False,
 }
 
 # Settings file path — Decky provides this directory
@@ -101,6 +103,54 @@ def _save_settings(settings: Dict[str, Any]) -> None:
     except Exception as e:
         logger.error(f"Failed to save settings: {e}")
         raise
+
+
+def _private_plex_base_url(address: str, port: int, protocol: str) -> str:
+    """Validate a Companion Plex endpoint as private LAN or secure plex.direct."""
+    host = str(address or "").strip().strip("[]")
+    scheme = str(protocol or "http").lower()
+    port = int(port or 32400)
+    if scheme not in ("http", "https"):
+        raise ValueError("Unsupported Plex server protocol")
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid Plex server port")
+    if not host or any(char in host for char in "/\\?#@"):
+        raise ValueError("Plexamp supplied an invalid server address")
+    try:
+        resolved_ips = [ipaddress.ip_address(host)]
+    except ValueError:
+        # Plex commonly advertises secure servers as
+        # <encoded-private-ip>.<certificate-id>.plex.direct. Keep the hostname
+        # for TLS/SNI, but ensure it resolves only to a private address.
+        answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        resolved_ips = list({ipaddress.ip_address(answer[4][0]) for answer in answers})
+        if not resolved_ips:
+            raise ValueError("Plex server hostname did not resolve")
+        plex_direct = host.lower().endswith(".plex.direct")
+        advertised_ip = None
+        if plex_direct:
+            encoded_ip = host.split(".", 1)[0].replace("-", ".")
+            try:
+                advertised_ip = ipaddress.ip_address(encoded_ip)
+            except ValueError:
+                advertised_ip = None
+            if advertised_ip and advertised_ip not in resolved_ips:
+                raise ValueError("Plex server hostname resolved to a different address")
+        if any(not ip.is_private for ip in resolved_ips):
+            # Plex's own plex.direct hostname encodes the server IP and is
+            # required for valid TLS on remote servers. Only trust the public
+            # address when it matches that encoded IP exactly.
+            if not plex_direct or not advertised_ip or any(ip != advertised_ip for ip in resolved_ips):
+                raise ValueError("Public Plex servers must use a matching plex.direct hostname")
+    if any(ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified
+           for ip in resolved_ips):
+        raise ValueError("Plex server address is not usable")
+    try:
+        literal_ip = ipaddress.ip_address(host)
+    except ValueError:
+        literal_ip = None
+    formatted_host = f"[{host}]" if literal_ip and literal_ip.version == 6 else host
+    return f"{scheme}://{formatted_host}:{port}"
 
 
 # Store PIN state across calls
@@ -268,6 +318,11 @@ class PlexCompanionReceiver:
         return (f'<MediaContainer location="fullScreenMusic" commandID="{int(command_id)}"><Timeline {values}/></MediaContainer>').encode("utf-8")
 
     def start(self) -> None:
+        if self.is_active():
+            return
+        if self.httpd or self.gdm_socket:
+            self.stop()
+        self.error = ""
         receiver = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -401,14 +456,25 @@ class PlexCompanionReceiver:
     def stop(self) -> None:
         server, self.httpd = self.httpd, None
         if server:
-            server.shutdown()
+            if self.http_thread and self.http_thread.is_alive():
+                server.shutdown()
             server.server_close()
+        thread, self.http_thread = self.http_thread, None
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
         sock, self.gdm_socket = self.gdm_socket, None
         if sock:
             try:
                 sock.close()
             except Exception:
                 pass
+        thread, self.gdm_thread = self.gdm_thread, None
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    def is_active(self) -> bool:
+        return bool(self.httpd and self.http_thread and self.http_thread.is_alive()
+                    and self.gdm_socket and self.gdm_thread and self.gdm_thread.is_alive())
 
 
 class PlexHTTP:
@@ -881,7 +947,29 @@ class PlexHTTP:
                 "fallback_stream_url": direct_url if codec in ("mp3", "flac") else "",
                 "stream_mode": "transcode-aac"}
 
-    def prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
+    def prepare_companion_playback(self, key: str, container_key: str = "",
+                                   server_machine_id: str = "", controller_token: str = "") -> Dict[str, Any]:
+        # Companion playMedia carries the controller's transient token for the
+        # media server. Use it when supplied so a Plexamp account with shared
+        # library access can play through DeckyPlex even if Decky is signed into
+        # a different Plex account. Keep requests pinned to the configured
+        # server; never trust an address supplied by a LAN controller.
+        target_server_id = str(getattr(self.sdk, "machineIdentifier", "") or "")
+        if server_machine_id and target_server_id and server_machine_id != target_server_id:
+            raise ValueError("Plexamp requested playback from a different Plex server than DeckyPlex selected")
+        client = self
+        owns_session = False
+        if controller_token and controller_token != self.token:
+            client = PlexHTTP(self.base_url, controller_token, timeout=self.timeout,
+                              verify_tls=bool(self.session.verify), account_token=controller_token)
+            owns_session = True
+        try:
+            return client._prepare_companion_playback(key, container_key)
+        finally:
+            if owns_session:
+                client.session.close()
+
+    def _prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
         parsed = urllib.parse.urlparse(key or "")
         match = re.search(r"/library/metadata/(\d+)", parsed.path or key or "")
         if not match:
@@ -917,11 +1005,20 @@ class PlexHTTP:
         streams = self.get_stream_urls(rating_key)
         selected = self._item_dict(item)
         selected["playQueueItemID"] = active_item_id
+        server_url = urllib.parse.urlparse(self.sdk._baseurl)
+        server_context = {
+            "machine_identifier": str(getattr(self.sdk, "machineIdentifier", "") or ""),
+            "address": server_url.hostname or "",
+            "port": server_url.port or 32400,
+            "protocol": server_url.scheme or "http",
+            "token": self.token,
+        }
         return {"success": True, "track": selected, "queue": queue,
                 "play_queue_id": active_queue_id,
                 "play_queue_item_id": active_item_id,
                 "play_queue_version": active_queue_version,
                 "container_key": f"/playQueues/{active_queue_id}?window=200&own=1" if active_queue_id else "",
+                "server_context": server_context,
                 **streams}
 
     def inspect_stream(self, rating_key: str, stream_url: str) -> Dict[str, Any]:
@@ -973,6 +1070,23 @@ class Plugin:
             receiver_id = str(uuid.uuid4())
             settings["companion_id"] = receiver_id
             _save_settings(settings)
+        if settings.get("companion_receiver_enabled", True):
+            self._configure_companion_receiver(receiver_id, True)
+        else:
+            logger.info("Plex Companion receiver is disabled in settings")
+
+    def _configure_companion_receiver(self, receiver_id: str, enabled: bool) -> None:
+        global _companion_receiver
+        if not enabled:
+            if _companion_receiver:
+                _companion_receiver.stop()
+                _companion_receiver = None
+            logger.info("Plex Companion receiver disabled")
+            return
+        if _companion_receiver and _companion_receiver.is_active():
+            return
+        if _companion_receiver:
+            _companion_receiver.stop()
         _companion_receiver = PlexCompanionReceiver(receiver_id, _companion_event_loop)
         _companion_receiver.start()
 
@@ -1031,9 +1145,12 @@ class Plugin:
         try:
             merged = _load_settings()
             for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns", "volume",
-                        "playback_target", "connection_timeout", "verify_tls"):
+                        "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
+                        "allow_signed_out_companion"):
                 if key in settings:
                     merged[key] = settings[key]
+            merged["companion_receiver_enabled"] = bool(merged.get("companion_receiver_enabled", True))
+            merged["allow_signed_out_companion"] = bool(merged.get("allow_signed_out_companion", False))
             merged["manual_server_url"] = self._normalize_server_url(merged.get("manual_server_url", ""))
             merged["playback_target"] = "remote" if merged.get("playback_target") == "remote" and merged.get("selected_player_id") else "local"
             try:
@@ -1051,6 +1168,9 @@ class Plugin:
             except (TypeError, ValueError):
                 merged["grid_columns"] = 0
             _save_settings(merged)
+            receiver_id = str(merged.get("companion_id") or "").strip()
+            if receiver_id:
+                self._configure_companion_receiver(receiver_id, merged["companion_receiver_enabled"])
             return self._public_settings(merged)
         except Exception as e:
             logger.error(f"Failed to save settings: {e}")
@@ -1266,9 +1386,12 @@ class Plugin:
 
     async def get_companion_status(self) -> Dict[str, Any]:
         receiver = _companion_receiver
+        enabled = bool(_load_settings().get("companion_receiver_enabled", True))
+        if not enabled:
+            return {"active": False, "enabled": False, "error": "Receiver disabled in settings"}
         if not receiver:
-            return {"active": False, "error": "Companion receiver is not running"}
-        return {"active": bool(receiver.httpd and receiver.gdm_socket),
+            return {"active": False, "enabled": True, "error": "Receiver has not initialized yet"}
+        return {"active": receiver.is_active(), "enabled": True,
                 "port": receiver.HTTP_PORT, "error": receiver.error}
 
     async def poll_companion_commands(self) -> Dict[str, Any]:
@@ -1279,24 +1402,93 @@ class Plugin:
                         len(commands), ", ".join(command.get("command", "?") for command in commands))
         return {"commands": commands}
 
-    async def prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
+    async def prepare_companion_playback(self, key: str, container_key: str = "",
+                                        server_machine_id: str = "", controller_token: str = "",
+                                        server_address: str = "", server_port: int = 32400,
+                                        server_protocol: str = "http") -> Dict[str, Any]:
         plex = self._get_plex()
+        settings = _load_settings()
+        # When enabled, incoming Plexamp playback is authorized by the token
+        # sent with that command, regardless of DeckyPlex's signed-in account
+        # or selected server. Keep this path limited to private LAN IPs.
+        if settings.get("allow_signed_out_companion", False):
+            if not controller_token:
+                return {"success": False, "error": "Plexamp did not provide a server access token."}
+            try:
+                if not server_machine_id or server_machine_id == "node":
+                    raise ValueError("Plexamp did not identify a local Plex server")
+                base_url = _private_plex_base_url(server_address, server_port, server_protocol)
+                timeout = int(settings.get("connection_timeout", 8) or 8)
+                verify_tls = bool(settings.get("verify_tls", False))
+                plex = PlexHTTP(base_url, controller_token, timeout=timeout,
+                                verify_tls=verify_tls, account_token=controller_token)
+                try:
+                    return plex.prepare_companion_playback(key, container_key, server_machine_id, controller_token)
+                finally:
+                    plex.session.close()
+            except Exception as exc:
+                logger.warning("Could not prepare signed-out Companion playback: %s", exc)
+                return {"success": False, "error": str(exc)}
         if not plex:
-            return {"success": False, "error": "Connect to a Plex server before receiving playback."}
+            return {"success": False, "error": "Connect DeckyPlex to Plex or enable playback from any Plex account in Players settings."}
         try:
-            return plex.prepare_companion_playback(key, container_key)
+            return plex.prepare_companion_playback(key, container_key, server_machine_id, controller_token)
         except Exception as exc:
             logger.error("Could not prepare incoming Plex playback: %s", exc, exc_info=True)
             return {"success": False, "error": str(exc)}
 
+    async def play_companion_track(self, rating_key: str,
+                                   server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get the next Companion queue item's stream using its authorized server context."""
+        context = server_context or {}
+        settings = _load_settings()
+        plex = None
+        owns_session = False
+        try:
+            if settings.get("allow_signed_out_companion", False):
+                token = str(context.get("token") or "")
+                machine_id = str(context.get("machine_identifier") or "")
+                if not token or not machine_id:
+                    return {"success": False, "error": "Missing Plexamp server authorization."}
+                base_url = _private_plex_base_url(
+                    str(context.get("address") or ""),
+                    int(context.get("port") or 32400),
+                    str(context.get("protocol") or "http"),
+                )
+                plex = PlexHTTP(base_url, token,
+                                timeout=int(settings.get("connection_timeout", 8) or 8),
+                                verify_tls=bool(settings.get("verify_tls", False)),
+                                account_token=token)
+                owns_session = True
+                if str(getattr(plex.sdk, "machineIdentifier", "") or "") != machine_id:
+                    return {"success": False, "error": "Plexamp server identity changed during playback."}
+            else:
+                plex = self._get_plex()
+                if not plex:
+                    return {"success": False, "error": "Not connected to Plex server"}
+                expected_id = str(getattr(plex.sdk, "machineIdentifier", "") or "")
+                requested_id = str(context.get("machine_identifier") or "")
+                if requested_id and expected_id and requested_id != expected_id:
+                    return {"success": False, "error": "Plexamp requested playback from a different Plex server than DeckyPlex selected"}
+            streams = plex.get_stream_urls(str(rating_key))
+            return {"success": True, **streams}
+        except Exception as exc:
+            logger.warning("Could not load Companion queue track %s: %s", rating_key, exc)
+            return {"success": False, "error": str(exc)}
+        finally:
+            if owns_session and plex:
+                plex.session.close()
+
     async def report_companion_timeline(self, rating_key: str, time_ms: int, duration_ms: int,
                                         state: str, volume: int = 50,
                                         play_queue_id: str = "", play_queue_item_id: str = "",
-                                        container_key: str = "", play_queue_version: str = "") -> Dict[str, Any]:
+                                        container_key: str = "", play_queue_version: str = "",
+                                        server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         receiver = _companion_receiver
         if receiver:
             settings = _load_settings()
             server_url = urllib.parse.urlparse(self._get_plex_server_url())
+            context = server_context or {}
             receiver.set_timeline({"key": f"/library/metadata/{rating_key}" if rating_key else "",
                                    "state": state, "time": max(0, int(time_ms)),
                                    "duration": max(0, int(duration_ms)),
@@ -1304,10 +1496,11 @@ class Plugin:
                                    "playQueueItemID": str(play_queue_item_id or ""),
                                    "containerKey": str(container_key or ""),
                                    "playQueueVersion": str(play_queue_version or ""),
-                                   "serverId": settings.get("selected_server_id", ""),
-                                   "address": server_url.hostname or "", "port": server_url.port or 32400,
-                                   "protocol": server_url.scheme or "http",
-                                   "token": self._get_server_access_token(),
+                                   "serverId": context.get("machine_identifier") or settings.get("selected_server_id", ""),
+                                   "address": context.get("address") or server_url.hostname or "",
+                                   "port": int(context.get("port") or server_url.port or 32400),
+                                   "protocol": context.get("protocol") or server_url.scheme or "http",
+                                   "token": context.get("token") or self._get_server_access_token(),
                                    "volume": max(0, min(100, int(volume)))})
         return {"success": True}
 

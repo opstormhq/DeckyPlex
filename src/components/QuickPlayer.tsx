@@ -162,8 +162,8 @@ export function QuickPlayer() {
 
   // Status: green=playing, orange=paused, blue=ready (default), red=error
   const hasTrack = !!track;
-  const statusColor = !plexConnected ? '#777777' : isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : error ? '#ff4444' : '#4488ff';
-  const statusText = !plexConnected ? 'Not connected to Plex' : isPlaying ? 'Playing' : isPaused ? 'Paused' : error ? error : 'Ready';
+  const statusColor = error ? '#ff4444' : !plexConnected ? '#777777' : isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : '#4488ff';
+  const statusText = error ? 'Error' : !plexConnected ? 'Not connected to Plex' : isPlaying ? 'Playing' : isPaused ? 'Paused' : 'Ready';
 
   return (
     <PanelSection title="">

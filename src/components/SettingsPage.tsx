@@ -32,6 +32,8 @@ interface Settings {
   connection_timeout: number;
   verify_tls: boolean;
   grid_columns: number;
+  companion_receiver_enabled: boolean;
+  allow_signed_out_companion: boolean;
 }
 
 interface Server {
@@ -65,6 +67,8 @@ const DEFAULT_SETTINGS: Settings = {
   connection_timeout: 8,
   verify_tls: false,
   grid_columns: 0,
+  companion_receiver_enabled: true,
+  allow_signed_out_companion: false,
 };
 
 export function SettingsPage() {
@@ -75,7 +79,7 @@ export function SettingsPage() {
   const [serverStatus, setServerStatus] = useState("");
   const [refreshingServers, setRefreshingServers] = useState(false);
   const [selectingServer, setSelectingServer] = useState(false);
-  const [companionStatus, setCompanionStatus] = useState<{ active: boolean; port?: number; error?: string }>({ active: false });
+  const [companionStatus, setCompanionStatus] = useState<{ active: boolean; enabled?: boolean; port?: number; error?: string }>({ active: false, enabled: true });
   const [checkingCompanionStatus, setCheckingCompanionStatus] = useState(true);
   const [playersStatus, setPlayersStatus] = useState("");
   const [browserStatus, setBrowserStatus] = useState("");
@@ -117,13 +121,20 @@ export function SettingsPage() {
   // Load settings on mount
   useEffect(() => {
     callWithTimeout("get_settings", 10000)
-      .then((result: any) => {
+      .then(async (result: any) => {
         settingsRef.current = result;
         setSettings(result);
-        void callWithTimeout('get_companion_status', 5000)
-          .then(setCompanionStatus)
-          .catch((error: any) => setCompanionStatus({ active: false, error: error?.message || 'Could not check receiver status' }))
-          .finally(() => setCheckingCompanionStatus(false));
+        try {
+          // Read this local status before starting Plex discovery below. Discovery
+          // uses synchronous PlexAPI requests and can block Decky's Python event
+          // loop long enough for this otherwise-instant call to time out.
+          const status = await callWithTimeout('get_companion_status', 15000);
+          setCompanionStatus(status);
+        } catch (error: any) {
+          setCompanionStatus({ active: false, error: error?.message || 'Could not check receiver status' });
+        } finally {
+          setCheckingCompanionStatus(false);
+        }
         if (!result.has_plex_token) return;
         setRefreshingServers(true);
         void (async () => {
@@ -315,6 +326,23 @@ export function SettingsPage() {
     return updated;
   }, [saveSettings]);
 
+  const handleReceiverEnabledChange = useCallback(async (enabled: boolean) => {
+    const updated: Settings = { ...settingsRef.current, companion_receiver_enabled: enabled };
+    settingsRef.current = updated;
+    setSettings(updated);
+    setCheckingCompanionStatus(true);
+    try {
+      const saved: any = await callWithTimeout('set_settings', 15000, updated);
+      if (saved?.error) throw new Error(saved.error);
+      const receiver: any = await callWithTimeout('get_companion_status', 15000);
+      setCompanionStatus(receiver);
+    } catch (error: any) {
+      setCompanionStatus({ active: false, enabled, error: error?.message || 'Could not update receiver' });
+    } finally {
+      setCheckingCompanionStatus(false);
+    }
+  }, []);
+
   useEffect(() => () => {
     if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
   }, []);
@@ -430,15 +458,36 @@ export function SettingsPage() {
   const renderPlayersPage = () => (
     <PanelSection>
       <PanelSectionRow>
+        <DialogCheckbox
+          label="Plexamp receiver"
+          description="Let Plexamp and other Plex apps play music on this Decky device. Enabled by default."
+          checked={settings.companion_receiver_enabled}
+          onChange={handleReceiverEnabledChange}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <DialogCheckbox
+          label="Accept playback from any Plex account"
+          description="Use Plexamp’s access token even when DeckyPlex is signed in to another account or server, or signed out. Supports LAN servers and secure plex.direct addresses."
+          checked={settings.allow_signed_out_companion}
+          onChange={(checked) => updateSetting('allow_signed_out_companion', checked)}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           {checkingCompanionStatus
             ? <Spinner style={{ width: '16px', height: '16px', flexShrink: 0 }} />
-            : companionStatus.active
+            : !settings.companion_receiver_enabled
+              ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#8b8b8b' }} />
+              : companionStatus.active
               ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#77d98b' }} />
               : <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#e7a64a' }} />}
-          <DialogBodyText>{checkingCompanionStatus ? 'Checking DeckyPlex receiver…' : companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : `DeckyPlex receiver unavailable${companionStatus.error ? `: ${companionStatus.error}` : '.'}`}</DialogBodyText>
+          <DialogBodyText>{checkingCompanionStatus ? 'Checking DeckyPlex receiver…' : !settings.companion_receiver_enabled ? 'Plexamp receiver is off.' : companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : 'Error'}</DialogBodyText>
         </div>
       </PanelSectionRow>
+      {!settings.has_plex_token ? (
+        <PanelSectionRow><DialogBodyText style={{ opacity: 0.65 }}>Log in to Plex to select remote players.</DialogBodyText></PanelSectionRow>
+      ) : <>
       <PanelSectionRow>
         <DialogBodyText style={{ opacity: 0.75 }}>
           Choose where DeckyPlex sends playback. The list includes server-connected clients and devices registered to your Plex account. A registered device may need to be opened or started before it can accept playback.
@@ -489,6 +538,7 @@ export function SettingsPage() {
         </PanelSectionRow>
       )}
       {playersStatus && <PanelSectionRow><DialogBodyText>{playersStatus}</DialogBodyText></PanelSectionRow>}
+      </>}
     </PanelSection>
   );
 
@@ -571,15 +621,7 @@ export function SettingsPage() {
     {
       title: 'Players',
       icon: <FaMusic />,
-      content: settings.has_plex_token ? renderPlayersPage() : (
-        <PanelSection>
-          <PanelSectionRow>
-            <DialogBodyText style={{ opacity: 0.5 }}>
-              Log in first to discover players.
-            </DialogBodyText>
-          </PanelSectionRow>
-        </PanelSection>
-      ),
+      content: renderPlayersPage(),
     },
     {
       title: 'Browser',
