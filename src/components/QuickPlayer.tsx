@@ -362,7 +362,7 @@ export function QuickPlayer() {
       <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
-          <div style={{ width: '100%', padding: '0.2rem 0.85rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField
+          <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField
             label="Volume"
             min={0}
             max={100}

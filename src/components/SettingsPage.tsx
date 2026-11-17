@@ -343,6 +343,22 @@ export function SettingsPage() {
     }
   }, []);
 
+  const handleAllowAnyAccountChange = useCallback(async (enabled: boolean) => {
+    const previous = settingsRef.current;
+    const updated: Settings = { ...previous, allow_signed_out_companion: enabled };
+    settingsRef.current = updated;
+    setSettings(updated);
+    try {
+      const saved: any = await callWithTimeout('set_settings', 15000, updated);
+      if (saved?.error) throw new Error(saved.error);
+      window.dispatchEvent(new Event('deckyplex-settings-change'));
+    } catch (error: any) {
+      settingsRef.current = previous;
+      setSettings(previous);
+      setPlayersStatus(error?.message || 'Could not save playback access setting.');
+    }
+  }, []);
+
   useEffect(() => () => {
     if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
   }, []);
@@ -470,7 +486,7 @@ export function SettingsPage() {
           label="Accept playback from any Plex account"
           description="Use Plexamp’s access token even when DeckyPlex is signed in to another account or server, or signed out. Supports LAN servers and secure plex.direct addresses."
           checked={settings.allow_signed_out_companion}
-          onChange={(checked) => updateSetting('allow_signed_out_companion', checked)}
+          onChange={handleAllowAnyAccountChange}
         />
       </PanelSectionRow>
       <PanelSectionRow>

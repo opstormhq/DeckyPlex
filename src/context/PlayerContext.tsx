@@ -74,6 +74,18 @@ function logToBackend(message: string) {
   call("log_message", message).catch(() => {});
 }
 
+function showTransientPlaybackError(setState: any, message: string) {
+  const revision = (engine.playbackErrorRevision || 0) + 1;
+  engine.playbackErrorRevision = revision;
+  if (engine.playbackErrorTimer) window.clearTimeout(engine.playbackErrorTimer);
+  setState((state: PlayerState) => ({ ...state, playbackState: 'stopped', error: message }));
+  engine.playbackErrorTimer = window.setTimeout(() => {
+    if (engine.playbackErrorRevision !== revision) return;
+    setState((state: PlayerState) => state.error === message ? { ...state, error: null } : state);
+    engine.playbackErrorTimer = null;
+  }, 5000);
+}
+
 function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) {
   if (engine.companionActive && engine.track?.id) {
     const now = Date.now();
@@ -182,6 +194,7 @@ async function playQueuedIndex(index: number) {
     engine.explicitlyStopped = false;
     const started = await playStreamWithFallback(result.stream_url, result.fallback_stream_url || '', nextTrack.title, requestId);
     if (requestId === engine.requestId && !started) throw new Error('Playback request was interrupted');
+    if (requestId === engine.requestId && engine.companionActive) reportTimeline('playing', true);
   } catch (e: any) {
     if (requestId !== engine.requestId) return;
     const mediaError = sharedAudio.error;
@@ -273,20 +286,23 @@ async function loadMoreQueue() {
 
 async function startCompanionTrack(params: Record<string, string[]>) {
   const requestedKey = params.key?.[0] || '';
+  engine.lastCompanionPlayMediaAt = Date.now();
+  const previousContext = engine.companionServerContext || {};
   engine.companionServerContext = {
-    machine_identifier: params.machineIdentifier?.[0] || '',
-    address: params.address?.[0] || '',
-    port: Number(params.port?.[0] || 32400),
-    protocol: params.protocol?.[0] || 'http',
-    token: params.token?.[0] || '',
+    machine_identifier: params.machineIdentifier?.[0] || previousContext.machine_identifier || '',
+    address: params.address?.[0] || previousContext.address || '',
+    port: Number(params.port?.[0] || previousContext.port || 32400),
+    protocol: params.protocol?.[0] || previousContext.protocol || 'http',
+    token: params.token?.[0] || previousContext.token || '',
   };
   if (engine.companionActive && !sharedAudio.paused && engine.track?.key === requestedKey) {
     logToBackend(`Plex Companion repeated current playMedia; keeping ${engine.track.title} active`);
     return;
   }
+  const containerKey = params.containerKey?.[0] || engine.companionContainerKey || '';
   const prepared: any = await call('prepare_companion_playback', requestedKey,
-    params.containerKey?.[0] || '', params.machineIdentifier?.[0] || '', params.token?.[0] || '',
-    params.address?.[0] || '', Number(params.port?.[0] || 32400), params.protocol?.[0] || 'http');
+    containerKey, engine.companionServerContext.machine_identifier, engine.companionServerContext.token,
+    engine.companionServerContext.address, engine.companionServerContext.port, engine.companionServerContext.protocol);
   if (prepared?.server_context) engine.companionServerContext = prepared.server_context;
   if (!prepared?.success || !prepared.track || !prepared.stream_url) {
     const failedKey = requestedKey.match(/\/library\/metadata\/(\d+)/)?.[1] || '';
@@ -309,7 +325,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   const queue = (prepared.queue || [prepared.track]).map(toTrack).filter((item: TrackInfo) => item.id);
   const selected = toTrack(prepared.track);
   const requestId = ++engine.requestId;
-  if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
+  if (engine.track && !engine.remoteActive && !engine.companionActive) reportTimeline('stopped', true);
   engine.companionActive = true;
   engine.companionServerContext = prepared.server_context || engine.companionServerContext;
   engine.companionPlayQueueId = prepared.play_queue_id || '';
@@ -334,6 +350,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   try {
     const started = await playStreamWithFallback(prepared.stream_url, prepared.fallback_stream_url || '', selected.title, requestId);
     if (requestId !== engine.requestId || !started) return;
+    reportTimeline('playing', true);
     window.dispatchEvent(new Event('deckyplex-track-change'));
     const offset = Number(params.offset?.[0] || 0);
     if (offset > 0) window.setTimeout(() => {
@@ -377,6 +394,10 @@ function handleCompanionCommand(entry: any) {
       reportTimeline('paused', true);
       break;
     case 'stop':
+      if (engine.companionActive && Date.now() - (engine.lastCompanionPlayMediaAt || 0) < 1500) {
+        logToBackend('Plex Companion stop arrived during a new queue handoff; ignoring stale stop');
+        break;
+      }
       logToBackend('Plex Companion stop command received');
       stopSharedPlayback(true);
       engine.companionActive = false;
@@ -391,7 +412,10 @@ function handleCompanionCommand(entry: any) {
       const targetIndex = engine.queue.findIndex((track: TrackInfo) =>
         track.key === key || (ratingKey && track.id === ratingKey));
       if (targetIndex >= 0) void playQueuedIndex(targetIndex);
-      else logToBackend(`Plex Companion skipTo key not found in queue: ${key}`);
+      else if (ratingKey && engine.companionActive) {
+        logToBackend(`Plex Companion skipTo key is outside the loaded queue; loading from server: ${key}`);
+        void startCompanionTrack({ ...params, key: [key], containerKey: [params.containerKey?.[0] || engine.companionContainerKey || ''] });
+      } else logToBackend(`Plex Companion skipTo key not found in queue: ${key}`);
       break;
     }
     case 'previous': {
@@ -508,7 +532,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       logToBackend(`audio error: code=${mediaError?.code} ${msg}`);
       engine.explicitlyStopped = true;
       reportTimeline('stopped', true);
-      setState(s => ({ ...s, playbackState: "stopped", error: msg }));
+      showTransientPlaybackError(setState, msg);
     };
     const onTimeUpdate = () => setState(s => s.remoteMode ? s : ({
         ...s,
@@ -549,7 +573,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const detail = (event as CustomEvent<{ message?: string; requestId?: number }>).detail;
       if (detail?.requestId != null && detail.requestId !== engine.requestId) return;
       const message = detail?.message || 'Could not load queued track';
-      setState(s => ({ ...s, playbackState: 'stopped', error: message }));
+      showTransientPlaybackError(setState, message);
     };
 
     sharedAudio.addEventListener('play', onPlay);
