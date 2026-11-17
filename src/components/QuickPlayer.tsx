@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { call } from '@decky/api';
 import {
   Button,
@@ -33,6 +33,8 @@ export function QuickPlayer() {
   const [shufflingAll, setShufflingAll] = useState(false);
   const [shuffleError, setShuffleError] = useState('');
   const [showQueue, setShowQueue] = useState(false);
+  const queueContainerRef = useRef<HTMLDivElement | null>(null);
+  const pendingQueueFocusId = useRef<string | null>(null);
   const {
     playbackState,
     track,
@@ -57,6 +59,21 @@ export function QuickPlayer() {
     playQueueIndex,
     removeFromQueue,
   } = usePlayer();
+
+  useEffect(() => {
+    if (!showQueue || !pendingQueueFocusId.current) return;
+    const nextId = pendingQueueFocusId.current;
+    pendingQueueFocusId.current = null;
+    const rows = Array.from(queueContainerRef.current?.querySelectorAll<HTMLElement>('[data-queue-track-id]') || []);
+    rows.find(row => row.dataset.queueTrackId === nextId)?.focus();
+  }, [queue, showQueue]);
+
+  const handleRemoveQueueTrack = (index: number) => {
+    const nextTrack = queue[index + 1] || queue[index - 1];
+    pendingQueueFocusId.current = nextTrack?.id || null;
+    removeFromQueue(index);
+    if (queue.length <= 1) setShowQueue(false);
+  };
 
   useEffect(() => {
     let mounted = true;
@@ -318,14 +335,14 @@ export function QuickPlayer() {
       </PanelSectionRow>
       {showQueue && (
         <PanelSectionRow>
-          <div style={{ width: '100%', maxHeight: 'min(390px, 42vh)', overflowY: 'auto', overscrollBehavior: 'contain', padding: '0 0.5rem', boxSizing: 'border-box' }}>
+          <div ref={queueContainerRef} style={{ width: '100%', maxHeight: 'min(390px, 42vh)', overflowY: 'auto', overscrollBehavior: 'contain', padding: '0 0.5rem', boxSizing: 'border-box' }}>
             <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
               {queue.slice(Math.max(0, queueIndex)).map((queuedTrack, index) => {
                 const actualIndex = Math.max(0, queueIndex) + index;
-                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)}
-                  onOptionsActionDescription="Remove from queue" onOptionsButton={() => removeFromQueue(actualIndex)}
+                return <Button key={`${queuedTrack.id}-${actualIndex}`} ref={(element: HTMLDivElement | null) => { if (element) element.dataset.queueTrackId = queuedTrack.id; }} onClick={() => playQueueIndex(actualIndex)}
+                  onSecondaryActionDescription="Remove from queue" onSecondaryButton={(event) => { event.preventDefault(); event.stopPropagation(); handleRemoveQueueTrack(actualIndex); }}
                   style={{ width: '100%', minWidth: 0, minHeight: '0', height: '30px', padding: '0.05rem 0.35rem', fontSize: '0.82rem', justifyContent: 'flex-start', overflow: 'hidden', boxSizing: 'border-box', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
-                  <span style={{ display: 'block', flex: '1 1 0%', width: 0, maxWidth: '100%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
+                  <span style={{ display: 'block', width: '100%', maxWidth: '100%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
                 </Button>;
               })}
             </Focusable>
@@ -334,7 +351,7 @@ export function QuickPlayer() {
       )}
 
       {/* Volume Control */}
-      <PanelSectionRow><div style={{ height: '0.2rem', width: '100%' }} /></PanelSectionRow>
+      <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
           <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField

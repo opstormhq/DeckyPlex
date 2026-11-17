@@ -1023,6 +1023,8 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const playlistLoadInProgress = useRef(false);
+  const playlistActionInProgress = useRef(false);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -1032,35 +1034,44 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
   }, [view, loading, playlists.length]);
 
   const showPlaylists = async () => {
+    if (playlistLoadInProgress.current) return;
+    playlistLoadInProgress.current = true;
     setView('playlists');
     setLoading(true);
-    setMessage('');
+    setMessage('Loading playlists…');
     try {
       const result: any = await call('get_audio_playlists', 100);
       if (result?.error) throw new Error(result.error);
       setPlaylists(result?.items || []);
+      setMessage('');
     } catch (error: any) {
       setMessage(error?.message || 'Could not load playlists.');
     } finally {
+      playlistLoadInProgress.current = false;
       setLoading(false);
     }
   };
 
   const addToPlaylist = async (playlistId: string) => {
+    if (playlistActionInProgress.current) return;
+    playlistActionInProgress.current = true;
     setBusy(true);
     try {
       const result: any = await call('add_track_to_playlist', playlistId, track.id);
       if (!result?.success) throw new Error(result?.error || 'Could not add track to playlist.');
       setMessage(`Added to ${result.playlist || 'playlist'}.`);
       window.dispatchEvent(new Event('deckyplex-playlists-change'));
-      setBusy(false);
     } catch (error: any) {
       setMessage(error?.message || 'Could not add track to playlist.');
+    } finally {
+      playlistActionInProgress.current = false;
       setBusy(false);
     }
   };
 
   const createPlaylist = async () => {
+    if (playlistActionInProgress.current) return;
+    playlistActionInProgress.current = true;
     setBusy(true);
     try {
       const result: any = await call('create_audio_playlist', playlistName, track.id);
@@ -1069,9 +1080,10 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
       setPlaylists(items => [{ id: result.id, key: '', title: result.playlist || playlistName, type: 'playlist' }, ...items]);
       setView('playlists');
       window.dispatchEvent(new Event('deckyplex-playlists-change'));
-      setBusy(false);
     } catch (error: any) {
       setMessage(error?.message || 'Could not create playlist.');
+    } finally {
+      playlistActionInProgress.current = false;
       setBusy(false);
     }
   };
@@ -1084,12 +1096,12 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
         {view === 'actions' && <>
           <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
           <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
-          <PanelSectionRow><Button onClick={() => void showPlaylists()}>Add to Playlist</Button></PanelSectionRow>
+          <PanelSectionRow><Button onClick={() => void showPlaylists()} onOKButton={(event) => { event.preventDefault(); void showPlaylists(); }}>Add to Playlist</Button></PanelSectionRow>
         </>}
         {view === 'playlists' && <>
-          {loading && <PanelSectionRow><Spinner /></PanelSectionRow>}
+          {loading && <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Spinner style={{ width: '18px', height: '18px' }} /> Loading playlists…</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
-          {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)}>{playlist.title}</Button></PanelSectionRow>)}
+          {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)} onOKButton={(event) => { event.preventDefault(); void addToPlaylist(playlist.id); }}>{playlist.title}</Button></PanelSectionRow>)}
           {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
           <PanelSectionRow><Button disabled={busy} onClick={() => setView('actions')}>Back</Button></PanelSectionRow>
         </>}
