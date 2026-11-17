@@ -24,6 +24,9 @@ export default definePlugin(() => {
 
   return {
     name: "DeckyPlex",
+    // The playback engine receives Plex Companion commands even when the QAM is hidden.
+    // Keep Decky's content tree alive so its frontend bridge remains available.
+    alwaysRender: true,
     titleView: <div className={staticClasses.Title}>DeckyPlex</div>,
     icon: <FaMusic />,
     content: (

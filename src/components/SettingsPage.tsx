@@ -76,6 +76,7 @@ export function SettingsPage() {
   const [refreshingServers, setRefreshingServers] = useState(false);
   const [selectingServer, setSelectingServer] = useState(false);
   const [companionStatus, setCompanionStatus] = useState<{ active: boolean; port?: number; error?: string }>({ active: false });
+  const [checkingCompanionStatus, setCheckingCompanionStatus] = useState(true);
   const [playersStatus, setPlayersStatus] = useState("");
   const [browserStatus, setBrowserStatus] = useState("");
   const [advancedStatus, setAdvancedStatus] = useState("");
@@ -119,7 +120,10 @@ export function SettingsPage() {
       .then((result: any) => {
         settingsRef.current = result;
         setSettings(result);
-        void callWithTimeout('get_companion_status', 5000).then(setCompanionStatus).catch(() => {});
+        void callWithTimeout('get_companion_status', 5000)
+          .then(setCompanionStatus)
+          .catch((error: any) => setCompanionStatus({ active: false, error: error?.message || 'Could not check receiver status' }))
+          .finally(() => setCheckingCompanionStatus(false));
         if (!result.has_plex_token) return;
         setRefreshingServers(true);
         void (async () => {
@@ -427,8 +431,12 @@ export function SettingsPage() {
     <PanelSection>
       <PanelSectionRow>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          {companionStatus.active ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#77d98b' }} /> : <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#e7a64a' }} />}
-          <DialogBodyText>{companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : `DeckyPlex receiver unavailable${companionStatus.error ? `: ${companionStatus.error}` : '.'}`}</DialogBodyText>
+          {checkingCompanionStatus
+            ? <Spinner style={{ width: '16px', height: '16px', flexShrink: 0 }} />
+            : companionStatus.active
+              ? <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#77d98b' }} />
+              : <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#e7a64a' }} />}
+          <DialogBodyText>{checkingCompanionStatus ? 'Checking DeckyPlex receiver…' : companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : `DeckyPlex receiver unavailable${companionStatus.error ? `: ${companionStatus.error}` : '.'}`}</DialogBodyText>
         </div>
       </PanelSectionRow>
       <PanelSectionRow>

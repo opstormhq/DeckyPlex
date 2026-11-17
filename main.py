@@ -1,4 +1,5 @@
 import json
+import asyncio
 import html
 import ipaddress
 import os
@@ -107,6 +108,7 @@ _pin_state: Dict[str, Any] = {}
 _plex_cache_key = None
 _plex_cache_instance = None
 _companion_receiver = None
+_companion_event_loop = None
 
 
 class PlexCompanionReceiver:
@@ -114,8 +116,9 @@ class PlexCompanionReceiver:
     HTTP_PORT = int(os.environ.get("DECKYPLEX_COMPANION_PORT", "32435"))
     GDM_PORT = 32412
 
-    def __init__(self, machine_id: str):
+    def __init__(self, machine_id: str, event_loop=None):
         self.machine_id = machine_id
+        self.event_loop = event_loop
         self.httpd = None
         self.http_thread = None
         self.gdm_socket = None
@@ -144,9 +147,10 @@ class PlexCompanionReceiver:
             command_id = int(params.get("commandID", ["0"])[0])
         except (TypeError, ValueError):
             command_id = 0
+        command = {"command": name, "params": params, "client_host": client_host,
+                   "client_id": client_id, "received_at": time.time()}
         with self.lock:
-            self.commands.append({"command": name, "params": params, "client_host": client_host,
-                                  "client_id": client_id, "received_at": time.time()})
+            self.commands.append(command)
             self.commands = self.commands[-32:]
             if client_id in self.controllers:
                 self.controllers[client_id]["commandId"] = command_id
@@ -157,8 +161,44 @@ class PlexCompanionReceiver:
         if name == "playMedia":
             logger.info("Companion received playMedia from %s: key=%s containerKey=%s",
                         client_host, params.get("key", [""])[0], params.get("containerKey", [""])[0])
+            # Plexamp waits for the receiver's timeline after playMedia. A music
+            # queue can take several seconds to resolve through PlexAPI, so report
+            # buffering now and replace it with playing/paused once playback starts.
+            try:
+                self.set_timeline({
+                    "key": params.get("key", [""])[0],
+                    "state": "buffering",
+                    "time": max(0, int(params.get("offset", ["0"])[0] or 0)),
+                    "duration": 0,
+                    "serverId": params.get("machineIdentifier", [""])[0],
+                    "address": params.get("address", [""])[0],
+                    "port": int(params.get("port", ["32400"])[0] or 32400),
+                    "protocol": params.get("protocol", ["http"])[0],
+                    "token": params.get("token", [""])[0],
+                    "volume": self.timeline.get("volume", 50),
+                })
+            except (TypeError, ValueError) as exc:
+                logger.warning("Could not publish initial Companion buffering timeline: %s", exc)
         else:
             logger.info("Companion received %s from %s (commandID=%s)", name, client_host, command_id)
+        # Push after updating the immediate buffering timeline. Keep the queued
+        # copy too, so polling can recover if the frontend event listener was
+        # not mounted when this event was emitted.
+        if self.event_loop and self.event_loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    decky.emit("companion_command", command), self.event_loop
+                )
+                future.add_done_callback(self._log_event_delivery_error)
+            except Exception as exc:
+                logger.warning("Could not dispatch Companion command event: %s", exc)
+
+    @staticmethod
+    def _log_event_delivery_error(future) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            logger.warning("Decky Companion command event failed: %s", exc)
 
     def drain_commands(self) -> List[Dict[str, Any]]:
         with self.lock:
@@ -216,7 +256,7 @@ class PlexCompanionReceiver:
             "address": state.get("address", ""), "port": state.get("port", 32400),
             "protocol": state.get("protocol", "http"), "token": state.get("token", ""),
             "volume": int(state.get("volume", 50)),
-            "controllable": "volume,seekTo,skipNext,skipPrevious,stop,playPause",
+            "controllable": "volume,seekTo,skipTo,skipNext,skipPrevious,stop,playPause",
         }
         if state.get("playQueueID"):
             attrs["playQueueID"] = state["playQueueID"]
@@ -313,7 +353,7 @@ class PlexCompanionReceiver:
                     command = parsed.path.rsplit("/", 1)[-1]
                     aliases = {"playMedia": "playMedia", "play": "play", "pause": "pause",
                                "stop": "stop", "skipNext": "next", "skipPrevious": "previous",
-                               "seekTo": "seek", "setParameters": "parameters"}
+                               "skipTo": "skipTo", "seekTo": "seek", "setParameters": "parameters"}
                     if command not in aliases:
                         return self._send(b"", status=404)
                     receiver.enqueue(aliases[command], urllib.parse.parse_qs(parsed.query), self.client_address[0],
@@ -925,22 +965,24 @@ class Plugin:
                 logger.error(f"Failed to create settings dir: {e}")
         else:
             logger.warning(f"Settings file has no directory: {_settings_file}")
-        global _companion_receiver
+        global _companion_receiver, _companion_event_loop
+        _companion_event_loop = asyncio.get_running_loop()
         settings = _load_settings()
         receiver_id = str(settings.get("companion_id") or "").strip()
         if not receiver_id:
             receiver_id = str(uuid.uuid4())
             settings["companion_id"] = receiver_id
             _save_settings(settings)
-        _companion_receiver = PlexCompanionReceiver(receiver_id)
+        _companion_receiver = PlexCompanionReceiver(receiver_id, _companion_event_loop)
         _companion_receiver.start()
 
     async def _unload(self):
         """Called when the plugin is unloaded."""
-        global _companion_receiver
+        global _companion_receiver, _companion_event_loop
         if _companion_receiver:
             _companion_receiver.stop()
             _companion_receiver = None
+        _companion_event_loop = None
         logger.info("DeckyPlex plugin unloaded")
 
     async def _uninstall(self):
@@ -1231,7 +1273,11 @@ class Plugin:
 
     async def poll_companion_commands(self) -> Dict[str, Any]:
         receiver = _companion_receiver
-        return {"commands": receiver.drain_commands() if receiver else []}
+        commands = receiver.drain_commands() if receiver else []
+        if commands:
+            logger.info("Dispatching %d Plex Companion command(s) to frontend: %s",
+                        len(commands), ", ".join(command.get("command", "?") for command in commands))
+        return {"commands": commands}
 
     async def prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
         plex = self._get_plex()

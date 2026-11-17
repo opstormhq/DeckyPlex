@@ -7,7 +7,7 @@ import {
   useEffect,
   ReactNode,
 } from 'react';
-import { call } from '@decky/api';
+import { addEventListener, call } from '@decky/api';
 
 interface TrackInfo {
   id: string;
@@ -158,11 +158,17 @@ async function playQueuedIndex(index: number) {
   sharedAudio.pause();
   sharedAudio.removeAttribute('src');
   sharedAudio.load();
-  reportTimeline('stopped', true);
+  if (!engine.companionActive) reportTimeline('stopped', true);
   engine.queueIndex = index;
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   engine.track = nextTrack;
   window.dispatchEvent(new Event('deckyplex-track-change'));
+  if (engine.companionActive) {
+    void call('report_companion_timeline', nextTrack.id, 0, nextTrack.duration || 0, 'buffering',
+      Math.round((sharedAudio.volume || 0) * 100), engine.companionPlayQueueId || '',
+      nextTrack.playQueueItemID || '', engine.companionContainerKey || '', engine.companionPlayQueueVersion || '')
+      .catch((error: any) => logToBackend(`Could not report Companion buffering state: ${error?.message || error}`));
+  }
   logToBackend(`queue: loading track ${index + 1}/${engine.queue.length}: ${nextTrack.title}`);
   try {
     const result: any = await call('play_track', nextTrack.id, nextTrack.sectionId);
@@ -218,12 +224,13 @@ sharedAudio.addEventListener('error', () => {
 sharedAudio.addEventListener('ended', () => {
   if (engine.explicitlyStopped || sharedAudio.error || !engine.track) return;
   logToBackend(`queue: track ended at ${engine.queueIndex + 1}/${engine.queue.length}`);
-  reportTimeline('stopped', true);
+  if (!engine.companionActive) reportTimeline('stopped', true);
   if (engine.queueIndex + 1 < engine.queue.length) {
     void playQueuedIndex(engine.queueIndex + 1);
   } else if (engine.queueLoader) {
     void loadMoreQueue();
   } else {
+    if (engine.companionActive) reportTimeline('stopped', true);
     stopSharedPlayback(false);
   }
 });
@@ -261,6 +268,12 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   }
   const prepared: any = await call('prepare_companion_playback', requestedKey, params.containerKey?.[0] || '');
   if (!prepared?.success || !prepared.track || !prepared.stream_url) {
+    const failedKey = requestedKey.match(/\/library\/metadata\/(\d+)/)?.[1] || '';
+    logToBackend(`Plex Companion could not prepare incoming track: ${prepared?.error || 'missing stream URL'}`);
+    if (failedKey) {
+      void call('report_companion_timeline', failedKey, 0, 0, 'error')
+        .catch((error: any) => logToBackend(`Could not report Companion playback error: ${error?.message || error}`));
+    }
     window.dispatchEvent(new CustomEvent('deckyplex-playback-error', {
       detail: { message: prepared?.error || 'Plexamp sent an unsupported track.' },
     }));
@@ -295,6 +308,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   window.dispatchEvent(new Event('deckyplex-track-change'));
   logToBackend(`Plex Companion starting ${selected.title} (${engine.queue.length} queued track(s))`);
+  logToBackend(`Plex Companion selected queue item ${engine.queueIndex + 1}/${engine.queue.length} for key ${requestedKey}`);
   try {
     const started = await playStreamWithFallback(prepared.stream_url, prepared.fallback_stream_url || '', selected.title, requestId);
     if (requestId !== engine.requestId || !started) return;
@@ -307,12 +321,26 @@ async function startCompanionTrack(params: Record<string, string[]>) {
     if (requestId !== engine.requestId) return;
     const message = error?.message || 'Could not start incoming Plex playback.';
     logToBackend(`Plex Companion playback failed: ${message}`);
+    void call('report_companion_timeline', selected.id, 0, selected.duration || 0, 'error',
+      Math.round((sharedAudio.volume || 0) * 100), engine.companionPlayQueueId || '',
+      selected.playQueueItemID || '', engine.companionContainerKey || '', engine.companionPlayQueueVersion || '')
+      .catch((reportError: any) => logToBackend(`Could not report Companion playback error: ${reportError?.message || reportError}`));
     window.dispatchEvent(new CustomEvent('deckyplex-playback-error', { detail: { message, requestId } }));
   }
 }
 
 function handleCompanionCommand(entry: any) {
   const params: Record<string, string[]> = entry.params || {};
+  const commandId = params.commandID?.[0];
+  if (commandId && commandId !== '0') {
+    const source = entry.client_id || entry.client_host || 'unknown';
+    const commandKey = `${source}:${commandId}`;
+    const handled: string[] = engine.handledCompanionCommands || (engine.handledCompanionCommands = []);
+    if (handled.includes(commandKey)) return;
+    handled.push(commandKey);
+    if (handled.length > 64) handled.splice(0, handled.length - 64);
+  }
+  logToBackend(`Plex Companion frontend received ${entry.command || 'unknown'} command`);
   const value = (key: string) => Number(params[key]?.[0] || 0);
   switch (entry.command) {
     case 'playMedia': void startCompanionTrack(params); break;
@@ -334,6 +362,15 @@ function handleCompanionCommand(entry: any) {
     case 'next':
       if (engine.queueIndex + 1 < engine.queue.length) void playQueuedIndex(engine.queueIndex + 1);
       break;
+    case 'skipTo': {
+      const key = params.key?.[0] || '';
+      const ratingKey = key.match(/\/library\/metadata\/(\d+)/)?.[1] || '';
+      const targetIndex = engine.queue.findIndex((track: TrackInfo) =>
+        track.key === key || (ratingKey && track.id === ratingKey));
+      if (targetIndex >= 0) void playQueuedIndex(targetIndex);
+      else logToBackend(`Plex Companion skipTo key not found in queue: ${key}`);
+      break;
+    }
     case 'previous': {
       const previous = sharedAudio.currentTime > 3 ? engine.queueIndex : engine.queueIndex - 1;
       if (previous >= 0 && previous < engine.queue.length) void playQueuedIndex(previous);
@@ -355,10 +392,17 @@ function handleCompanionCommand(entry: any) {
   }
 }
 
+// Decky's backend event bridge delivers commands immediately; the polling loop
+// below remains as a recovery path for events emitted before this bundle loads.
+addEventListener<[entry: any]>('companion_command', handleCompanionCommand);
+
 function startCompanionCommandPolling() {
-  if (engine.companionPolling) return;
-  engine.companionPolling = true;
+  // Do not use a window-global "already started" flag here. Decky can reload
+  // this bundle while preserving window state, leaving that flag true after the
+  // old interval has been discarded. Each live bundle may poll safely because
+  // the backend drains commands atomically.
   let polling = false;
+  logToBackend('Plex Companion frontend poller started');
   window.setInterval(async () => {
     if (polling) return;
     polling = true;
