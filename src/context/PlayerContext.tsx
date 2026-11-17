@@ -83,7 +83,18 @@ function showTransientPlaybackError(setState: any, message: string) {
     if (engine.playbackErrorRevision !== revision) return;
     setState((state: PlayerState) => state.error === message ? { ...state, error: null } : state);
     engine.playbackErrorTimer = null;
-  }, 5000);
+  }, 10000);
+}
+
+function rememberCompanionSession() {
+  if (!engine.companionActive || !engine.queue?.length || engine.queueIndex < 0) return;
+  engine.lastCompanionSession = {
+    queue: engine.queue.slice(), queueIndex: engine.queueIndex,
+    serverContext: engine.companionServerContext,
+    playQueueId: engine.companionPlayQueueId || '',
+    containerKey: engine.companionContainerKey || '',
+    playQueueVersion: engine.companionPlayQueueVersion || '',
+  };
 }
 
 function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) {
@@ -173,6 +184,7 @@ async function playQueuedIndex(index: number) {
   sharedAudio.load();
   if (!engine.companionActive) reportTimeline('stopped', true);
   engine.queueIndex = index;
+  rememberCompanionSession();
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   engine.track = nextTrack;
   window.dispatchEvent(new Event('deckyplex-track-change'));
@@ -343,6 +355,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   engine.queueIndex = Math.max(0, engine.queue.findIndex((item: TrackInfo) => item.id === selected.id));
   engine.queueLoader = null;
   engine.queueLoadInProgress = false;
+  rememberCompanionSession();
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   window.dispatchEvent(new Event('deckyplex-track-change'));
   logToBackend(`Plex Companion starting ${selected.title} (${engine.queue.length} queued track(s))`);
@@ -492,6 +505,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
     engine.companionActive = false;
     engine.companionServerContext = null;
+    engine.lastCompanionSession = null;
     sharedAudio.pause();
     sharedAudio.removeAttribute('src');
     sharedAudio.load();
@@ -795,9 +809,31 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       void controlRemotePlayer('play');
       return;
     }
+    if (!engine.companionActive && !engine.track && engine.lastCompanionSession) {
+      const session = engine.lastCompanionSession;
+      engine.companionActive = true;
+      engine.companionServerContext = session.serverContext;
+      engine.companionPlayQueueId = session.playQueueId;
+      engine.companionContainerKey = session.containerKey;
+      engine.companionPlayQueueVersion = session.playQueueVersion;
+      engine.queue = session.queue.slice();
+      engine.queueIndex = Math.max(0, Math.min(session.queueIndex, engine.queue.length - 1));
+      window.dispatchEvent(new Event('deckyplex-queue-change'));
+      void playQueuedIndex(engine.queueIndex);
+      return;
+    }
+    if (engine.companionActive && engine.track && engine.queue.length) {
+      // A phone may let its Plex session expire while paused or asleep. Reload
+      // the current item through Plex so playback and the phone timeline reconnect.
+      void playQueuedIndex(engine.queueIndex);
+      return;
+    }
     if (audioRef.current) {
       engine.explicitlyStopped = false;
-      audioRef.current.play().catch((e: Error) => {
+      const companionPlayback = engine.companionActive;
+      audioRef.current.play().then(() => {
+        if (companionPlayback) reportTimeline('playing', true);
+      }).catch((e: Error) => {
         setState(s => ({ ...s, error: e.message || "Failed to play" }));
       });
     }

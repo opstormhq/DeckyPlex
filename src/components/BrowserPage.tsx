@@ -628,7 +628,7 @@ export function BrowserPage() {
 
   const startTrackQueue = useCallback(async (sourceItems: LibraryItem[], startId?: string) => {
     try {
-      const trackQueue = sourceItems.filter(entry => entry.type === 'track').map(entry => ({
+      const fullTrackQueue = sourceItems.filter(entry => entry.type === 'track').map(entry => ({
         id: entry.id,
         sectionId: selectedSection,
         title: entry.title || 'Unknown',
@@ -637,11 +637,14 @@ export function BrowserPage() {
         duration: entry.duration || 0,
         thumb: versionArtwork(entry.thumb || '', artworkRevision),
       }));
-      if (!trackQueue.length) throw new Error('No tracks found to play.');
-      const trackInfo = trackQueue.find(track => track.id === startId) || trackQueue[0];
+      if (!fullTrackQueue.length) throw new Error('No tracks found to play.');
+      const selectedIndex = startId == null ? 0 : fullTrackQueue.findIndex(track => String(track.id) === String(startId));
+      const startIndex = selectedIndex >= 0 ? selectedIndex : 0;
+      const trackInfo = fullTrackQueue[startIndex];
+      const trackQueue = fullTrackQueue.slice(startIndex);
       itemCache.current.delete(`tab:${selectedSection}:recent`);
       if (remoteMode) {
-        const result = await playRemoteQueue(trackQueue, trackInfo.id);
+        const result = await playRemoteQueue(fullTrackQueue, trackInfo.id);
         if (!result.success) setError(result.error || 'Could not start playback on the selected remote player.');
         return;
       }
@@ -907,7 +910,7 @@ export function BrowserPage() {
           <DialogLabel style={{ flex: 1, minWidth: 0 }}>
             {subView?.title || (activeTab === 'recentlyAdded' ? 'Recently Added' : activeTab === 'recent' ? 'Recently Played' : activeTab === 'playlists' ? 'Playlists' : activeTab === 'search' ? 'Search' : activeTab === 'tracks' ? 'Songs' : activeTab[0].toUpperCase() + activeTab.slice(1))}
           </DialogLabel>
-          {(loading || loadingMore) && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
+          {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
           {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
             <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef} onClick={handlePlayCollection} onCancelButton={handleCancel} disabled={loading}>
               <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
@@ -980,6 +983,13 @@ export function BrowserPage() {
                 })}
               </Focusable>
             )}
+            </div>
+          </PanelSectionRow>
+        )}
+        {loadingMore && (
+          <PanelSectionRow>
+            <div style={{ display: 'flex', justifyContent: 'center', width: '100%', padding: '0.35rem 0' }}>
+              <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />
             </div>
           </PanelSectionRow>
         )}

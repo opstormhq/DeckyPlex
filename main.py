@@ -956,7 +956,7 @@ class PlexHTTP:
         # server; never trust an address supplied by a LAN controller.
         target_server_id = str(getattr(self.sdk, "machineIdentifier", "") or "")
         if server_machine_id and target_server_id and server_machine_id != target_server_id:
-            raise ValueError("Plexamp requested playback from a different Plex server than DeckyPlex selected")
+            raise ValueError("Incoming stream rejected: Plexamp is using a different Plex server. Log in to the same account and server in DeckyPlex, or enable ‘Accept playback from any Plex account’ in Players settings.")
         client = self
         owns_session = False
         if controller_token and controller_token != self.token:
@@ -978,7 +978,8 @@ class PlexHTTP:
         item = self.sdk.fetchItem(int(rating_key))
         if getattr(item, "type", "") != "track":
             raise ValueError("Plexamp target currently supports music tracks only")
-        queue = [self._item_dict(item)]
+        selected = self._item_dict(item)
+        queue = [selected]
         active_queue_id = ""
         active_item_id = ""
         active_queue_version = ""
@@ -998,20 +999,34 @@ class PlexHTTP:
                     tracks.append(track_dict)
                     if str(track.ratingKey) == rating_key:
                         active_item_id = track_dict["playQueueItemID"]
-                if tracks:
-                    queue = tracks
+                selected_index = next((index for index, track in enumerate(tracks)
+                                       if str(track.get("id")) == rating_key), -1)
+                if selected_index >= 0:
+                    # The phone selected this item from somewhere inside the
+                    # play queue. Keep it first so Decky never restarts at the
+                    # queue's first track and doesn't replay earlier songs.
+                    queue = tracks[selected_index:]
+                    active_item_id = str(queue[0].get("playQueueItemID") or active_item_id)
+                elif tracks:
+                    # If Plex returned a trimmed queue window without the
+                    # selected item, still start the requested item rather
+                    # than silently falling back to the first item in window.
+                    queue = [selected]
+                    logger.warning("Selected Companion track %s was not present in play queue %s; using a single-track queue",
+                                   rating_key, queue_id.group(1))
             except Exception as exc:
                 logger.warning("Could not load incoming Plex play queue %s: %s", queue_id.group(1), exc)
         streams = self.get_stream_urls(rating_key)
-        selected = self._item_dict(item)
         selected["playQueueItemID"] = active_item_id
         server_url = urllib.parse.urlparse(self.sdk._baseurl)
+        stream_url = urllib.parse.urlparse(streams.get("stream_url", ""))
+        stream_token = urllib.parse.parse_qs(stream_url.query).get("X-Plex-Token", [self.token])[0]
         server_context = {
             "machine_identifier": str(getattr(self.sdk, "machineIdentifier", "") or ""),
-            "address": server_url.hostname or "",
-            "port": server_url.port or 32400,
-            "protocol": server_url.scheme or "http",
-            "token": self.token,
+            "address": stream_url.hostname or server_url.hostname or "",
+            "port": stream_url.port or server_url.port or 32400,
+            "protocol": stream_url.scheme or server_url.scheme or "http",
+            "token": stream_token,
         }
         return {"success": True, "track": selected, "queue": queue,
                 "play_queue_id": active_queue_id,
@@ -1428,14 +1443,20 @@ class Plugin:
                     plex.session.close()
             except Exception as exc:
                 logger.warning("Could not prepare signed-out Companion playback: %s", exc)
-                return {"success": False, "error": str(exc)}
+                error_text = str(exc)
+                if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized")):
+                    error_text = "Incoming stream was rejected as unauthorized. Log in to the same Plex account or enable ‘Accept playback from any Plex account’ in Players settings."
+                return {"success": False, "error": error_text}
         if not plex:
-            return {"success": False, "error": "Connect DeckyPlex to Plex or enable playback from any Plex account in Players settings."}
+            return {"success": False, "error": "Incoming stream rejected: this device is not connected to Plex. Log in to DeckyPlex or enable ‘Accept playback from any Plex account’ in Players settings."}
         try:
             return plex.prepare_companion_playback(key, container_key, server_machine_id, controller_token)
         except Exception as exc:
             logger.error("Could not prepare incoming Plex playback: %s", exc, exc_info=True)
-            return {"success": False, "error": str(exc)}
+            error_text = str(exc)
+            if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized")):
+                error_text = "Incoming stream was rejected as unauthorized. Log in to the same Plex account or enable ‘Accept playback from any Plex account’ in Players settings."
+            return {"success": False, "error": error_text}
 
     async def play_companion_track(self, rating_key: str,
                                    server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1469,7 +1490,7 @@ class Plugin:
                 expected_id = str(getattr(plex.sdk, "machineIdentifier", "") or "")
                 requested_id = str(context.get("machine_identifier") or "")
                 if requested_id and expected_id and requested_id != expected_id:
-                    return {"success": False, "error": "Plexamp requested playback from a different Plex server than DeckyPlex selected"}
+                    return {"success": False, "error": "Incoming stream rejected: Plexamp is using a different Plex server. Log in to the same account and server in DeckyPlex, or enable ‘Accept playback from any Plex account’ in Players settings."}
             streams = plex.get_stream_urls(str(rating_key))
             return {"success": True, **streams}
         except Exception as exc:
