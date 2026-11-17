@@ -43,6 +43,7 @@ interface PlayerContextType extends PlayerState {
   skipNext: () => void;
   skipPrevious: () => void;
   playQueueIndex: (index: number) => void;
+  removeFromQueue: (index: number) => void;
   addToQueue: (track: TrackInfo, playNext?: boolean) => void;
   setVolume: (volume: number) => void;
   seek: (time: number) => void;
@@ -616,6 +617,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (index >= 0 && index < engine.queue.length) void playQueuedIndex(index);
   }, [state.remoteMode]);
 
+  const removeFromQueue = useCallback((index: number) => {
+    if (state.remoteMode || index < 0 || index >= engine.queue.length) return;
+    if (index === engine.queueIndex) {
+      // Keep the current audio playing, but remove it and already-played entries
+      // from the upcoming queue. The next item becomes index zero.
+      engine.queue = engine.queue.slice(index + 1);
+      engine.queueIndex = -1;
+    } else {
+      engine.queue.splice(index, 1);
+      if (index < engine.queueIndex) engine.queueIndex--;
+    }
+    window.dispatchEvent(new Event('deckyplex-queue-change'));
+  }, [state.remoteMode]);
+
   const addToQueue = useCallback((track: TrackInfo, playNext = false) => {
     if (!track.id) return;
     if (!engine.queue.length) {
@@ -669,6 +684,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         skipNext,
         skipPrevious,
         playQueueIndex,
+        removeFromQueue,
         addToQueue,
         setVolume,
         seek,

@@ -55,6 +55,7 @@ export function QuickPlayer() {
     queue,
     queueIndex,
     playQueueIndex,
+    removeFromQueue,
   } = usePlayer();
 
   useEffect(() => {
@@ -311,7 +312,7 @@ export function QuickPlayer() {
       <PanelSectionRow>
         <div style={{ width: '100%', padding: '0 0.5rem', boxSizing: 'border-box' }}>
           <Button onClick={() => setShowQueue(value => !value)} disabled={!queue.length} style={{ width: '100%' }}>
-            <span>{showQueue ? 'Hide queue' : `Queue${queue.length ? ` · ${queueIndex + 1}/${queue.length}` : ''}`}</span>
+            <span>{showQueue ? 'Hide queue' : `Queue${queue.length ? ` · ${queueIndex < 0 ? `${queue.length} queued` : `${queueIndex + 1}/${queue.length}`}` : ''}`}</span>
           </Button>
         </div>
       </PanelSectionRow>
@@ -321,8 +322,10 @@ export function QuickPlayer() {
             <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem' }}>
               {queue.slice(Math.max(0, queueIndex)).map((queuedTrack, index) => {
                 const actualIndex = Math.max(0, queueIndex) + index;
-                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)} style={{ width: '100%', minHeight: '0', height: '30px', padding: '0.05rem 0.35rem', fontSize: '0.82rem', justifyContent: 'flex-start', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
+                return <Button key={`${queuedTrack.id}-${actualIndex}`} onClick={() => playQueueIndex(actualIndex)}
+                  onOptionsActionDescription="Remove from queue" onOptionsButton={() => removeFromQueue(actualIndex)}
+                  style={{ width: '100%', minWidth: 0, minHeight: '0', height: '30px', padding: '0.05rem 0.35rem', fontSize: '0.82rem', justifyContent: 'flex-start', overflow: 'hidden', boxSizing: 'border-box', opacity: actualIndex === queueIndex ? 1 : 0.75 }}>
+                  <span style={{ display: 'block', flex: '1 1 0%', width: 0, maxWidth: '100%', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'left' }}>{actualIndex === queueIndex ? '▶ ' : ''}{queuedTrack.title} <span style={{ opacity: 0.65 }}>— {queuedTrack.artist}</span></span>
                 </Button>;
               })}
             </Focusable>
@@ -331,9 +334,10 @@ export function QuickPlayer() {
       )}
 
       {/* Volume Control */}
+      <PanelSectionRow><div style={{ height: '0.2rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
-          <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'hidden' }}><SliderField
+          <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField
             label="Volume"
             min={0}
             max={100}

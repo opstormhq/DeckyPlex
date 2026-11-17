@@ -85,6 +85,8 @@ export function SettingsPage() {
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const autoSaveTimer = useRef<number | null>(null);
+  const autoSaveRevision = useRef(0);
 
   const saveSettings = useCallback((s: Settings) => {
     return call("set_settings", s).then((result: any) => {
@@ -285,20 +287,27 @@ export function SettingsPage() {
     const updated = { ...settingsRef.current, [key]: value };
     settingsRef.current = updated;
     setSettings(updated);
+    const isBrowserSetting = key === 'grid_columns';
+    const setSaveStatus = isBrowserSetting ? setBrowserStatus : setAdvancedStatus;
+    setSaveStatus('Saving…');
+    if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
+    const revision = ++autoSaveRevision.current;
+    autoSaveTimer.current = window.setTimeout(async () => {
+      if (revision === autoSaveRevision.current) autoSaveTimer.current = null;
+      const result: any = await saveSettings(settingsRef.current);
+      if (revision === autoSaveRevision.current) setSaveStatus(result?.error || 'Saved automatically.');
+    }, 350);
     return updated;
+  }, [saveSettings]);
+
+  useEffect(() => () => {
+    if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
   }, []);
 
-  const saveAdvancedSettings = useCallback(async () => {
-    const result: any = await saveSettings(settingsRef.current);
-    setAdvancedStatus(result?.error || "Advanced settings saved.");
-  }, [saveSettings]);
-
-  const saveBrowserSettings = useCallback(async () => {
-    const result: any = await saveSettings(settingsRef.current);
-    setBrowserStatus(result?.error || "Browser settings saved.");
-  }, [saveSettings]);
-
   const testServerConnection = useCallback(async () => {
+    if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
+    autoSaveTimer.current = null;
+    autoSaveRevision.current++;
     setAdvancedStatus("Testing Plex server connection...");
     try {
       const saved: any = await saveSettings(settingsRef.current);
@@ -470,9 +479,6 @@ export function SettingsPage() {
           onChange={(value: number) => updateSetting('grid_columns', Math.round(value))}
         />
       </PanelSectionRow>
-      <PanelSectionRow>
-        <Button onClick={saveBrowserSettings}>Save browser settings</Button>
-      </PanelSectionRow>
       {browserStatus && <PanelSectionRow><DialogBodyText>{browserStatus}</DialogBodyText></PanelSectionRow>}
     </PanelSection>
   );
@@ -511,8 +517,7 @@ export function SettingsPage() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <Button onClick={saveAdvancedSettings}>Save advanced settings</Button>
-        <Button style={{ marginLeft: '0.5rem' }} onClick={testServerConnection}>Test connection</Button>
+        <Button onClick={testServerConnection}>Test connection</Button>
       </PanelSectionRow>
       {advancedStatus && <PanelSectionRow><DialogBodyText>{advancedStatus}</DialogBodyText></PanelSectionRow>}
     </PanelSection>

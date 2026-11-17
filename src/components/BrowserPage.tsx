@@ -130,6 +130,9 @@ export function BrowserPage() {
   }, []);
 
   useEffect(() => {
+    tabLoadRequestId.current++;
+    loadingMoreRef.current = false;
+    setLoadingMore(false);
     setHistory([]);
     setSubView(null);
   }, [activeTab]);
@@ -321,7 +324,15 @@ export function BrowserPage() {
       restoringHistoryRef.current = false;
       return;
     }
-    if (activeTab === 'search') { setItems([]); return; }
+    if (activeTab === 'search') {
+      tabLoadRequestId.current++;
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+      setLoading(false);
+      setTabHasMore(false);
+      setItems([]);
+      return;
+    }
     loadTabData(activeTab);
   }, [activeTab, connected, selectedSection, subView]);
 
@@ -354,9 +365,9 @@ export function BrowserPage() {
       } else {
         const typeFilter = tab === 'artists' ? 'artist' : tab === 'albums' ? 'album' : 'track';
         result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100, 0));
-        setTabHasMore(Boolean(result.has_more));
       }
       if (requestId !== tabLoadRequestId.current) return;
+      if (tab === 'artists' || tab === 'albums' || tab === 'tracks') setTabHasMore(Boolean(result.has_more));
       if (result.error) {
         if (!cached) {
           setError(result.error);
@@ -437,13 +448,15 @@ export function BrowserPage() {
     } catch (e) {
       if (requestId === tabLoadRequestId.current && requestedTab === activeTab) setError('Could not load more music library items.');
     } finally {
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
+      if (requestId === tabLoadRequestId.current) {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      }
     }
   }, [tabHasMore, selectedSection, subView, activeTab, items.length, cachedItems]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
-    tabLoadRequestId.current++;
+    const requestId = ++tabLoadRequestId.current;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -451,21 +464,23 @@ export function BrowserPage() {
     setSubView({ type: 'albums', title: artistName || 'Albums', id: artistId });
     try {
       const result: any = await cachedItems(`children:${artistId}`, 300000, () => call("get_metadata_children", artistId));
+      if (requestId !== tabLoadRequestId.current) return;
       if (Array.isArray(result.items)) {
         setItems(result.items);
       } else {
         setItems([]);
       }
     } catch (e) {
+      if (requestId !== tabLoadRequestId.current) return;
       setError("Failed to load albums.");
       setItems([]);
     } finally {
-      setLoading(false);
+      if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
-    tabLoadRequestId.current++;
+    const requestId = ++tabLoadRequestId.current;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -473,18 +488,20 @@ export function BrowserPage() {
     setSubView({ type: 'tracks', title: playlistName || 'Playlist', id: playlistId, queueLabel: 'Play Playlist' });
     try {
       const result: any = await cachedItems(`playlist:${playlistId}`, 60000, () => call('get_playlist_tracks', playlistId, 200));
+      if (requestId !== tabLoadRequestId.current) return;
       if (Array.isArray(result.items)) setItems(result.items);
       else { setItems([]); if (result.error) setError(result.error); }
     } catch {
+      if (requestId !== tabLoadRequestId.current) return;
       setError('Failed to load playlist tracks.');
       setItems([]);
     } finally {
-      setLoading(false);
+      if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
-    tabLoadRequestId.current++;
+    const requestId = ++tabLoadRequestId.current;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -492,22 +509,24 @@ export function BrowserPage() {
     setSubView({ type: 'tracks', title: albumName || 'Tracks', id: albumId, queueLabel: 'Play Album' });
     try {
       const result: any = await cachedItems(`children:${albumId}`, 300000, () => call("get_metadata_children", albumId));
+      if (requestId !== tabLoadRequestId.current) return;
       if (Array.isArray(result.items)) {
         setItems(result.items);
       } else {
         setItems([]);
       }
     } catch (e) {
+      if (requestId !== tabLoadRequestId.current) return;
       setError("Failed to load tracks.");
       setItems([]);
     } finally {
-      setLoading(false);
+      if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [items, subView, searchQuery, cachedItems]);
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
-    tabLoadRequestId.current++;
+    const requestId = ++tabLoadRequestId.current;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     pendingSearchFocus.current = true;
     setLoading(true);
@@ -516,6 +535,7 @@ export function BrowserPage() {
     try {
       const cacheKey = `search:${selectedSection}:${searchQuery.trim().toLowerCase()}`;
       const result: any = await cachedItems(cacheKey, 30000, () => call("search_library", searchQuery, selectedSection, 30));
+      if (requestId !== tabLoadRequestId.current) return;
       if (Array.isArray(result.items)) {
         setItems(result.items);
         if (result.items.length === 0) pendingSearchFocus.current = false;
@@ -523,9 +543,10 @@ export function BrowserPage() {
         pendingSearchFocus.current = false;
       }
     } catch (e) {
+      if (requestId !== tabLoadRequestId.current) return;
       setError("Search failed.");
     } finally {
-      setLoading(false);
+      if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [searchQuery, selectedSection, items, subView, cachedItems]);
 
