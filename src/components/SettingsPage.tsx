@@ -339,7 +339,7 @@ export function SettingsPage() {
             <DialogBodyText style={{ marginTop: '1rem', opacity: 0.7 }}>
               {connectingToPlex ? 'Plex approved. Connecting to your server...' : 'Waiting for approval...'}
             </DialogBodyText>
-            {connectingToPlex && <Spinner style={{ margin: '0.5rem auto' }} />}
+            {connectingToPlex && <Spinner style={{ width: '18px', height: '18px', margin: '0.35rem auto' }} />}
           </div>
         </PanelSectionRow>
       )}
@@ -357,8 +357,8 @@ export function SettingsPage() {
           {loggingOut ? 'Logging out...' : 'Logout'}
         </ButtonItem>
       </PanelSectionRow>
-      {loggingOut && <PanelSectionRow><Spinner /></PanelSectionRow>}
-      {connectingToPlex && <PanelSectionRow><Spinner /></PanelSectionRow>}
+      {loggingOut && <PanelSectionRow><Spinner style={{ width: '18px', height: '18px' }} /></PanelSectionRow>}
+      {connectingToPlex && <PanelSectionRow><Spinner style={{ width: '18px', height: '18px' }} /></PanelSectionRow>}
       {status && (
         <PanelSectionRow>
           <DialogBodyText>{status}</DialogBodyText>

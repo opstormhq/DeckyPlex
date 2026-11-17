@@ -147,8 +147,9 @@ export function QuickPlayer() {
   return (
     <PanelSection title="">
       <PanelSectionRow>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '0.2rem 0.25rem 0.45rem' }}><DialogLabel>Quick Player</DialogLabel>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', padding: '0.2rem 0.5rem 0.45rem', boxSizing: 'border-box' }}><DialogLabel>Quick Player</DialogLabel>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginLeft: 'auto' }}>
+          <span style={{ fontSize: '0.75rem', opacity: 0.8, fontWeight: 400 }}>{statusText}</span>
           <div
             style={{
               width: '8px',
@@ -157,7 +158,6 @@ export function QuickPlayer() {
               backgroundColor: statusColor,
             }}
           />
-          <span style={{ fontSize: '0.75rem', opacity: 0.8, fontWeight: 400 }}>{statusText}</span>
           </div>
         </div>
       </PanelSectionRow>
@@ -187,7 +187,7 @@ export function QuickPlayer() {
 
       {/* Track Info */}
       <PanelSectionRow>
-        <div style={{ display: 'flex', gap: '1.1rem', alignItems: 'center', width: '100%', padding: '0.5rem 0.65rem 0.35rem', marginTop: '0.2rem' }}>
+        <div style={{ display: 'flex', gap: '1.1rem', alignItems: 'center', width: '100%', padding: '0.5rem 0.5rem 0.35rem', marginTop: '0.2rem', boxSizing: 'border-box' }}>
           {/* Album Art */}
           <div
             style={{
@@ -214,42 +214,21 @@ export function QuickPlayer() {
           </div>
 
           {/* Track Details */}
-          <div style={{ display: 'flex', flex: 1, flexDirection: 'column', justifyContent: 'center', gap: '0.3rem', minWidth: 0, paddingRight: '0.25rem' }}>
+          <div style={{ display: 'flex', flex: 1, flexDirection: 'column', justifyContent: 'center', gap: '0.2rem', minWidth: 0, paddingRight: '0.25rem' }}>
             <DialogLabel
               style={{
                 overflow: 'hidden',
-                display: '-webkit-box',
-                WebkitBoxOrient: 'vertical',
-                WebkitLineClamp: 2,
-                whiteSpace: 'normal',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
                 lineHeight: 1.15,
+                margin: 0,
               }}
             >
               {track?.title || 'No track selected'}
             </DialogLabel>
-            {track?.artist && (
-              <DialogBodyText
-                style={{
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {track.artist}
-              </DialogBodyText>
-            )}
-            {track?.album && (
-              <DialogBodyText
-                style={{
-                  opacity: 0.5,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                }}
-              >
-                {track.album}
-              </DialogBodyText>
-            )}
+            {(track?.artist || track?.album) && <DialogBodyText style={{ opacity: 0.7, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
+              {[track?.artist, track?.album].filter(Boolean).join(' · ')}
+            </DialogBodyText>}
           </div>
         </div>
       </PanelSectionRow>
@@ -350,10 +329,9 @@ export function QuickPlayer() {
       )}
 
       {/* Volume Control */}
-      <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
-          <div style={{ width: '100%', padding: '0.3rem 0.55rem 0.1rem', marginTop: '0.2rem', boxSizing: 'border-box' }}><SliderField
+          <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'hidden' }}><SliderField
             label="Volume"
             min={0}
             max={100}

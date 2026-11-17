@@ -958,12 +958,73 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
   addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => void;
   onClose: () => void;
 }) {
+  const [view, setView] = useState<'actions' | 'playlists' | 'new'>('actions');
+  const [playlists, setPlaylists] = useState<LibraryItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [playlistName, setPlaylistName] = useState('');
+  const [message, setMessage] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const showPlaylists = async () => {
+    setView('playlists');
+    setLoading(true);
+    setMessage('');
+    try {
+      const result: any = await call('get_audio_playlists', 100);
+      if (result?.error) throw new Error(result.error);
+      setPlaylists(result?.items || []);
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not load playlists.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const addToPlaylist = async (playlistId: string) => {
+    setBusy(true);
+    try {
+      const result: any = await call('add_track_to_playlist', playlistId, track.id);
+      if (!result?.success) throw new Error(result?.error || 'Could not add track to playlist.');
+      onClose();
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not add track to playlist.');
+      setBusy(false);
+    }
+  };
+
+  const createPlaylist = async () => {
+    setBusy(true);
+    try {
+      const result: any = await call('create_audio_playlist', playlistName, track.id);
+      if (!result?.success) throw new Error(result?.error || 'Could not create playlist.');
+      onClose();
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not create playlist.');
+      setBusy(false);
+    }
+  };
+
   return (
     <ModalRoot closeModal={onClose} onCancel={onClose}>
-      <PanelSection title={track.title}>
+      <PanelSection title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
         <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
-        <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
-        <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
+        {view === 'actions' && <>
+          <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
+          <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
+          <PanelSectionRow><Button onClick={() => void showPlaylists()}>Add to Playlist</Button></PanelSectionRow>
+        </>}
+        {view === 'playlists' && <>
+          {loading && <PanelSectionRow><Spinner /></PanelSectionRow>}
+          {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)}>{playlist.title}</Button></PanelSectionRow>)}
+          {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
+          <PanelSectionRow><Button disabled={busy} onClick={() => setView('actions')}>Back</Button></PanelSectionRow>
+        </>}
+        {view === 'new' && <>
+          <PanelSectionRow><TextField label="Playlist name" value={playlistName} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPlaylistName(e.target.value)} /></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()}>{busy ? 'Creating…' : 'Create Playlist'}</Button></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy} onClick={() => setView('playlists')}>Back</Button></PanelSectionRow>
+        </>}
+        {!!message && <PanelSectionRow><DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
     </ModalRoot>
   );

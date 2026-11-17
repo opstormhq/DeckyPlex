@@ -233,6 +233,8 @@ window.setInterval(() => {
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const volumeSaveTimer = useRef<number | null>(null);
+  const volumePreferenceLoaded = useRef(false);
   const [state, setState] = useState<PlayerState>({
     playbackState: "stopped",
     track: sharedTrack,
@@ -350,6 +352,15 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       try {
         const settings: any = await call('get_settings');
         if (!mounted) return;
+        if (!volumePreferenceLoaded.current) {
+          const savedVolume = Number(settings.volume);
+          if (Number.isFinite(savedVolume)) {
+            const normalizedVolume = Math.max(0, Math.min(100, savedVolume));
+            sharedAudio.volume = normalizedVolume / 100;
+            setState(s => ({ ...s, volume: normalizedVolume }));
+          }
+          volumePreferenceLoaded.current = true;
+        }
         setState(s => ({
           ...s,
           remoteMode: settings.playback_target === 'remote' && !!settings.selected_player_id,
@@ -587,14 +598,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setVolume = useCallback((volume: number) => {
-    setState(s => ({ ...s, volume }));
+    const normalizedVolume = Math.max(0, Math.min(100, Math.round(volume)));
+    setState(s => ({ ...s, volume: normalizedVolume }));
     if (state.remoteMode) {
-      void controlRemotePlayer('volume', volume);
+      void controlRemotePlayer('volume', normalizedVolume);
       return;
     }
     if (audioRef.current) {
-      audioRef.current.volume = volume / 100;
+      audioRef.current.volume = normalizedVolume / 100;
     }
+    if (volumeSaveTimer.current !== null) window.clearTimeout(volumeSaveTimer.current);
+    volumeSaveTimer.current = window.setTimeout(() => {
+      void call('set_settings', { volume: normalizedVolume }).catch(() => {});
+      volumeSaveTimer.current = null;
+    }, 250);
   }, [state.remoteMode, controlRemotePlayer]);
 
   const seek = useCallback((time: number) => {

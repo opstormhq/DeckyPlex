@@ -40,6 +40,7 @@ DEFAULT_SETTINGS = {
     "selected_player_id": "",
     "selected_player_name": "",
     "grid_columns": 0,
+    "volume": 50,
     "manual_server_url": "",
     "playback_target": "local",
     "connection_timeout": 8,
@@ -424,6 +425,25 @@ class PlexHTTP:
             })
         return result
 
+    def add_track_to_playlist(self, playlist_id: str, rating_key: str) -> Dict[str, Any]:
+        """Add one library track to an existing audio playlist via PlexAPI."""
+        playlist = next((item for item in self.sdk.playlists(playlistType="audio")
+                         if str(item.ratingKey) == str(playlist_id)), None)
+        if playlist is None:
+            raise ValueError("Audio playlist not found")
+        track = self.sdk.fetchItem(int(rating_key))
+        playlist.addItems([track])
+        return {"success": True, "playlist": playlist.title}
+
+    def create_audio_playlist(self, title: str, rating_key: str) -> Dict[str, Any]:
+        """Create an audio playlist containing the requested track via PlexAPI."""
+        title = str(title or "").strip()
+        if not title:
+            raise ValueError("Enter a playlist name")
+        track = self.sdk.fetchItem(int(rating_key))
+        playlist = self.sdk.createPlaylist(title, items=[track])
+        return {"success": True, "playlist": playlist.title, "id": str(playlist.ratingKey)}
+
     def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         playlists = self.sdk.playlists(playlistType="audio")
         playlist = next((item for item in playlists if str(item.ratingKey) == str(playlist_id)), None)
@@ -584,7 +604,7 @@ class Plugin:
         """Save user-editable preferences without accepting auth tokens from the UI."""
         try:
             merged = _load_settings()
-            for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns",
+            for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns", "volume",
                         "playback_target", "connection_timeout", "verify_tls"):
                 if key in settings:
                     merged[key] = settings[key]
@@ -595,6 +615,10 @@ class Plugin:
             except (TypeError, ValueError):
                 merged["connection_timeout"] = 8
             merged["verify_tls"] = bool(merged.get("verify_tls", False))
+            try:
+                merged["volume"] = max(0, min(100, int(merged.get("volume", 50))))
+            except (TypeError, ValueError):
+                merged["volume"] = 50
             try:
                 columns = int(merged.get("grid_columns", 0))
                 merged["grid_columns"] = columns if columns == 0 else max(3, min(8, columns))
@@ -1014,6 +1038,26 @@ class Plugin:
         except Exception as e:
             logger.error(f"Failed to get audio playlists: {e}")
             return {"items": [], "error": str(e)}
+
+    async def add_track_to_playlist(self, playlist_id: str, rating_key: str) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        try:
+            return plex.add_track_to_playlist(playlist_id, rating_key)
+        except Exception as e:
+            logger.error(f"Failed to add track {rating_key} to playlist {playlist_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def create_audio_playlist(self, title: str, rating_key: str) -> Dict[str, Any]:
+        plex = self._get_plex()
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server"}
+        try:
+            return plex.create_audio_playlist(title, rating_key)
+        except Exception as e:
+            logger.error(f"Failed to create audio playlist {title!r}: {e}")
+            return {"success": False, "error": str(e)}
 
     async def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> Dict[str, Any]:
         plex = self._get_plex()
