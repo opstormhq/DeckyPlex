@@ -54,7 +54,7 @@ interface BrowserHistoryEntry {
 interface TabFocusPosition { itemId: string; scrollTop: number; }
 
 export function BrowserPage() {
-  const { playTrack, playRemoteQueue, remoteMode, remotePlayerName, addToQueue } = usePlayer();
+  const { playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue } = usePlayer();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -86,6 +86,7 @@ export function BrowserPage() {
   const tabFocusPositions = useRef(new Map<BrowserTab, TabFocusPosition>());
   const pendingSearchFocus = useRef(false);
   const loadingMoreRef = useRef(false);
+  const tabLoadRequestId = useRef(0);
   const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
 
@@ -97,8 +98,11 @@ export function BrowserPage() {
       const itemRect = item.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
       const edgePadding = 28;
-      if (itemRect.bottom > viewportRect.bottom - edgePadding) {
-        viewport.scrollTop += itemRect.bottom - (viewportRect.bottom - edgePadding);
+      // Steam overlays a footer on the bottom of routed plugin views. Keep a
+      // generous safe area there so focused cards and the last track stay readable.
+      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - 150);
+      if (itemRect.bottom > visibleBottom - edgePadding) {
+        viewport.scrollTop += itemRect.bottom - (visibleBottom - edgePadding);
       } else if (itemRect.top < viewportRect.top + edgePadding) {
         viewport.scrollTop -= (viewportRect.top + edgePadding) - itemRect.top;
       }
@@ -133,6 +137,7 @@ export function BrowserPage() {
   const goBack = useCallback(() => {
     const previous = history[history.length - 1];
     if (previous) {
+      tabLoadRequestId.current++;
       restoringHistoryRef.current = previous.subView === null;
       setHistory(history.slice(0, -1));
       setItems(previous.items);
@@ -321,6 +326,9 @@ export function BrowserPage() {
   }, [activeTab, connected, selectedSection, subView]);
 
   const loadTabData = useCallback(async (tab: BrowserTab) => {
+    const requestId = ++tabLoadRequestId.current;
+    loadingMoreRef.current = false;
+    setLoadingMore(false);
     setError(null);
     const cacheKey = `tab:${selectedSection}:${tab}`;
     const cached = itemCache.current.get(cacheKey);
@@ -348,12 +356,14 @@ export function BrowserPage() {
         result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100, 0));
         setTabHasMore(Boolean(result.has_more));
       }
+      if (requestId !== tabLoadRequestId.current) return;
       if (result.error) {
         if (!cached) {
           setError(result.error);
           setItems([]);
         }
       } else if (Array.isArray(result.items)) {
+        if (requestId !== tabLoadRequestId.current) return;
         const firstPageIds = new Set(result.items.map((item: LibraryItem) => item.id));
         const mergedItems = cached
           ? [...result.items, ...cached.items.filter(item => !firstPageIds.has(item.id))]
@@ -368,25 +378,42 @@ export function BrowserPage() {
         setItems([]);
       }
     } catch (e) {
+      if (requestId !== tabLoadRequestId.current) return;
       if (!cached) {
         setError("Failed to load items.");
         setItems([]);
       }
     } finally {
-      setLoading(false);
+      if (requestId === tabLoadRequestId.current) setLoading(false);
     }
   }, [selectedSection, cachedItems]);
 
+  useEffect(() => {
+    const refreshPlaylists = () => {
+      itemCache.current.delete(`tab:${selectedSection}:playlists`);
+      if (activeTab === 'playlists' && !subView) void loadTabData('playlists');
+    };
+    window.addEventListener('deckyplex-playlists-change', refreshPlaylists);
+    return () => window.removeEventListener('deckyplex-playlists-change', refreshPlaylists);
+  }, [selectedSection, activeTab, subView, loadTabData]);
+
   const loadMoreTabPage = useCallback(async () => {
     if (!tabHasMore || loadingMoreRef.current || !selectedSection || subView || !['artists', 'albums', 'tracks'].includes(activeTab)) return;
+    const requestId = tabLoadRequestId.current;
+    const requestedTab = activeTab;
     loadingMoreRef.current = true;
     setLoadingMore(true);
+    const focusedId = document.activeElement instanceof HTMLElement
+      ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
+      : focusedItemId.current;
+    const savedScrollTop = contentRef.current?.scrollTop || 0;
     try {
       const typeFilter = activeTab === 'artists' ? 'artist' : activeTab === 'albums' ? 'album' : 'track';
       const offset = items.length;
       const cacheKey = `tab:${selectedSection}:${activeTab}:${offset}`;
       const result: any = await cachedItems(cacheKey, 300000,
         () => call('get_section_contents', selectedSection, typeFilter, 100, offset));
+      if (requestId !== tabLoadRequestId.current || requestedTab !== activeTab) return;
       if (result.error) {
         setError(result.error);
         return;
@@ -394,6 +421,11 @@ export function BrowserPage() {
       const nextPage: LibraryItem[] = Array.isArray(result.items) ? result.items : [];
       const existing = new Set(items.map(item => item.id));
       const mergedItems = [...items, ...nextPage.filter(item => !existing.has(item.id))];
+      if (focusedId) {
+        pendingFocusId.current = focusedId;
+        pendingScrollTop.current = savedScrollTop;
+        setRestoreFocusTick(value => value + 1);
+      }
       setItems(mergedItems);
       setTabHasMore(Boolean(result.has_more));
       const baseKey = `tab:${selectedSection}:${activeTab}`;
@@ -403,7 +435,7 @@ export function BrowserPage() {
         expiresAt: Date.now() + 300000,
       });
     } catch (e) {
-      setError('Could not load more music library items.');
+      if (requestId === tabLoadRequestId.current && requestedTab === activeTab) setError('Could not load more music library items.');
     } finally {
       loadingMoreRef.current = false;
       setLoadingMore(false);
@@ -411,6 +443,7 @@ export function BrowserPage() {
   }, [tabHasMore, selectedSection, subView, activeTab, items.length, cachedItems]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
+    tabLoadRequestId.current++;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -432,6 +465,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
+    tabLoadRequestId.current++;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -450,6 +484,7 @@ export function BrowserPage() {
   }, [items, subView, searchQuery, cachedItems]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
+    tabLoadRequestId.current++;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
     setLoading(true);
@@ -472,6 +507,7 @@ export function BrowserPage() {
 
   const handleSearch = useCallback(async () => {
     if (!searchQuery.trim()) return;
+    tabLoadRequestId.current++;
     setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
     pendingSearchFocus.current = true;
     setLoading(true);
@@ -512,6 +548,7 @@ export function BrowserPage() {
         if (!result.success) setError(result.error || 'Could not start playback on the selected remote player.');
         return;
       }
+      const playbackToken = beginPlaybackRequest();
       // Get stream URL first, then play — playTrack must be called with a valid URL
       // so audio.play() can start immediately from this call stack.
       const result: any = await call("play_track", trackInfo.id, selectedSection);
@@ -524,7 +561,7 @@ export function BrowserPage() {
       }
       if (result.stream_url) {
         console.log(`[DeckyPlex] Got stream URL, starting playback`);
-        playTrack(result.stream_url, trackInfo, trackQueue, result.fallback_stream_url || '');
+        playTrack(result.stream_url, trackInfo, trackQueue, result.fallback_stream_url || '', undefined, playbackToken);
       } else {
         setError("Plex returned no audio stream URL.");
       }
@@ -532,7 +569,7 @@ export function BrowserPage() {
       console.error(`[DeckyPlex] play_track exception:`, e);
       setError("Failed to play track.");
     }
-  }, [selectedSection, playTrack, playRemoteQueue, remoteMode, artworkRevision]);
+  }, [selectedSection, playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, artworkRevision]);
 
   const handlePlayTrack = useCallback((item: LibraryItem) => {
     void startTrackQueue(items, item.id);
@@ -924,7 +961,7 @@ export function BrowserPage() {
           ))}
         </Focusable>
       </div>
-      <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.55rem 0.35rem 0 0', boxSizing: 'border-box' }}>
+        <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.75rem 0.5rem 150px 0', boxSizing: 'border-box', scrollPaddingBottom: '150px' }}>
         {renderContent()}
       </div>
     </div>
@@ -964,6 +1001,14 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
   const [playlistName, setPlaylistName] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      menuRef.current?.querySelector<HTMLElement>('button, input, [tabindex="0"]')?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [view, loading, playlists.length]);
 
   const showPlaylists = async () => {
     setView('playlists');
@@ -985,7 +1030,9 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
     try {
       const result: any = await call('add_track_to_playlist', playlistId, track.id);
       if (!result?.success) throw new Error(result?.error || 'Could not add track to playlist.');
-      onClose();
+      setMessage(`Added to ${result.playlist || 'playlist'}.`);
+      window.dispatchEvent(new Event('deckyplex-playlists-change'));
+      setBusy(false);
     } catch (error: any) {
       setMessage(error?.message || 'Could not add track to playlist.');
       setBusy(false);
@@ -997,7 +1044,11 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
     try {
       const result: any = await call('create_audio_playlist', playlistName, track.id);
       if (!result?.success) throw new Error(result?.error || 'Could not create playlist.');
-      onClose();
+      setMessage(`Created ${result.playlist || playlistName} and added this song.`);
+      setPlaylists(items => [{ id: result.id, key: '', title: result.playlist || playlistName, type: 'playlist' }, ...items]);
+      setView('playlists');
+      window.dispatchEvent(new Event('deckyplex-playlists-change'));
+      setBusy(false);
     } catch (error: any) {
       setMessage(error?.message || 'Could not create playlist.');
       setBusy(false);
@@ -1006,7 +1057,8 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
 
   return (
     <ModalRoot closeModal={onClose} onCancel={onClose}>
-      <PanelSection title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
+      <div ref={menuRef}>
+      <PanelSection key={view} title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
         <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
         {view === 'actions' && <>
           <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
@@ -1015,6 +1067,7 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
         </>}
         {view === 'playlists' && <>
           {loading && <PanelSectionRow><Spinner /></PanelSectionRow>}
+          {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)}>{playlist.title}</Button></PanelSectionRow>)}
           {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
           <PanelSectionRow><Button disabled={busy} onClick={() => setView('actions')}>Back</Button></PanelSectionRow>
@@ -1026,6 +1079,7 @@ function TrackOptionsDialog({ track, addToQueue, onClose }: {
         </>}
         {!!message && <PanelSectionRow><DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
+      </div>
     </ModalRoot>
   );
 }

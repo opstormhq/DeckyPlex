@@ -44,6 +44,7 @@ export function QuickPlayer() {
     remotePlayerName,
     playTrack,
     playRemoteQueue,
+    beginPlaybackRequest,
     play,
     pause,
     stop,
@@ -84,6 +85,7 @@ export function QuickPlayer() {
 
   const shuffleAllSongs = async () => {
     if (shufflingAll) return;
+    const playbackToken = remoteMode ? undefined : beginPlaybackRequest();
     setShufflingAll(true);
     setShuffleError('');
     try {
@@ -130,7 +132,7 @@ export function QuickPlayer() {
         if (!stream?.success || !stream.stream_url) {
           throw new Error(stream?.error || 'Plex did not return a playable audio stream.');
         }
-        playTrack(stream.stream_url, queue[0], queue, stream.fallback_stream_url || '', loadMore);
+        playTrack(stream.stream_url, queue[0], queue, stream.fallback_stream_url || '', loadMore, playbackToken);
       }
     } catch (e: any) {
       setShuffleError(e?.message || 'Could not shuffle the music library.');
