@@ -44,6 +44,7 @@ export function QuickPlayer() {
     progress,
     duration,
     remoteMode,
+    companionMode,
     remotePlayerName,
     playTrack,
     playRemoteQueue,
@@ -162,8 +163,8 @@ export function QuickPlayer() {
 
   // Status: green=playing, orange=paused, blue=ready (default), red=error
   const hasTrack = !!track;
-  const statusColor = error ? '#ff4444' : !plexConnected ? '#777777' : isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : '#4488ff';
-  const statusText = error ? 'Error' : !plexConnected ? 'Not connected to Plex' : isPlaying ? 'Playing' : isPaused ? 'Paused' : 'Ready';
+  const statusColor = error ? '#ff4444' : companionMode ? (isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : '#4488ff') : !plexConnected ? '#777777' : isPlaying ? '#44ff44' : isPaused ? '#ffaa00' : '#4488ff';
+  const statusText = error ? 'Error' : companionMode ? 'Remote play' : !plexConnected ? 'Not connected to Plex' : isPlaying ? 'Playing' : isPaused ? 'Paused' : 'Ready';
 
   return (
     <PanelSection title="">
@@ -361,7 +362,7 @@ export function QuickPlayer() {
       <PanelSectionRow><div style={{ height: '0.4rem', width: '100%' }} /></PanelSectionRow>
       <PanelSectionRow>
         {SliderField ? (
-          <div style={{ width: '100%', padding: '0.2rem 0.5rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField
+          <div style={{ width: '100%', padding: '0.2rem 0.85rem 0.1rem', boxSizing: 'border-box', overflow: 'visible' }}><SliderField
             label="Volume"
             min={0}
             max={100}

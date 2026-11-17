@@ -29,6 +29,7 @@ interface PlayerState {
   progress: number; // current position in seconds
   duration: number; // total duration in seconds
   remoteMode: boolean;
+  companionMode: boolean;
   remotePlayerId: string;
   remotePlayerName: string;
   queue: TrackInfo[];
@@ -453,6 +454,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     progress: 0,
     duration: 0,
     remoteMode: false,
+    companionMode: !!engine.companionActive,
     remotePlayerId: '',
     remotePlayerName: '',
     queue: engine.queue.slice(),
@@ -464,6 +466,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     engine.pendingRequestId = 0;
     engine.explicitlyStopped = true;
     if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
+    engine.companionActive = false;
+    engine.companionServerContext = null;
     sharedAudio.pause();
     sharedAudio.removeAttribute('src');
     sharedAudio.load();
@@ -531,10 +535,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       progress: 0,
       duration: engine.track ? (engine.track.duration || 0) / 1000 : 0,
       remoteMode: engine.companionActive ? false : s.remoteMode,
+      companionMode: !!engine.companionActive,
       playbackState: engine.companionActive ? (sharedAudio.paused ? 'paused' : 'playing') : s.remoteMode ? s.playbackState : engine.track ? 'paused' : 'stopped',
       error: null,
     }));
     const onQueueChange = () => setState(s => ({ ...s, queue: engine.queue.slice(), queueIndex: engine.queueIndex }));
+    const onCompanionStop = () => setState(s => ({ ...s, companionMode: false }));
     const onVolumeChange = (event: Event) => {
       const volume = Number((event as CustomEvent<number>).detail);
       if (Number.isFinite(volume)) setState(s => ({ ...s, volume }));
@@ -557,6 +563,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     window.addEventListener('deckyplex-queue-change', onQueueChange);
     window.addEventListener('deckyplex-volume-change', onVolumeChange);
     window.addEventListener('deckyplex-playback-error', onPlaybackError);
+    window.addEventListener('deckyplex-companion-stop', onCompanionStop);
     setState(s => ({
       ...s,
       track: engine.track,
@@ -579,6 +586,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       window.removeEventListener('deckyplex-queue-change', onQueueChange);
       window.removeEventListener('deckyplex-volume-change', onVolumeChange);
       window.removeEventListener('deckyplex-playback-error', onPlaybackError);
+      window.removeEventListener('deckyplex-companion-stop', onCompanionStop);
     };
   }, []);
 
@@ -797,6 +805,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       return;
     }
     stopSharedPlayback(true);
+    engine.companionActive = false;
+    engine.companionServerContext = null;
+    window.dispatchEvent(new Event('deckyplex-companion-stop'));
     setState(s => ({ ...s, playbackState: "stopped", track: null, progress: 0, duration: 0 }));
   }, [state.remoteMode, controlRemotePlayer]);
 
