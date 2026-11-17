@@ -990,6 +990,16 @@ class PlexHTTP:
                 play_queue = PlayQueue.get(self.sdk, int(queue_id.group(1)), window=200, includeBefore=True, includeAfter=True)
                 active_queue_id = str(play_queue.playQueueID or "")
                 active_queue_version = str(play_queue.playQueueVersion or "")
+                # Plex can return only the current window from a PlayQueue.
+                # Center the request on its selected item so a song selected
+                # later in a long list is present in the queue window.
+                selected_queue_item_id = str(getattr(play_queue, "playQueueSelectedItemID", "") or "")
+                if selected_queue_item_id:
+                    play_queue = PlayQueue.get(
+                        self.sdk, int(queue_id.group(1)), window=200,
+                        includeBefore=True, includeAfter=True,
+                        center=int(selected_queue_item_id),
+                    )
                 tracks = []
                 for track in play_queue.items:
                     if getattr(track, "type", "") != "track":
@@ -1000,7 +1010,9 @@ class PlexHTTP:
                     if str(track.ratingKey) == rating_key:
                         active_item_id = track_dict["playQueueItemID"]
                 selected_index = next((index for index, track in enumerate(tracks)
-                                       if str(track.get("id")) == rating_key), -1)
+                                       if str(track.get("id")) == rating_key
+                                       or re.search(r"/library/metadata/(\d+)", str(track.get("key") or ""))
+                                       and re.search(r"/library/metadata/(\d+)", str(track.get("key") or "")).group(1) == rating_key), -1)
                 if selected_index >= 0:
                     # The phone selected this item from somewhere inside the
                     # play queue. Keep it first so Decky never restarts at the
@@ -1444,8 +1456,8 @@ class Plugin:
             except Exception as exc:
                 logger.warning("Could not prepare signed-out Companion playback: %s", exc)
                 error_text = str(exc)
-                if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized")):
-                    error_text = "Incoming stream was rejected as unauthorized. Log in to the same Plex account or enable ‘Accept playback from any Plex account’ in Players settings."
+                if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized", "404", "not_found")):
+                    error_text = "Plexamp's account was not authorized to play this item. Confirm it has access to the Plex server, or enable ‘Accept playback from any Plex account’ in Players settings."
                 return {"success": False, "error": error_text}
         if not plex:
             return {"success": False, "error": "Incoming stream rejected: this device is not connected to Plex. Log in to DeckyPlex or enable ‘Accept playback from any Plex account’ in Players settings."}
@@ -1454,8 +1466,8 @@ class Plugin:
         except Exception as exc:
             logger.error("Could not prepare incoming Plex playback: %s", exc, exc_info=True)
             error_text = str(exc)
-            if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized")):
-                error_text = "Incoming stream was rejected as unauthorized. Log in to the same Plex account or enable ‘Accept playback from any Plex account’ in Players settings."
+            if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized", "404", "not_found")):
+                error_text = "The Plexamp account does not appear to have access to this item on the selected Plex server. Sign in to Plexamp with an account that can access this server, or enable ‘Accept playback from any Plex account’ in Players settings."
             return {"success": False, "error": error_text}
 
     async def play_companion_track(self, rating_key: str,

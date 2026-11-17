@@ -626,7 +626,7 @@ export function BrowserPage() {
     }
   }, [searchQuery, selectedSection, items, subView, cachedItems]);
 
-  const startTrackQueue = useCallback(async (sourceItems: LibraryItem[], startId?: string) => {
+  const startTrackQueue = useCallback(async (sourceItems: LibraryItem[], startId?: string, requestedTrack?: LibraryItem) => {
     try {
       const fullTrackQueue = sourceItems.filter(entry => entry.type === 'track').map(entry => ({
         id: entry.id,
@@ -638,10 +638,24 @@ export function BrowserPage() {
         thumb: versionArtwork(entry.thumb || '', artworkRevision),
       }));
       if (!fullTrackQueue.length) throw new Error('No tracks found to play.');
-      const selectedIndex = startId == null ? 0 : fullTrackQueue.findIndex(track => String(track.id) === String(startId));
+      let selectedIndex = startId == null ? 0 : fullTrackQueue.findIndex(track => String(track.id) === String(startId));
+      if (startId != null && selectedIndex < 0 && requestedTrack) {
+        // A click can race a paginated list refresh. Preserve the clicked song
+        // as the queue head instead of silently starting at item one.
+        const clickedTrack = {
+          id: String(requestedTrack.id), sectionId: selectedSection,
+          title: requestedTrack.title || 'Unknown',
+          artist: requestedTrack.grandparentTitle || requestedTrack.artist || '',
+          album: requestedTrack.parentTitle || '', duration: requestedTrack.duration || 0,
+          thumb: versionArtwork(requestedTrack.thumb || '', artworkRevision),
+        };
+        fullTrackQueue.unshift(clickedTrack);
+        selectedIndex = 0;
+      }
       const startIndex = selectedIndex >= 0 ? selectedIndex : 0;
       const trackInfo = fullTrackQueue[startIndex];
       const trackQueue = fullTrackQueue.slice(startIndex);
+      console.info(`[DeckyPlex] starting queue at ${trackInfo.title} (${startIndex + 1}/${fullTrackQueue.length})`);
       itemCache.current.delete(`tab:${selectedSection}:recent`);
       if (remoteMode) {
         const result = await playRemoteQueue(fullTrackQueue, trackInfo.id);
@@ -672,7 +686,7 @@ export function BrowserPage() {
   }, [selectedSection, playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, artworkRevision]);
 
   const handlePlayTrack = useCallback((item: LibraryItem) => {
-    void startTrackQueue(items, item.id);
+    void startTrackQueue(items, item.id, item);
   }, [items, startTrackQueue]);
 
   const handlePlayCollection = useCallback(async () => {
@@ -729,7 +743,19 @@ export function BrowserPage() {
   const gridView = subView?.type === 'albums' || (!subView && ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab));
 
   const handleGridDirection = (event: import('@decky/ui').GamepadEvent) => {
-    if (subView || event.detail.button !== GamepadButton.DIR_UP) return;
+    if (event.detail.button !== GamepadButton.DIR_UP) return;
+    if (subView?.type === 'tracks') {
+      const focusedId = document.activeElement instanceof HTMLElement
+        ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
+        : undefined;
+      if (items.length && focusedId === items[0].id) {
+        event.preventDefault();
+        event.stopPropagation();
+        playCollectionRef.current?.focus();
+      }
+      return;
+    }
+    if (subView) return;
     const focusedId = document.activeElement instanceof HTMLElement
       ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
       : undefined;

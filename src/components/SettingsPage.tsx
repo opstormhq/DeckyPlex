@@ -501,6 +501,9 @@ export function SettingsPage() {
           <DialogBodyText>{checkingCompanionStatus ? 'Checking DeckyPlex receiver…' : !settings.companion_receiver_enabled ? 'Plexamp receiver is off.' : companionStatus.active ? `DeckyPlex receiver ready on port ${companionStatus.port}.` : 'Error'}</DialogBodyText>
         </div>
       </PanelSectionRow>
+      <PanelSectionRow>
+        <div style={{ width: '100%', borderTop: '1px solid rgba(255,255,255,0.16)' }} />
+      </PanelSectionRow>
       {!settings.has_plex_token ? (
         <PanelSectionRow><DialogBodyText style={{ opacity: 0.65 }}>Log in to Plex to select remote players.</DialogBodyText></PanelSectionRow>
       ) : <>
