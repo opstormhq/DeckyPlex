@@ -431,6 +431,11 @@ function handleCompanionCommand(entry: any) {
       } else logToBackend(`Plex Companion skipTo key not found in queue: ${key}`);
       break;
     }
+    case 'refreshQueue':
+      if (engine.companionActive && engine.companionPlayQueueId) {
+        void refreshCompanionQueue();
+      }
+      break;
     case 'previous': {
       const previous = sharedAudio.currentTime > 3 ? engine.queueIndex : engine.queueIndex - 1;
       if (previous >= 0 && previous < engine.queue.length) void playQueuedIndex(previous);
@@ -449,6 +454,37 @@ function handleCompanionCommand(entry: any) {
       }
       break;
     }
+  }
+}
+
+async function refreshCompanionQueue() {
+  const currentTrack = engine.track;
+  const queueId = engine.companionPlayQueueId;
+  if (!engine.companionActive || !currentTrack || !queueId) return;
+  try {
+    const result: any = await call('refresh_companion_queue', queueId,
+      currentTrack.playQueueItemID || '', engine.companionServerContext || {});
+    if (!result?.success) throw new Error(result?.error || 'Plex did not return the updated queue');
+    if (!engine.companionActive || engine.companionPlayQueueId !== queueId) return;
+    const refreshed = (result.queue || []).map((item: any): TrackInfo => ({
+      id: String(item.id || ''), sectionId: String(item.sectionId || ''),
+      title: item.title || 'Unknown', artist: item.grandparentTitle || item.artist || '',
+      album: item.parentTitle || '', duration: Number(item.duration) || 0,
+      thumb: item.thumb || '', key: item.key || '',
+      playQueueItemID: item.playQueueItemID || '',
+    })).filter((item: TrackInfo) => item.id);
+    if (!refreshed.length) throw new Error('Plex returned an empty playback queue');
+    engine.queue = refreshed;
+    engine.queueIndex = 0;
+    engine.track = refreshed[0];
+    engine.companionPlayQueueVersion = result.play_queue_version || engine.companionPlayQueueVersion;
+    rememberCompanionSession();
+    window.dispatchEvent(new Event('deckyplex-queue-change'));
+    window.dispatchEvent(new Event('deckyplex-track-change'));
+    reportTimeline(sharedAudio.paused ? 'paused' : 'playing', true);
+    logToBackend(`Plex Companion queue refreshed (${refreshed.length} track(s), version ${engine.companionPlayQueueVersion})`);
+  } catch (error: any) {
+    logToBackend(`Plex Companion queue refresh failed: ${error?.message || error}`);
   }
 }
 
@@ -914,6 +950,33 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const addToQueue = useCallback((track: TrackInfo, playNext = false) => {
     if (!track.id) return;
+    if (engine.companionActive) {
+      if (!engine.companionPlayQueueId || !engine.track?.playQueueItemID) {
+        logToBackend('queue: cannot edit Plexamp queue because its active queue item is unknown');
+        setState(s => ({ ...s, error: 'Plexamp did not provide a queue that DeckyPlex can update.' }));
+        return;
+      }
+      const queueId = engine.companionPlayQueueId;
+      void call('add_companion_queue_track', track.id, queueId,
+        engine.track.playQueueItemID, engine.companionServerContext || {}, playNext).then((result: any) => {
+        if (!result?.success || !result.track?.playQueueItemID) {
+          throw new Error(result?.error || 'Plex did not confirm the queued track');
+        }
+        if (!engine.companionActive || engine.companionPlayQueueId !== queueId) return;
+        const queuedTrack: TrackInfo = { ...track, playQueueItemID: result.track.playQueueItemID };
+        if (playNext) engine.queue.splice(Math.max(0, engine.queueIndex + 1), 0, queuedTrack);
+        else engine.queue.push(queuedTrack);
+        engine.companionPlayQueueVersion = result.play_queue_version || engine.companionPlayQueueVersion;
+        rememberCompanionSession();
+        window.dispatchEvent(new Event('deckyplex-queue-change'));
+        reportTimeline(sharedAudio.paused ? 'paused' : 'playing', true);
+        logToBackend(`queue: added ${track.title} to Plexamp queue (${playNext ? 'next' : 'upcoming'})`);
+      }).catch((error: any) => {
+        logToBackend(`queue: could not update Plexamp queue: ${error?.message || error}`);
+        setState(s => ({ ...s, error: error?.message || 'Could not update the Plexamp queue.' }));
+      });
+      return;
+    }
     if (!engine.queue.length) {
       engine.queue = [track];
       engine.queueIndex = -1;
