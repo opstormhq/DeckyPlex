@@ -209,8 +209,9 @@ class PlexCompanionReceiver:
                     if controller.get("host") == client_host:
                         controller["commandId"] = command_id
         if name == "playMedia":
-            logger.info("Companion received playMedia from %s: key=%s containerKey=%s",
-                        client_host, params.get("key", [""])[0], params.get("containerKey", [""])[0])
+            logger.info("Companion received playMedia from %s: key=%s containerKey=%s mediaIndex=%s offset=%s",
+                        client_host, params.get("key", [""])[0], params.get("containerKey", [""])[0],
+                        params.get("mediaIndex", [""])[0], params.get("offset", [""])[0])
             # Plexamp waits for the receiver's timeline after playMedia. A music
             # queue can take several seconds to resolve through PlexAPI, so report
             # buffering now and replace it with playing/paused once playback starts.
@@ -974,7 +975,8 @@ class PlexHTTP:
         match = re.search(r"/library/metadata/(\d+)", parsed.path or key or "")
         if not match:
             raise ValueError("Plexamp sent an unsupported media key")
-        rating_key = match.group(1)
+        requested_rating_key = match.group(1)
+        rating_key = requested_rating_key
         item = self.sdk.fetchItem(int(rating_key))
         if getattr(item, "type", "") != "track":
             raise ValueError("Plexamp target currently supports music tracks only")
@@ -987,18 +989,47 @@ class PlexHTTP:
         if queue_id:
             try:
                 from plexapi.playqueue import PlayQueue
-                play_queue = PlayQueue.get(self.sdk, int(queue_id.group(1)), window=200, includeBefore=True, includeAfter=True)
+                queue_params = urllib.parse.parse_qs(urllib.parse.urlparse(container_key).query)
+                own_queue = queue_params.get("own", ["0"])[0] == "1"
+                play_queue = PlayQueue.get(self.sdk, int(queue_id.group(1)), own=own_queue,
+                                           window=200, includeBefore=True, includeAfter=True)
                 active_queue_id = str(play_queue.playQueueID or "")
                 active_queue_version = str(play_queue.playQueueVersion or "")
-                # Plex can return only the current window from a PlayQueue.
-                # Center the request on its selected item so a song selected
-                # later in a long list is present in the queue window.
-                selected_queue_item_id = str(getattr(play_queue, "playQueueSelectedItemID", "") or "")
-                if selected_queue_item_id:
+                queue_selected_key = str(getattr(play_queue, "playQueueSelectedMetadataItemID", "") or "")
+                queue_selected_offset = getattr(play_queue, "playQueueSelectedItemOffset", "")
+                def queue_track_matches(track: Any) -> bool:
+                    if str(getattr(track, "ratingKey", "") or "") == rating_key:
+                        return True
+                    track_key = str(getattr(track, "key", "") or "")
+                    track_match = re.search(r"/library/metadata/(\d+)", track_key)
+                    return bool(track_match and track_match.group(1) == rating_key)
+
+                # Some Plexamp playMedia requests retain the old queue's key
+                # while the newly created queue identifies the tapped song in
+                # playQueueSelectedMetadataItemID. Prefer that queue selection
+                # only when the selected item is actually present in the queue.
+                selected_queue_item = next(
+                    (track for track in play_queue.items
+                     if str(getattr(track, "ratingKey", "") or "") == queue_selected_key), None
+                ) if queue_selected_key else None
+                if selected_queue_item and queue_selected_key != requested_rating_key:
+                    logger.info("Companion key %s differs from queue-selected track %s; using the queue selection",
+                                requested_rating_key, queue_selected_key)
+                    rating_key = queue_selected_key
+                    item = selected_queue_item
+                    selected = self._item_dict(item)
+                requested_queue_item = selected_queue_item or next(
+                    (track for track in play_queue.items if queue_track_matches(track)), None
+                )
+                center_item_id = str(
+                    getattr(requested_queue_item, "playQueueItemID", "")
+                    or getattr(play_queue, "playQueueSelectedItemID", "") or ""
+                )
+                if center_item_id:
                     play_queue = PlayQueue.get(
-                        self.sdk, int(queue_id.group(1)), window=200,
+                        self.sdk, int(queue_id.group(1)), own=own_queue, window=200,
                         includeBefore=True, includeAfter=True,
-                        center=int(selected_queue_item_id),
+                        center=int(center_item_id),
                     )
                 tracks = []
                 for track in play_queue.items:
@@ -1013,6 +1044,12 @@ class PlexHTTP:
                                        if str(track.get("id")) == rating_key
                                        or re.search(r"/library/metadata/(\d+)", str(track.get("key") or ""))
                                        and re.search(r"/library/metadata/(\d+)", str(track.get("key") or "")).group(1) == rating_key), -1)
+                logger.info("Incoming play queue %s requested ratingKey=%s; using ratingKey=%s matched position=%s/%s (window size=%s)",
+                            queue_id.group(1), requested_rating_key, rating_key,
+                            selected_index + 1 if selected_index >= 0 else "not found",
+                            getattr(play_queue, "playQueueTotalCount", len(tracks)), len(tracks))
+                logger.info("Incoming play queue %s server selection: ratingKey=%s offset=%s own=%s",
+                            queue_id.group(1), queue_selected_key, queue_selected_offset, int(own_queue))
                 if selected_index >= 0:
                     # The phone selected this item from somewhere inside the
                     # play queue. Keep it first so Decky never restarts at the
