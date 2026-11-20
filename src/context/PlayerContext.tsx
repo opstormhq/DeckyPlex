@@ -56,6 +56,7 @@ interface PlayerContextType extends PlayerState {
 }
 
 const PlayerContext = createContext<PlayerContextType | null>(null);
+const DEFAULT_LOCAL_VOLUME = 50;
 
 // Decky may mount the sidebar and routed browser from separate bundle contexts.
 // Keep the whole playback engine on window so both controls always share one queue,
@@ -68,12 +69,31 @@ const engine: any = (window as any).__deckyPlexPlaybackEngine || ((window as any
 });
 const sharedAudio: HTMLAudioElement = engine.audio;
 if (!engine.audioInitialized) {
-  sharedAudio.volume = 0.5;
+  sharedAudio.volume = DEFAULT_LOCAL_VOLUME / 100;
   engine.audioInitialized = true;
 }
 if (!engine.gamePipAudioHook) {
   sharedAudio.addEventListener('play', () => window.dispatchEvent(new Event('deckyplex-local-music-playing')));
   engine.gamePipAudioHook = true;
+}
+
+export function startLocalVolumeSession() {
+  const session = Symbol();
+  const cancelPendingSave = () => {
+    window.clearTimeout(engine.volumeSaveTimer);
+    engine.volumeSaveTimer = undefined;
+  };
+  // The Steam window can retain the engine when Decky reloads the plugin.
+  cancelPendingSave();
+  engine.volumeSession = session;
+  engine.volumePreferenceLoaded = false;
+  sharedAudio.volume = DEFAULT_LOCAL_VOLUME / 100;
+
+  return () => {
+    if (engine.volumeSession !== session) return;
+    engine.volumeSession = undefined;
+    cancelPendingSave();
+  };
 }
 
 function isPlaybackPending() {
@@ -699,18 +719,18 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let mounted = true;
+    const volumeSession = engine.volumeSession;
     const refreshTarget = async () => {
       try {
         const settings: any = await call('get_settings');
-        if (!mounted) return;
+        if (!mounted || engine.volumeSession !== volumeSession) return;
         if (!engine.volumePreferenceLoaded) {
-          const savedVolume = Number(settings.volume);
-          if (Number.isFinite(savedVolume)) {
-            const normalizedVolume = Math.max(0, Math.min(100, savedVolume));
-            sharedAudio.volume = normalizedVolume / 100;
-            window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: normalizedVolume }));
-          }
+          const savedVolume = settings.volume;
+          const normalizedVolume = Number.isFinite(savedVolume)
+            ? Math.max(0, Math.min(100, savedVolume)) : DEFAULT_LOCAL_VOLUME;
           engine.volumePreferenceLoaded = true;
+          sharedAudio.volume = normalizedVolume / 100;
+          window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: normalizedVolume }));
         }
         const remoteMode = !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id;
         setState(s => ({

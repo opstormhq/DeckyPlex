@@ -182,7 +182,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     return ++tabLoadRequestId.current;
   }, []);
 
-  const selectTab = (tab: BrowserTab) => {
+  const selectTab = useCallback((tab: BrowserTab) => {
     if (tab === activeTabRef.current) return;
     activeTabRef.current = tab;
     // Invalidate outstanding root and pagination requests synchronously when
@@ -197,7 +197,25 @@ const LibraryBrowser = memo(function LibraryBrowser({
     setError(null);
     setLoading(tab !== 'search');
     setActiveTab(tab);
-  };
+  }, [invalidateTabLoad]);
+
+  const openSearch = useCallback(() => {
+    if (activeTabRef.current !== 'search') {
+      selectTab('search');
+    } else if (subView && subView.type !== 'search') {
+      invalidateTabLoad();
+      setSubView(null);
+      setHistory([]);
+      setError(null);
+    }
+    restoringHistoryRef.current = false;
+    pendingFocusId.current = undefined;
+    pendingScrollTop.current = undefined;
+    pendingSearchFocus.current = false;
+    enterContentPending.current = false;
+    pendingSearchInputFocus.current = true;
+    setRestoreFocusTick(value => value + 1);
+  }, [selectTab, subView, invalidateTabLoad]);
 
   const keepFocusedElementVisible = (element: HTMLElement, sidebar = false) => {
     window.cancelAnimationFrame(focusScrollFrame.current);
@@ -246,7 +264,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   }, []);
 
   useEffect(() => {
-    if (viewerExpanded || pendingSortFocus.current || pendingFocusId.current || pendingScrollTop.current != null) return;
+    if (viewerExpanded || pendingSortFocus.current || pendingSearchInputFocus.current
+        || pendingFocusId.current || pendingScrollTop.current != null) return;
     const frame = window.requestAnimationFrame(() => {
       const sidebar = sidebarRef.current;
       const focused = document.activeElement;
@@ -395,7 +414,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     && (library.type === 'movie' || library.type === 'show'));
 
   useEffect(() => {
-    if (loading || loadingLibraries || viewerExpanded || (!pendingSortFocus.current && focusZone.current === 'sidebar' && !enterContentPending.current
+    if (viewerExpanded || ((loading || loadingLibraries) && !pendingSearchInputFocus.current)
+      || (!pendingSortFocus.current && focusZone.current === 'sidebar' && !enterContentPending.current
       && !pendingSearchFocus.current && !pendingSearchInputFocus.current && pendingScrollTop.current == null)) return;
     let secondFrame = 0;
     const frame = window.requestAnimationFrame(() => {
@@ -414,9 +434,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
           return;
         }
         if (pendingSearchInputFocus.current) {
+          const input = searchFormRef.current?.querySelector('input');
+          if (!input) return;
           pendingSearchInputFocus.current = false;
           pendingScrollTop.current = undefined;
-          searchFormRef.current?.querySelector('input')?.focus();
+          if (contentRef.current) contentRef.current.scrollTop = 0;
+          input.focus({ preventScroll: true });
           return;
         }
         if (pendingFocusId.current) {
@@ -455,7 +478,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       window.cancelAnimationFrame(frame);
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
-  }, [loading, loadingLibraries, items, subView, activeTab, restoreFocusTick, viewerExpanded, shelf, sorting, error]);
+  }, [loading, loadingLibraries, items, subView, activeTab, restoreFocusTick, viewerExpanded, shelf, sorting, error,
+    checkingConnection, connected]);
 
   const saveGridColumns = useCallback(async (columns: number) => {
     const result: any = await call('set_settings', { grid_columns: columns });
@@ -1644,7 +1668,16 @@ const LibraryBrowser = memo(function LibraryBrowser({
         firstItemRef.current?.focus({ preventScroll: true });
       }
     };
-    const onButtonDown = (event: Event) => moveAtBoundary(event, (event as GamepadEvent).detail?.button);
+    const onButtonDown = (event: Event) => {
+      const detail = (event as GamepadEvent).detail;
+      if (detail?.button === GamepadButton.START && connected && !gridDialogRef.current && !actionDialogRef.current) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (!detail.is_repeat) openSearch();
+        return;
+      }
+      moveAtBoundary(event, detail?.button);
+    };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'ArrowUp') moveAtBoundary(event, GamepadButton.DIR_UP);
       if (event.key === 'ArrowDown') moveAtBoundary(event, GamepadButton.DIR_DOWN);
@@ -1655,7 +1688,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       browser.removeEventListener('vgp_onbuttondown', onButtonDown, true);
       browser.removeEventListener('keydown', onKeyDown, true);
     };
-  }, [viewerExpanded, gridView, gridColumns, homeView]);
+  }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch]);
 
   const enterContent = () => {
     focusZone.current = 'content';

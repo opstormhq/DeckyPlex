@@ -2,7 +2,7 @@ import { definePlugin, routerHook } from '@decky/api';
 import { staticClasses, PanelSection, PanelSectionRow, ButtonItem, Navigation } from '@decky/ui';
 import { FaMusic } from 'react-icons/fa';
 import { QuickPlayer } from './components/QuickPlayer';
-import { PlayerProvider } from './context/PlayerContext';
+import { PlayerProvider, startLocalVolumeSession } from './context/PlayerContext';
 import { BrowserPage } from './components/BrowserPage';
 import { SettingsPage } from './components/SettingsPage';
 import { GamePipHost, gamePipFullscreenEvent, prepareGamePipFullscreen, stopGamePip } from './components/GamePip';
@@ -21,6 +21,7 @@ function BrowserPageWithProvider() {
 }
 
 export default definePlugin(() => {
+  const endLocalVolumeSession = startLocalVolumeSession();
   routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: true });
   routerHook.addRoute(SETTINGS_ROUTE, SettingsPage, { exact: true });
   routerHook.addGlobalComponent(GAME_PIP_HOST, GamePipHost);
@@ -65,6 +66,7 @@ export default definePlugin(() => {
       </PlayerProvider>
     ),
     onDismount() {
+      endLocalVolumeSession();
       stopGamePip();
       routerHook.removeGlobalComponent(GAME_PIP_HOST);
       routerHook.removeRoute(BROWSER_ROUTE);
