@@ -607,13 +607,13 @@ async function startCompanionTrack(params: Record<string, string[]>) {
 
 function handleCompanionCommand(entry: any) {
   const params: Record<string, string[]> = entry.params || {};
-  const commandId = params.commandID?.[0];
-  if (commandId && commandId !== '0') {
-    const source = entry.client_id || entry.client_host || 'unknown';
-    const commandKey = `${source}:${commandId}`;
+  // The event and poll can deliver the same request. Plexamp can reuse its
+  // command ID for a different request after it relaunches.
+  const deliveryId = entry.delivery_id;
+  if (deliveryId) {
     const handled: string[] = engine.handledCompanionCommands || (engine.handledCompanionCommands = []);
-    if (handled.includes(commandKey)) return;
-    handled.push(commandKey);
+    if (handled.includes(deliveryId)) return;
+    handled.push(deliveryId);
     if (handled.length > 64) handled.splice(0, handled.length - 64);
   }
   if ((engine.remoteStartRequestId && engine.remoteStartRequestId === engine.requestId) ||

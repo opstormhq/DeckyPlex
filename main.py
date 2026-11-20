@@ -292,7 +292,7 @@ class PlexCompanionReceiver:
         except (TypeError, ValueError):
             command_id = 0
         command = {"command": name, "params": params, "client_host": client_host,
-                   "client_id": client_id, "received_at": time.time()}
+                   "client_id": client_id, "delivery_id": uuid.uuid4().hex}
         with self.lock:
             if self.shutting_down:
                 return
