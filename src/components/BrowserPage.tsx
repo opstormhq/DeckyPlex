@@ -922,6 +922,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
     }
   }, [tabHasMore, selectedSection, combinedArtists, subView, activeTab, items.length, sorting, cachedItems]);
 
+  // Keep the current page boundary available without restarting the held-input
+  // listener when pagination appends rows.
+  const nextPageAtBoundary = useRef<{ itemCount: number; load: typeof loadMoreTabPage } | null>(null);
+  nextPageAtBoundary.current = !subView && tabHasMore && !paginationError
+    ? { itemCount: items.length, load: loadMoreTabPage } : null;
+
   useEffect(() => {
     const viewport = contentRef.current;
     const target = moreItemsRef.current;
@@ -1749,7 +1755,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   useEffect(() => {
     const browser = browserRef.current;
     if (viewerExpanded || !browser) return;
-    const moveAtBoundary = (event: Event, button: GamepadButton) => {
+    const moveAtBoundary = (event: Event, button: GamepadButton, repeat: boolean) => {
       if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
       // Steam sends controller input to the focused navigation node, which can
       // differ from the DOM's active element when Gaming Mode uses virtual focus.
@@ -1776,7 +1782,21 @@ const LibraryBrowser = memo(function LibraryBrowser({
               || (homeView && !card.hasAttribute('data-browser-home-start'))) return;
           lastCollectionItem.current = collection ? card : null;
           target = collection ?? searchFormRef.current?.querySelector('input');
-        } else return;
+        } else {
+          const page = nextPageAtBoundary.current;
+          const hold = alphabetHold.current;
+          if (!page || hold?.button !== button || (!repeat && hold.timer != null)) return;
+          const card = active.closest<HTMLElement>('[data-browser-item-index]');
+          if (!card) return;
+          const columns = gridView ? gridColumns : 1;
+          const row = Math.floor(Number(card.dataset.browserItemIndex) / columns);
+          // A partial next row is still navigable from every column.
+          if ((row + 1) * columns < page.itemCount) return;
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          void page.load();
+          return;
+        }
       } else return;
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -1811,20 +1831,21 @@ const LibraryBrowser = memo(function LibraryBrowser({
     };
     const onButtonDown = (event: Event) => {
       const detail = (event as GamepadEvent).detail;
-      recordVerticalPress(detail?.button, detail?.is_repeat === true, event.target);
+      const repeat = detail?.is_repeat === true;
+      recordVerticalPress(detail?.button, repeat, event.target);
       if (detail?.button === GamepadButton.START && connected && !gridDialogRef.current && !actionDialogRef.current) {
         event.preventDefault();
         event.stopImmediatePropagation();
         if (!detail.is_repeat) openSearch();
         return;
       }
-      moveAtBoundary(event, detail?.button);
+      moveAtBoundary(event, detail?.button, repeat);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
       const button = event.key === 'ArrowUp' ? GamepadButton.DIR_UP : GamepadButton.DIR_DOWN;
       recordVerticalPress(button, event.repeat, event.target);
-      moveAtBoundary(event, button);
+      moveAtBoundary(event, button, event.repeat);
     };
     const endRepeat = () => {
       fastVerticalNavigation.current = false;
