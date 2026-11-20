@@ -15,7 +15,7 @@ import {
   showModal,
   type GamepadEvent,
 } from '@decky/ui';
-import { call } from '@decky/api';
+import { call, toaster } from '@decky/api';
 import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay, FaFilm, FaImage, FaHome } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 import { InlineSpinner } from './InlineSpinner';
@@ -92,15 +92,16 @@ type VideoHomeRow = typeof VIDEO_HOME_ROWS[number]['id'];
 type VideoHomeData = Partial<Record<VideoHomeRow, { items: LibraryItem[]; error?: string }>>;
 
 export function BrowserPage() {
-  const { playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue, playbackState, pause, localVolume } = usePlayer();
-  return <LibraryBrowser {...{ playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName,
-    addToQueue, playbackState, pause, localVolume }} />;
+  const { playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteMode, remoteTargetSelected, remotePlayerName,
+    addToQueue, playbackState, pause, localVolume } = usePlayer();
+  return <LibraryBrowser {...{ playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteTargetSelected, remotePlayerName,
+    addToQueue, pause, localVolume }} localMusicPlaying={!remoteMode && playbackState === 'playing'} />;
 }
 
-type BrowserPlayback = Pick<ReturnType<typeof usePlayer>, 'playTrack' | 'playRemoteQueue' | 'beginPlaybackRequest'
-  | 'remoteMode' | 'remotePlayerName' | 'addToQueue' | 'playbackState' | 'pause' | 'localVolume'>;
+type BrowserPlayback = Pick<ReturnType<typeof usePlayer>, 'playTrack' | 'readMusicPlaybackTarget' | 'playRemoteQueue' | 'beginPlaybackRequest'
+  | 'remoteTargetSelected' | 'remotePlayerName' | 'addToQueue' | 'pause' | 'localVolume'> & { localMusicPlaying: boolean };
 const LibraryBrowser = memo(function LibraryBrowser({
-  playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue, playbackState, pause, localVolume,
+  playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteTargetSelected, remotePlayerName, addToQueue, localMusicPlaying, pause, localVolume,
 }: BrowserPlayback) {
   const pipEpisodeQueue = useGamePipEpisodeQueue();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
@@ -510,11 +511,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (actionDialogRef.current === dialog) actionDialogRef.current = null;
     };
     const close = () => { clearDialog(); dialog.Close(); };
-    const dialog = showModal(<TrackOptionsDialog track={track} playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
+    const dialog = showModal(<TrackOptionsDialog track={{ ...track, sourceServerId: serverId }}
+      playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
       window, { strTitle: track.title, bNeverPopOut: true, fnOnClose: clearDialog });
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [addToQueue]);
+  }, [addToQueue, serverId]);
 
   const openPlaylistOptions = useCallback((playlist: LibraryItem) => {
     const clearDialog = () => {
@@ -1051,8 +1053,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       const trackQueue = fullTrackQueue.slice(startIndex);
       console.info(`[DeckyPlex] starting queue at ${trackInfo.title} (${startIndex + 1}/${fullTrackQueue.length})`);
       itemCache.current.delete(`tab:${selectedSection}:recent`);
-      if (remoteMode) {
-        const result = await playRemoteQueue(fullTrackQueue, trackInfo.id);
+      const playerId = await readMusicPlaybackTarget();
+      if (playerId) {
+        const result = await playRemoteQueue(playerId, fullTrackQueue, trackInfo.id);
         if (!result.success) setError(result.error || 'Could not start playback on the selected remote player.');
         return;
       }
@@ -1078,7 +1081,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     } finally {
       setPlaybackRequests(count => count - 1);
     }
-  }, [selectedSection, playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode]);
+  }, [selectedSection, playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest]);
 
   const handlePlayTrack = useCallback((item: LibraryItem) => {
     void startTrackQueue(items, item.id, item);
@@ -1470,7 +1473,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           {sortable && <Button ref={sortButtonRef} onClick={() => openSortMenu()} onCancelButton={handleCancel}>
             {VIDEO_SORTS.find(sort => sort.id === sorting)?.title || 'Sort by'}
           </Button>}
-          {remoteMode && (
+          {remoteTargetSelected && (
             <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem', margin: 0 }}>
               Playback target: {remotePlayerName || 'remote Plex player'}
             </DialogBodyText>
@@ -1481,7 +1484,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
               onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
               <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{videoCollection
                 ? subView.mediaType === 'show' ? 'Play series' : 'Play season'
-                : remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
+                : remoteTargetSelected ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
             </Button>
           )}
         </div>
@@ -1782,7 +1785,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         removeEpisode={id => {
           if (id !== viewerItem.id) setViewerQueue(queue => queue?.filter(episode => episode.id !== id) ?? null);
         }}
-        onPlaying={() => { if (!remoteMode && playbackState === 'playing') pause(); }} />}
+        onPlaying={() => { if (localMusicPlaying) pause(); }} />}
     </>
   );
 });
@@ -1945,9 +1948,9 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
 }
 
 function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
-  track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string };
+  track: Parameters<ReturnType<typeof usePlayer>['addToQueue']>[0];
   playlistId?: string;
-  addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => Promise<{ success: boolean; error?: string }>;
+  addToQueue: ReturnType<typeof usePlayer>['addToQueue'];
   onClose: () => void;
 }) {
   const [view, setView] = useState<'actions' | 'playlists' | 'new'>('actions');
@@ -1957,24 +1960,20 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const queueActionInProgress = useRef(false);
   const playlistLoadInProgress = useRef(false);
   const playlistActionInProgress = useRef(false);
 
   const queueTrack = async (playNext: boolean) => {
-    if (busy) return;
-    setBusy(true);
-    setMessage('');
+    if (busy || queueActionInProgress.current) return;
+    queueActionInProgress.current = true;
+    onClose();
     try {
       const result = await addToQueue(track, playNext);
-      if (!result.success) {
-        setMessage(result.error || 'Could not update the queue.');
-        return;
-      }
-      onClose();
+      const message = result.success ? result.warning : result.error || 'Could not update the queue.';
+      if (message) void toaster.toast({ title: 'DeckyPlex', body: message });
     } catch (error: any) {
-      setMessage(error?.message || 'Could not update the queue.');
-    } finally {
-      setBusy(false);
+      void toaster.toast({ title: 'DeckyPlex', body: error?.message || 'Could not update the queue.' });
     }
   };
 
@@ -2075,8 +2074,10 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
       <PanelSection key={view} title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
         <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
         {view === 'actions' && <>
-          <PanelSectionRow><Button disabled={busy} onClick={() => void queueTrack(true)}>Play Next</Button></PanelSectionRow>
-          <PanelSectionRow><Button disabled={busy} onClick={() => void queueTrack(false)}>Add to Queue</Button></PanelSectionRow>
+          <PanelSectionRow><Button aria-disabled={busy} onClick={() => void queueTrack(true)}
+            onOKButton={event => { event.preventDefault(); if (!event.detail?.is_repeat) void queueTrack(true); }}>Play Next</Button></PanelSectionRow>
+          <PanelSectionRow><Button aria-disabled={busy} onClick={() => void queueTrack(false)}
+            onOKButton={event => { event.preventDefault(); if (!event.detail?.is_repeat) void queueTrack(false); }}>Add to Queue</Button></PanelSectionRow>
           <PanelSectionRow><Button onClick={() => void showPlaylists()} onOKButton={(event) => { event.preventDefault(); void showPlaylists(); }}>Add to Playlist</Button></PanelSectionRow>
           {playlistId && <PanelSectionRow><Button disabled={busy} onClick={() => void removeFromPlaylist()} onOKButton={(event) => { event.preventDefault(); void removeFromPlaylist(); }}>Remove from Playlist</Button></PanelSectionRow>}
         </>}

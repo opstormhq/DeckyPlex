@@ -1,5 +1,6 @@
 import json
 import asyncio
+import base64
 import html
 import ipaddress
 import os
@@ -250,6 +251,7 @@ class PlexCompanionReceiver:
     """Minimal local Plex Companion player endpoint for Plexamp casting."""
     HTTP_PORT = int(os.environ.get("DECKYPLEX_COMPANION_PORT", "32435"))
     GDM_PORT = 32412
+    POLL_DISCONNECT_GRACE = 1.25
 
     def __init__(self, machine_id: str, event_loop=None, device_name="DeckyPlex"):
         self.machine_id = machine_id
@@ -260,9 +262,15 @@ class PlexCompanionReceiver:
         self.gdm_socket = None
         self.gdm_thread = None
         self.lock = threading.Lock()
+        self.timeline_changed = threading.Condition(self.lock)
         self.commands: List[Dict[str, Any]] = []
         self.controllers: Dict[str, Dict[str, Any]] = {}
+        self.polling_controllers: Dict[tuple[str, str], float] = {}
+        self.poll_disconnects: Dict[tuple[str, str], threading.Event] = {}
+        self.outgoing_play = None
+        self.shutting_down = False
         self.timeline: Dict[str, Any] = {"state": "stopped", "time": 0, "duration": 0}
+        self.last_polled_queue_revision = None
         self.error = ""
 
     def _response_headers(self) -> bytes:
@@ -286,6 +294,16 @@ class PlexCompanionReceiver:
         command = {"command": name, "params": params, "client_host": client_host,
                    "client_id": client_id, "received_at": time.time()}
         with self.lock:
+            if self.shutting_down:
+                return
+            outgoing = self.outgoing_play
+            if (name == "playMedia" and outgoing and time.monotonic() < outgoing["until"]
+                    and params.get("key", [""])[0] == outgoing["key"]
+                    and self._matches_controller(client_id, client_host, outgoing["client_id"], outgoing["host"])):
+                self.outgoing_play = None
+                outgoing["echo"].set()
+                logger.info("Plexamp routed outgoing playback back to DeckyPlex")
+                return
             self.commands.append(command)
             self.commands = self.commands[-32:]
             if client_id in self.controllers:
@@ -354,18 +372,107 @@ class PlexCompanionReceiver:
                 command_id = 0
             controller = {"host": host, "port": port, "clientId": client_id, "commandId": command_id,
                           "protocol": params.get("protocol", ["http"])[0]}
+            controller_key = client_id or f"{host}:{port}"
             with self.lock:
-                self.controllers[client_id or f"{host}:{port}"] = controller
+                new_controller = controller_key not in self.controllers
+                disconnected = self.shutting_down
+                if not disconnected:
+                    self.controllers[controller_key] = controller
                 timeline = dict(self.timeline)
-            self._notify_controllers([controller], timeline)
+            if disconnected:
+                timeline = {"state": "stopped", "volume": timeline.get("volume", 50)}
+            elif new_controller:
+                logger.info("Plex Companion controller connected: state=%s queue=%s",
+                            timeline.get("state"), timeline.get("playQueueID") or "-")
+            self._notify_controllers([controller], timeline, disconnected=disconnected)
 
-    def set_timeline(self, timeline: Dict[str, Any]) -> None:
+    def set_timeline(self, timeline: Dict[str, Any], notify: bool = True) -> None:
+        with self.timeline_changed:
+            self.timeline = timeline
+            self.timeline_changed.notify_all()
+        if notify:
+            self.notify_timeline(timeline)
+
+    def notify_timeline(self, timeline: Dict[str, Any]) -> None:
         with self.lock:
-            self.timeline = dict(timeline)
+            if self.timeline is not timeline:
+                return
             controllers = list(self.controllers.values())
         self._notify_controllers(controllers, timeline)
 
-    def _notify_controllers(self, controllers: List[Dict[str, Any]], timeline: Dict[str, Any]) -> None:
+    @staticmethod
+    def _matches_controller(client_id: str, host: str, target_id: str, target_host: str) -> bool:
+        return bool((target_id and client_id == target_id) or (target_host and host == target_host))
+
+    def poll_timeline(self, host: str, client_id: str, command_id: int,
+                      wait: bool = False) -> tuple[bytes, Optional[threading.Event]]:
+        key = (client_id, host)
+        now = time.monotonic()
+        with self.timeline_changed:
+            self.polling_controllers = {k: at for k, at in self.polling_controllers.items() if now - at < 90}
+            self.poll_disconnects = {k: event for k, event in self.poll_disconnects.items()
+                                     if k in self.polling_controllers}
+            known_controller = key in self.polling_controllers
+            if not self.shutting_down and key not in self.poll_disconnects:
+                self.polling_controllers[key] = now
+                if wait and known_controller:
+                    previous = self.timeline
+                    self.timeline_changed.wait_for(
+                        lambda: self.timeline is not previous or self.shutting_down or key in self.poll_disconnects,
+                        timeout=1,
+                    )
+            pending_disconnect = self.poll_disconnects.get(key)
+            disconnected = self.shutting_down or pending_disconnect is not None
+            timeline = dict(self.timeline)
+            revision = (timeline.get("playQueueID"), timeline.get("playQueueVersion"))
+            if not disconnected and all(revision) and revision != self.last_polled_queue_revision:
+                self.last_polled_queue_revision = revision
+                logger.info("Companion poll served queue %s version %s while item %s was active",
+                            *revision, timeline.get("playQueueItemID"))
+        if disconnected:
+            timeline = {"state": "stopped", "volume": timeline.get("volume", 50)}
+        return self._timeline_xml(timeline, command_id, disconnected), pending_disconnect
+
+    def disconnect_controllers(self, target_id: str = "", target_host: str = "", *, shutting_down: bool = False) -> None:
+        def targeted(client_id, host):
+            return shutting_down or not (target_id or target_host) or self._matches_controller(
+                client_id, host, target_id, target_host)
+
+        with self.lock:
+            if shutting_down:
+                self.shutting_down = True
+            controllers = [self.controllers.pop(key) for key, entry in list(self.controllers.items())
+                           if targeted(entry.get("clientId") or key, entry["host"])]
+            now = time.monotonic()
+            polling = {key: self.poll_disconnects.setdefault(key, threading.Event())
+                       for key, seen in self.polling_controllers.items() if now - seen < 90 and targeted(*key)}
+            timeline = {"state": "stopped", "volume": self.timeline.get("volume", 50)}
+            self.timeline_changed.notify_all()
+        if controllers:
+            self._notify_controllers(controllers, timeline, disconnected=True)
+        if polling:
+            deadline = time.monotonic() + self.POLL_DISCONNECT_GRACE
+            for event in polling.values():
+                event.wait(max(0, deadline - time.monotonic()))
+            with self.lock:
+                for key, event in polling.items():
+                    if event.is_set():
+                        self.polling_controllers.pop(key, None)
+                    if self.poll_disconnects.get(key) is event:
+                        self.poll_disconnects.pop(key, None)
+        if controllers or polling:
+            logger.info("Released Plex Companion controllers: push=%d poll=%d poll_delivered=%d",
+                        len(controllers), len(polling), sum(event.is_set() for event in polling.values()))
+
+    def expect_outgoing_play(self, client_id: str, host: str, rating_key: int) -> threading.Event:
+        echo = threading.Event()
+        with self.lock:
+            self.outgoing_play = {"client_id": client_id, "host": host, "key": f"/library/metadata/{rating_key}",
+                                  "until": time.monotonic() + 10, "echo": echo}
+        return echo
+
+    def _notify_controllers(self, controllers: List[Dict[str, Any]], timeline: Dict[str, Any],
+                            disconnected: bool = False) -> None:
         if not controllers:
             return
         try:
@@ -373,7 +480,7 @@ class PlexCompanionReceiver:
             for controller in controllers:
                 scheme = "https" if controller.get("protocol") == "https" else "http"
                 url = f"{scheme}://{controller['host']}:{controller['port']}/:/timeline"
-                media = self._timeline_xml(timeline, controller.get("commandId", 0))
+                media = self._timeline_xml(timeline, controller.get("commandId", 0), disconnected)
                 try:
                     requests.post(url, data=media, timeout=0.35,
                                   headers={"Content-Type": "application/xml",
@@ -385,7 +492,10 @@ class PlexCompanionReceiver:
             logger.debug("Could not publish Companion timeline: %s", exc)
 
     @staticmethod
-    def _timeline_xml(state: Dict[str, Any], command_id: int = 0) -> bytes:
+    def _timeline_xml(state: Dict[str, Any], command_id: int = 0, disconnected: bool = False) -> bytes:
+        actions = ["volume", "seekTo", "skipTo", "skipPrevious", "stop", "playPause"]
+        if state.get("canSkipNext") is not False:
+            actions.append("skipNext")
         attrs = {
             "type": "music", "state": state.get("state", "stopped"),
             "time": int(state.get("time", 0)), "duration": int(state.get("duration", 0)),
@@ -393,8 +503,10 @@ class PlexCompanionReceiver:
             "address": state.get("address", ""), "port": state.get("port", 32400),
             "protocol": state.get("protocol", "http"), "token": state.get("token", ""),
             "volume": int(state.get("volume", 50)),
-            "controllable": "volume,seekTo,skipTo,skipNext,skipPrevious,stop,playPause",
+            "controllable": ",".join(actions),
         }
+        if state.get("ratingKey"):
+            attrs["ratingKey"] = state["ratingKey"]
         if state.get("playQueueID"):
             attrs["playQueueID"] = state["playQueueID"]
             attrs["playQueueItemID"] = state.get("playQueueItemID", "")
@@ -402,7 +514,9 @@ class PlexCompanionReceiver:
             if state.get("playQueueVersion"):
                 attrs["playQueueVersion"] = state["playQueueVersion"]
         values = " ".join(f'{name}=\"{html.escape(str(value), quote=True)}\"' for name, value in attrs.items())
-        return (f'<MediaContainer location="fullScreenMusic" commandID="{int(command_id)}"><Timeline {values}/></MediaContainer>').encode("utf-8")
+        disconnect = ' disconnected="1"' if disconnected else ''
+        return (f'<MediaContainer location="fullScreenMusic" commandID="{int(command_id)}"{disconnect}>'
+                f'<Timeline {values}/></MediaContainer>').encode("utf-8")
 
     def start(self) -> None:
         if self.is_active():
@@ -471,6 +585,10 @@ class PlexCompanionReceiver:
                 if parsed.path == "/player/timeline/unsubscribe":
                     with receiver.lock:
                         client_id = self.headers.get("X-Plex-Client-Identifier", "")
+                        receiver.polling_controllers.pop((client_id, self.client_address[0]), None)
+                        pending_disconnect = receiver.poll_disconnects.pop((client_id, self.client_address[0]), None)
+                        if pending_disconnect:
+                            pending_disconnect.set()
                         if client_id:
                             receiver.controllers.pop(client_id, None)
                         else:
@@ -478,20 +596,25 @@ class PlexCompanionReceiver:
                                                     if value.get("host") != self.client_address[0]}
                     return self._send(b"", "application/xml")
                 if parsed.path == "/player/timeline/poll":
-                    with receiver.lock:
-                        state = dict(receiver.timeline)
+                    params = urllib.parse.parse_qs(parsed.query)
                     try:
-                        command_id = int(urllib.parse.parse_qs(parsed.query).get("commandID", ["0"])[0])
+                        command_id = int(params.get("commandID", ["0"])[0])
                     except (TypeError, ValueError):
                         command_id = 0
-                    body = receiver._timeline_xml(state, command_id)
+                    body, pending_disconnect = receiver.poll_timeline(
+                        self.client_address[0], self.headers.get("X-Plex-Client-Identifier", ""), command_id,
+                        wait=params.get("wait", ["0"])[0] == "1")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/xml")
                     self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store")
                     self.send_header("X-Plex-Client-Identifier", receiver.machine_id)
                     self.send_header("Access-Control-Expose-Headers", "X-Plex-Client-Identifier")
                     self.end_headers()
-                    return self.wfile.write(body)
+                    self.wfile.write(body)
+                    if pending_disconnect:
+                        pending_disconnect.set()
+                    return
                 if parsed.path.startswith("/player/playback/"):
                     command = parsed.path.rsplit("/", 1)[-1]
                     aliases = {"playMedia": "playMedia", "play": "play", "pause": "pause",
@@ -532,7 +655,7 @@ class PlexCompanionReceiver:
         while self.gdm_socket:
             try:
                 packet, address = self.gdm_socket.recvfrom(2048)
-                if packet.startswith(b"M-SEARCH"):
+                if packet.startswith(b"M-SEARCH") and not self.shutting_down:
                     self.gdm_socket.sendto(self._response_headers(), address)
             except socket.timeout:
                 continue
@@ -565,11 +688,21 @@ class PlexCompanionReceiver:
                     and self.gdm_socket and self.gdm_thread and self.gdm_thread.is_alive())
 
 
+class RemotePlaybackError(RuntimeError):
+    """An actionable remote playback error safe to show in the UI."""
+
+
+def _plex_error_code(error: Exception) -> str:
+    # SDK exceptions can include the full command URL and its transient token.
+    status = re.match(r"^\((\d{3})\)", str(error))
+    return f"{type(error).__name__} HTTP {status[1]}" if status else type(error).__name__
+
+
 class PlexHTTP:
     """Small Decky-facing adapter around the bundled python-plexapi SDK."""
 
     def __init__(self, base_url: str, token: str, timeout: int = 8, verify_tls: bool = False,
-                 account_token: str = ""):
+                 account_token: str = "", *, connected_server=None):
         import requests
         from plexapi.server import PlexServer
 
@@ -577,10 +710,15 @@ class PlexHTTP:
         self.token = token
         self.account_token = account_token or token
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.verify = bool(verify_tls)
+        self.session = connected_server._session if connected_server is not None else requests.Session()
+        if connected_server is None:
+            self.session.verify = bool(verify_tls)
         self._remote_client_cache = {}
-        self.sdk = PlexServer(self.base_url, token, session=self.session, timeout=timeout)
+        self._remote_timeline_track = {}
+        self._remote_timeline_track_key = None
+        self._remote_metadata_servers = {}
+        self.sdk = (connected_server if connected_server is not None
+                    else PlexServer(self.base_url, token, session=self.session, timeout=timeout))
         self._account = None
 
     @property
@@ -738,11 +876,14 @@ class PlexHTTP:
     def get_sessions(self) -> List[Any]:
         return self.sdk.sessions()
 
-    def _client(self, machine_id: str):
+    def _client(self, machine_id: str, refused_url: str = ""):
+        def usable(player):
+            return player is not None and (not refused_url or player._baseurl != refused_url)
+
         client = self._remote_client_cache.get(machine_id)
-        if client is not None:
+        if usable(client):
             return client
-        client = next((c for c in self.sdk.clients() if c.machineIdentifier == machine_id), None)
+        client = next((c for c in self.sdk.clients() if c.machineIdentifier == machine_id and usable(c)), None)
         if client is None:
             try:
                 account = self.account
@@ -751,17 +892,16 @@ class PlexHTTP:
                                  and set((r.provides or "").split(",")) & {"client", "player", "pubsub-player"}), None)
                 if resource:
                     client = resource.connect(timeout=5, locations=["local", "remote", "relay"])
-                    self._remote_client_cache[machine_id] = client
                 else:
                     device = next((item for item in account.devices()
                                    if item.clientIdentifier == machine_id), None)
                     if device:
                         client = device.connect(timeout=5)
-                        self._remote_client_cache[machine_id] = client
             except Exception as e:
-                logger.debug("Could not connect to Plex player resource %s: %s", machine_id, e)
-        if client is None:
-            raise RuntimeError("Plex player is no longer connected")
+                logger.debug("Could not connect to Plex player resource %s: %s", machine_id, _plex_error_code(e))
+        if not usable(client):
+            raise RemotePlaybackError("Could not connect to the selected player. Open it and try again.")
+        self._remote_client_cache[machine_id] = client
         return client
 
     def play(self, machine_id: str) -> None:
@@ -779,72 +919,255 @@ class PlexHTTP:
     def set_volume(self, machine_id: str, volume: int) -> None:
         self._client(machine_id).setVolume(volume, mtype="music")
 
-    def play_remote_queue(self, machine_id: str, rating_keys: List[str], start_rating_key: str) -> None:
-        client = self._client(machine_id)
+    def play_remote_queue(self, machine_id: str, rating_keys: List[str], start_rating_key: str,
+                          receiver: Optional[PlexCompanionReceiver] = None) -> None:
+        from requests.exceptions import ConnectionError, ConnectTimeout, ReadTimeout
+        from urllib3.exceptions import NewConnectionError
+
         track_ids = [int(key) for key in rating_keys]
-        tracks = []
+        items = {}
         # PlexAPI supports fetching multiple metadata keys in one request. Keep
         # each batch bounded so large shuffle queues do not create oversized URLs.
         for start in range(0, len(track_ids), 200):
-            tracks.extend(self.sdk.fetchItems(track_ids[start:start + 200]))
-        tracks = [track for track in tracks if getattr(track, "type", "") == "track"]
+            items.update((item.ratingKey, item) for item in self.sdk.fetchItems(track_ids[start:start + 200])
+                         if getattr(item, "type", "") == "track")
+        tracks = [items[key] for key in track_ids if key in items]
         if not tracks:
-            raise ValueError("The selected queue contains no playable tracks")
+            raise RemotePlaybackError("The selected queue contains no playable tracks.")
         start_item = next((track for track in tracks if str(track.ratingKey) == str(start_rating_key)), tracks[0])
-        # Modern clients expose createPlayQueue on their own Companion endpoint.
-        # Plex Media Server's /player proxy does not implement this newer command
-        # consistently (it returns 404 even for a live /clients player). Try the
-        # direct SDK client first, then use PlexAPI's legacy playMedia flow, which
-        # creates the queue on the server and sends its containerKey to the player.
-        logger.info("Sending queue to %s (%s) via direct Companion connection", client.title, machine_id)
-        try:
-            client.proxyThroughServer(False)
-            client.createPlayQueue(self.sdk, tracks, startItem=start_item, shuffle=False, repeat=False)
-            return
-        except Exception as direct_error:
-            logger.warning("Direct createPlayQueue failed for %s: %s; trying SDK playMedia", machine_id, direct_error)
 
-        play_queue = self.sdk.createPlayQueue(
-            tracks, startItem=start_item, shuffle=False, repeat=False,
-            includeChapters=False, includeRelated=False,
-        )
-        # The SDK constructs the correct /playback/playMedia command including
-        # server address, transient token, selected key and containerKey.
-        # Use server proxy as a fallback for players that aren't directly reachable.
-        try:
+        def send_direct(client):
+            host = urllib.parse.urlparse(client._baseurl or "").hostname or ""
+            echo = None
+            if receiver:
+                receiver.disconnect_controllers(machine_id, host)
+                echo = receiver.expect_outgoing_play(machine_id, host, start_item.ratingKey)
+            logger.info("Sending queue to %s (%s) via direct Companion connection", client.title, machine_id)
             client.proxyThroughServer(False)
-            client.playMedia(play_queue)
-        except Exception as direct_error:
-            logger.warning("Direct playMedia failed for %s: %s; retrying via Plex server", machine_id, direct_error)
-            client.proxyThroughServer(True, server=self.sdk)
-            client.playMedia(play_queue)
+            try:
+                client.createPlayQueue(self.sdk, tracks, startItem=start_item, shuffle=False, repeat=False)
+            except (ConnectionError, ReadTimeout):
+                # A read timeout can occur after delivery. Never replay it.
+                raise
+            except Exception as error:
+                logger.warning("Direct createPlayQueue failed for %s (%s); trying SDK playMedia",
+                               machine_id, _plex_error_code(error))
+                queue = self.sdk.createPlayQueue(tracks, startItem=start_item, shuffle=False, repeat=False,
+                                                 includeChapters=False, includeRelated=False)
+                try:
+                    client.playMedia(queue)
+                except (ConnectionError, ReadTimeout):
+                    raise
+                except Exception as direct_error:
+                    logger.warning("Direct playMedia failed for %s (%s); trying Plex server proxy",
+                                   machine_id, _plex_error_code(direct_error))
+                    client.proxyThroughServer(True, server=self.sdk)
+                    try:
+                        client.playMedia(queue)
+                    finally:
+                        client.proxyThroughServer(False)
+            if echo and echo.wait(0.4):
+                raise RemotePlaybackError("Plexamp sent playback back to the Deck. Select This Device in Plexamp and retry.")
 
-    def remote_player_status(self, machine_id: str) -> Dict[str, Any]:
         client = self._client(machine_id)
         try:
-            for session in self.sdk.sessions():
-                player = getattr(session, "player", None)
-                if not player or player.machineIdentifier != machine_id or getattr(session, "type", "") != "track":
+            send_direct(client)
+        except ConnectionError as error:
+            self._remote_client_cache.pop(machine_id, None)
+            reason = getattr(error.args[0], "reason", None) if error.args else None
+            if not isinstance(error, ConnectTimeout) and not isinstance(reason, NewConnectionError):
+                raise
+            logger.info("Refreshing Plex player address after connection failure for %s (%s)",
+                        machine_id, _plex_error_code(error))
+            try:
+                send_direct(self._client(machine_id, refused_url=client._baseurl))
+            except ConnectionError as retry_error:
+                self._remote_client_cache.pop(machine_id, None)
+                raise RemotePlaybackError("Could not reach the selected player. Open it and try again.") from retry_error
+
+    def remote_player_status(self, machine_id: str, known_queue_id: str = "", known_version: str = "",
+                             known_item_id: str = "") -> Dict[str, Any]:
+        # The player timeline carries the real queue ID and revision. PMS
+        # sessions are a fallback for players without a readable timeline.
+        player_error = None
+        try:
+            client = self._client(machine_id)
+            music = self._remote_music_timeline(client)
+        except Exception as error:
+            self._remote_client_cache.pop(machine_id, None)
+            player_error = error
+        else:
+            if music and music.state in ("playing", "paused") and music.ratingKey:
+                return self._remote_music_status(client, music, known_queue_id, known_version, known_item_id)
+
+        for session in self.sdk.sessions():
+            player = getattr(session, "player", None)
+            if not player or player.machineIdentifier != machine_id or getattr(session, "type", "") != "track":
+                continue
+            return {
+                "state": getattr(session, "state", "playing") or "playing",
+                "track": {
+                    "id": str(getattr(session, "ratingKey", "") or ""),
+                    "title": getattr(session, "title", "") or "",
+                    "artist": getattr(session, "grandparentTitle", "") or "",
+                    "album": getattr(session, "parentTitle", "") or "",
+                    "duration": getattr(session, "duration", 0) or 0,
+                    "thumb": getattr(session, "thumbUrl", "") or "",
+                        "sourceServerId": self.sdk.machineIdentifier,
+                },
+                "progress": (getattr(session, "viewOffset", 0) or 0) / 1000,
+                "duration": (getattr(session, "duration", 0) or 0) / 1000,
+                "volume": getattr(player, "volume", None),
+            }
+        if player_error:
+            raise player_error
+        return {"state": "stopped", "track": None, "progress": 0, "duration": 0}
+
+    @staticmethod
+    def _remote_music_timeline(client):
+        return next((entry for entry in client.timelines() if entry.type == "music"), None)
+
+    @staticmethod
+    def _remote_queue_id(music) -> str:
+        queue_id = getattr(music, "playQueueID", None)
+        if queue_id:
+            return str(queue_id)
+        match = re.match(r"^/playQueues/(\d+)(?:\?|$)", getattr(music, "containerKey", "") or "")
+        return match[1] if match else ""
+
+    def _remote_music_status(self, client, music, known_queue_id: str, known_version: str,
+                             known_item_id: str) -> Dict[str, Any]:
+        track = {"id": str(music.ratingKey), "duration": music.duration or 0,
+                 "sourceServerId": music.machineIdentifier or ""}
+        same_server = music.machineIdentifier == self.sdk.machineIdentifier
+        metadata_key = (music.machineIdentifier, track["id"])
+        if getattr(self, "_remote_timeline_track_key", None) != metadata_key:
+            try:
+                server = self.sdk if same_server else self._account_plex_server(music.machineIdentifier)
+                if server:
+                    item = server.fetchItem(music.ratingKey)
+                    data = self._item_dict(item, from_listing=True)
+                    cover = data.get("gridThumb") or data.get("thumb")
+                    if not cover and getattr(item, "parentRatingKey", None):
+                        cover = item.album().thumbUrl
+                    self._remote_timeline_track = {
+                        "title": item.title, "artist": item.grandparentTitle, "album": item.parentTitle,
+                        "thumb": cover or "", "duration": item.duration,
+                    }
+                    self._remote_timeline_track_key = metadata_key
+            except Exception as e:
+                logger.debug("Could not load remote music metadata (%s)", _plex_error_code(e))
+        if getattr(self, "_remote_timeline_track_key", None) == metadata_key:
+            track.update(self._remote_timeline_track)
+        status = {"state": music.state, "track": track, "volume": music.volume,
+                  "progress": (music.time or 0) / 1000, "duration": (music.duration or track["duration"] or 0) / 1000}
+        queue_id = self._remote_queue_id(music) if same_server else ""
+        if not queue_id:
+            return status
+        item_id = str(getattr(music, "playQueueItemID", None) or "")
+        version = str(getattr(music, "playQueueVersion", None) or "")
+        status.update(play_queue_id=queue_id, play_queue_item_id=item_id, play_queue_version=version)
+        if not version or (queue_id, version, item_id) != (known_queue_id, known_version, known_item_id):
+            try:
+                snapshot = self.get_companion_queue(queue_id, item_id, own=False)
+                status["queue"] = snapshot["queue"]
+                status["play_queue_version"] = snapshot["play_queue_version"] or version
+                if not item_id and snapshot["selected_rating_key"] == track["id"]:
+                    item_id = snapshot["selected_item_id"]
+                    status["play_queue_item_id"] = item_id
+            except Exception as error:
+                logger.debug("Could not read remote play queue %s (%s)", queue_id, _plex_error_code(error))
+                return status
+        status["queue_editable"] = bool(item_id and "playqueues" in client.protocolCapabilities)
+        return status
+
+    def _account_plex_server(self, machine_id: str):
+        # Use servers available to DeckyPlex's linked account. The phone's
+        # playback timeline identifies the server but grants no access to it.
+        if not machine_id or machine_id == "node":
+            return None
+        cached, expires = self._remote_metadata_servers.get(machine_id, (None, 0))
+        if time.monotonic() < expires:
+            return cached
+        server = None
+        try:
+            resource = next((resource for resource in self.account.resources()
+                             if resource.clientIdentifier == machine_id
+                             and "server" in (resource.provides or "").split(",")), None)
+            if resource:
+                server = resource.connect(timeout=3, locations=["local", "remote", "relay"])
+                if server.machineIdentifier != machine_id:
+                    server = None
+        except Exception as error:
+            logger.debug("Could not connect to remote artwork server (%s)", _plex_error_code(error))
+        self._remote_metadata_servers[machine_id] = (server, time.monotonic() + (300 if server else 30))
+        return server
+
+    def music_artwork(self, rating_key: int, *, server=None) -> str:
+        sdk = server if server is not None else self.sdk
+        item = sdk.fetchItem(rating_key)
+        if getattr(item, "type", "") != "track":
+            return ""
+        artwork = self._item_dict(item, from_listing=True)
+        candidates = [artwork.get("gridThumb"), artwork.get("thumb")]
+        if getattr(item, "parentRatingKey", None):
+            try:
+                candidates.append(item.album().thumbUrl)
+            except Exception:
+                pass
+        base = urllib.parse.urlsplit(sdk._baseurl)
+        max_bytes = 1024 * 1024
+        for candidate in dict.fromkeys(url for url in candidates if url):
+            try:
+                image = urllib.parse.urlsplit(candidate)
+                if image.scheme != base.scheme or image.netloc != base.netloc:
                     continue
-                return {
-                    "state": getattr(session, "state", "playing") or "playing",
-                    "track": {
-                        "id": str(getattr(session, "ratingKey", "") or ""),
-                        "title": getattr(session, "title", "") or "",
-                        "artist": getattr(session, "grandparentTitle", "") or "",
-                        "album": getattr(session, "parentTitle", "") or "",
-                        "duration": getattr(session, "duration", 0) or 0,
-                        "thumb": getattr(session, "thumbUrl", "") or "",
-                    },
-                    "progress": (getattr(session, "viewOffset", 0) or 0) / 1000,
-                    "duration": (getattr(session, "duration", 0) or 0) / 1000,
-                    "volume": getattr(client, "volume", 50) or 50,
-                }
-        except Exception as e:
-            logger.warning("Could not read remote player status for %s: %s", machine_id, e)
-            return {"state": "error", "error": str(e)}
-        return {"state": "stopped", "track": None, "progress": 0, "duration": 0,
-                "volume": getattr(client, "volume", 50) or 50}
+                with sdk._session.get(candidate, timeout=min(self.timeout, 4), stream=True, allow_redirects=False) as response:
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    if response.status_code != 200 or content_type not in (
+                            "image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"):
+                        continue
+                    data = bytearray()
+                    for chunk in response.iter_content(chunk_size=16384):
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            break
+                    if 0 < len(data) <= max_bytes:
+                        return f"data:{content_type};base64,{base64.b64encode(data).decode('ascii')}"
+            except Exception as error:
+                logger.debug("Could not load Plex artwork (%s)", _plex_error_code(error))
+        return ""
+
+    def edit_remote_music_queue(self, machine_id: str, queue_id: str, action: str, item_id: str) -> Dict[str, Any]:
+        client = self._client(machine_id)
+        music = self._remote_music_timeline(client)
+        if (not music or music.state not in ("playing", "paused")
+                or music.machineIdentifier != self.sdk.machineIdentifier
+                or self._remote_queue_id(music) != queue_id or "playqueues" not in client.protocolCapabilities):
+            raise RemotePlaybackError("The selected player no longer has this queue.")
+        current_id = str(getattr(music, "playQueueItemID", None) or "")
+        if not current_id:
+            snapshot = self.get_companion_queue(queue_id, own=False)
+            if snapshot["selected_rating_key"] == str(music.ratingKey):
+                current_id = snapshot["selected_item_id"]
+        if not current_id or (action == "remove" and item_id == current_id):
+            raise RemotePlaybackError("The current track changed. Try editing the queue again.")
+        result = {"success": True}
+        if action == "remove":
+            self.remove_companion_queue_item(queue_id, item_id)
+        else:
+            added = self.add_companion_queue_item(queue_id, current_id, item_id, action == "next", own=False)
+            if added.get("warning"):
+                result["warning"] = added["warning"]
+        try:
+            client.refreshPlayQueue(queue_id, mtype="music")
+        except Exception as error:
+            # The write already succeeded. Report it distinctly so the user
+            # does not retry and accidentally add a second copy.
+            logger.warning("Could not refresh the player for queue %s (%s)", queue_id, _plex_error_code(error))
+            return {"success": True, "warning": "Plex saved the edit, but the player did not confirm the queue refresh."}
+        logger.info("Updated queue %s on %s (%s)", queue_id, client.title, action)
+        return result
 
     def control_remote_player(self, machine_id: str, command: str, value: int = 0) -> None:
         client = self._client(machine_id)
@@ -871,10 +1194,14 @@ class PlexHTTP:
         try:
             send()
         except Exception as direct_error:
-            logger.warning("Direct %s command failed for %s: %s; retrying via Plex server",
-                           command, machine_id, direct_error)
+            self._remote_client_cache.pop(machine_id, None)
+            logger.warning("Direct playback command failed for %s (%s); retrying via Plex server",
+                           machine_id, _plex_error_code(direct_error))
             client.proxyThroughServer(True, server=self.sdk)
-            send()
+            try:
+                send()
+            finally:
+                client.proxyThroughServer(False)
 
     def get_library_sections(self) -> List[Dict[str, Any]]:
         return [{"id": str(section.key), "name": section.title, "type": section.type}
@@ -1198,20 +1525,22 @@ class PlexHTTP:
         return {"machineIdentifier": self.sdk.machineIdentifier or "",
                 "friendlyName": self.sdk.friendlyName or "", "version": self.sdk.version or ""}
 
-    def get_stream_urls(self, rating_key: str) -> Dict[str, str]:
+    def get_stream_urls(self, rating_key: str, *, track=None, media_server=None) -> Dict[str, str]:
         """Prefer PlexAPI's direct media URL for common codecs, with MP3 transcode fallback."""
-        track = self.sdk.fetchItem(int(rating_key))
+        sdk = media_server if media_server is not None else self.sdk
+        if track is None:
+            track = sdk.fetchItem(int(rating_key))
         if getattr(track, "type", "") != "track":
             raise ValueError("Selected Plex item is not a music track")
         media = list(getattr(track, "media", []) or [])
         part = next((part for item in media for part in (getattr(item, "parts", []) or [])
                      if getattr(part, "key", "")), None)
-        direct_url = self.sdk.url(part.key, includeToken=True) if part else ""
+        direct_url = sdk.url(part.key, includeToken=True) if part else ""
         codec = str(getattr(media[0], "audioCodec", "") or "").lower() if media else ""
         # The transcoder requires a client identifier. Reuse PlexAPI's
         # configured identifier and advertise an MP3 target profile so the
         # response is an audio/mpeg byte stream, not a manifest/error document.
-        client_identifier = self.sdk._headers().get("X-Plex-Client-Identifier", "deckyplex")
+        client_identifier = sdk._headers().get("X-Plex-Client-Identifier", "deckyplex")
         # Use AAC in an MP4 container as the browser-safe alternate. Some MP3
         # parts in Plex libraries are legal MPEG audio but fail intermittently
         # in the embedded media element; a server-side AAC transcode avoids
@@ -1232,7 +1561,7 @@ class PlexHTTP:
             "X-Plex-Product": "DeckyPlex",
             "X-Plex-Version": "1.0.0",
         })
-        transcode_url = self.sdk.url(f"/music/:/transcode/universal/start.m4a?{params}", includeToken=True)
+        transcode_url = sdk.url(f"/music/:/transcode/universal/start.m4a?{params}", includeToken=True)
         if direct_url and codec in ("mp3", "flac"):
             return {"stream_url": direct_url, "fallback_stream_url": transcode_url,
                     "stream_mode": f"direct-{codec}"}
@@ -1240,40 +1569,40 @@ class PlexHTTP:
                 "fallback_stream_url": direct_url if codec in ("mp3", "flac") else "",
                 "stream_mode": "transcode-aac"}
 
-    def prepare_companion_playback(self, key: str, container_key: str = "",
-                                   server_machine_id: str = "", controller_token: str = "") -> Dict[str, Any]:
-        # Companion playMedia carries the controller's transient token for the
-        # media server. Use it when supplied so a Plexamp account with shared
-        # library access can play through DeckyPlex even if Decky is signed into
-        # a different Plex account. Keep requests pinned to the configured
-        # server; never trust an address supplied by a LAN controller.
-        target_server_id = str(getattr(self.sdk, "machineIdentifier", "") or "")
-        if server_machine_id and target_server_id and server_machine_id != target_server_id:
-            raise ValueError("Incoming stream rejected: Plexamp is using a different Plex server. Log in to the same account and server in DeckyPlex, or enable ‘Accept playback from any Plex account’ in Players settings.")
-        client = self
-        owns_session = False
-        if controller_token and controller_token != self.token:
-            client = PlexHTTP(self.base_url, controller_token, timeout=self.timeout,
-                              verify_tls=bool(self.session.verify), account_token=controller_token)
-            owns_session = True
-        try:
-            return client._prepare_companion_playback(key, container_key)
-        finally:
-            if owns_session:
-                client.session.close()
+    def _companion_media_server(self, source_id: str, account_plex=None):
+        if not source_id or source_id == self.sdk.machineIdentifier:
+            return self.sdk
+        if account_plex:
+            server = (account_plex.sdk if source_id == account_plex.sdk.machineIdentifier
+                      else account_plex._account_plex_server(source_id))
+            if server:
+                return server
+        raise RemotePlaybackError("This track is on another Plex server. Cast it directly from Plexamp or sign in to an account with access to that server.")
 
-    def _prepare_companion_playback(self, key: str, container_key: str = "") -> Dict[str, Any]:
+    @staticmethod
+    def _companion_server_context(sdk, token: str) -> Dict[str, Any]:
+        url = urllib.parse.urlparse(sdk._baseurl)
+        return {"source": "companion", "machine_identifier": sdk.machineIdentifier or "",
+                "address": url.hostname or "", "port": url.port or 32400,
+                "protocol": url.scheme or "http", "token": token}
+
+    def companion_track_streams(self, rating_key: str, source_server_id: str = "", account_plex=None, *, track=None):
+        server = self._companion_media_server(source_server_id, account_plex)
+        streams = self.get_stream_urls(rating_key, track=track, media_server=server)
+        if server is not self.sdk:
+            # The linked account authorizes Deck playback. The receiver's
+            # timeline must not send that account's token to LAN controllers.
+            streams["media_context"] = self._companion_server_context(server, "")
+        return streams
+
+    def prepare_companion_playback(self, key: str, container_key: str = "", account_plex=None) -> Dict[str, Any]:
         parsed = urllib.parse.urlparse(key or "")
         match = re.search(r"/library/metadata/(\d+)", parsed.path or key or "")
         if not match:
             raise ValueError("Plexamp sent an unsupported media key")
         requested_rating_key = match.group(1)
         rating_key = requested_rating_key
-        item = self.sdk.fetchItem(int(rating_key))
-        if getattr(item, "type", "") != "track":
-            raise ValueError("Plexamp target currently supports music tracks only")
-        selected = self._item_dict(item)
-        queue = [selected]
+        queue = []
         active_queue_id = ""
         active_item_id = ""
         active_queue_version = ""
@@ -1308,8 +1637,6 @@ class PlexHTTP:
                     logger.info("Companion key %s differs from queue-selected track %s; using the queue selection",
                                 requested_rating_key, queue_selected_key)
                     rating_key = queue_selected_key
-                    item = selected_queue_item
-                    selected = self._item_dict(item)
                 requested_queue_item = selected_queue_item or next(
                     (track for track in play_queue.items if queue_track_matches(track)), None
                 )
@@ -1323,19 +1650,13 @@ class PlexHTTP:
                         includeBefore=True, includeAfter=True,
                         center=int(center_item_id),
                     )
-                tracks = []
-                for track in play_queue.items:
-                    if getattr(track, "type", "") != "track":
-                        continue
-                    track_dict = self._item_dict(track)
-                    track_dict["playQueueItemID"] = str(getattr(track, "playQueueItemID", "") or "")
-                    tracks.append(track_dict)
-                    if str(track.ratingKey) == rating_key:
-                        active_item_id = track_dict["playQueueItemID"]
+                tracks = self._companion_queue_tracks(play_queue.items)
                 selected_index = next((index for index, track in enumerate(tracks)
-                                       if str(track.get("id")) == rating_key
-                                       or re.search(r"/library/metadata/(\d+)", str(track.get("key") or ""))
-                                       and re.search(r"/library/metadata/(\d+)", str(track.get("key") or "")).group(1) == rating_key), -1)
+                                       if center_item_id and track.get("playQueueItemID") == center_item_id
+                                       and track.get("id") == rating_key), -1)
+                if selected_index < 0:
+                    selected_index = next((index for index, track in enumerate(tracks)
+                                           if track.get("id") == rating_key), -1)
                 logger.info("Incoming play queue %s requested ratingKey=%s; using ratingKey=%s matched position=%s/%s (window size=%s)",
                             queue_id.group(1), requested_rating_key, rating_key,
                             selected_index + 1 if selected_index >= 0 else "not found",
@@ -1352,23 +1673,23 @@ class PlexHTTP:
                     # If Plex returned a trimmed queue window without the
                     # selected item, still start the requested item rather
                     # than silently falling back to the first item in window.
-                    queue = [selected]
                     logger.warning("Selected Companion track %s was not present in play queue %s; using a single-track queue",
                                    rating_key, queue_id.group(1))
             except Exception as exc:
-                logger.warning("Could not load incoming Plex play queue %s: %s", queue_id.group(1), exc)
-        streams = self.get_stream_urls(rating_key)
+                logger.warning("Could not load incoming Plex play queue %s (%s)", queue_id.group(1), _plex_error_code(exc))
+        source_server_id = queue[0].get("sourceServerId", "") if queue else ""
+        media_server = self._companion_media_server(source_server_id, account_plex)
+        item = media_server.fetchItem(int(rating_key))
+        if getattr(item, "type", "") != "track":
+            raise ValueError("Plexamp target currently supports music tracks only")
+        selected = self._item_dict(item)
+        streams = self.companion_track_streams(rating_key, source_server_id, account_plex, track=item)
         selected["playQueueItemID"] = active_item_id
-        server_url = urllib.parse.urlparse(self.sdk._baseurl)
-        stream_url = urllib.parse.urlparse(streams.get("stream_url", ""))
-        stream_token = urllib.parse.parse_qs(stream_url.query).get("X-Plex-Token", [self.token])[0]
-        server_context = {
-            "machine_identifier": str(getattr(self.sdk, "machineIdentifier", "") or ""),
-            "address": stream_url.hostname or server_url.hostname or "",
-            "port": stream_url.port or server_url.port or 32400,
-            "protocol": stream_url.scheme or server_url.scheme or "http",
-            "token": stream_token,
-        }
+        if source_server_id:
+            selected["sourceServerId"] = source_server_id
+        if not queue:
+            queue = [selected]
+        server_context = self._companion_server_context(self.sdk, self.token)
         return {"success": True, "track": selected, "queue": queue,
                 "play_queue_id": active_queue_id,
                 "play_queue_item_id": active_item_id,
@@ -1377,46 +1698,179 @@ class PlexHTTP:
                 "server_context": server_context,
                 **streams}
 
-    def get_companion_queue(self, play_queue_id: str, center_item_id: str = "") -> Dict[str, Any]:
-        """Fetch the active Companion play queue around its current item."""
+    def _companion_queue_entries(self, queue) -> List[Any]:
         from plexapi.playqueue import PlayQueue
-        queue = PlayQueue.get(self.sdk, int(play_queue_id), own=True,
-                              window=200, includeBefore=True, includeAfter=True,
-                              center=int(center_item_id) if str(center_item_id).isdigit() else None)
+        entries = list(queue.items)
+        known = {entry.playQueueItemID for entry in entries}
+        while entries and len(entries) < (getattr(queue, "playQueueTotalCount", None) or 0):
+            page = PlayQueue.get(self.sdk, queue.playQueueID, center=entries[-1].playQueueItemID,
+                                 window=200, includeBefore=False)
+            more = [entry for entry in page.items if entry.playQueueItemID not in known]
+            if not more:
+                break
+            entries.extend(more)
+            known.update(entry.playQueueItemID for entry in more)
+        return entries
+
+    def _companion_queue_tracks(self, entries) -> List[Dict[str, Any]]:
         tracks = []
-        for track in queue.items:
+        for track in entries:
             if getattr(track, "type", "") != "track":
                 continue
-            track_dict = self._item_dict(track)
+            track_dict = self._item_dict(track, from_listing=True)
+            if not track_dict["id"]:
+                key = re.match(r"/library/metadata/(\d+)", track_dict.get("key", ""))
+                if key:
+                    track_dict["id"] = key[1]
             track_dict["playQueueItemID"] = str(getattr(track, "playQueueItemID", "") or "")
+            source = re.match(r"^server://([a-zA-Z0-9-]+)/com\.plexapp\.plugins\.library(?:/|$)",
+                              vars(track).get("sourceURI") or "")
+            if source and source[1] not in ("local", "node"):
+                track_dict["sourceServerId"] = source[1]
             tracks.append(track_dict)
+        return tracks
+
+    def get_companion_queue(self, play_queue_id: str, center_item_id: str = "",
+                            include_remaining: bool = False, own: bool = True) -> Dict[str, Any]:
+        """Fetch the active Companion play queue around its current item."""
+        from plexapi.playqueue import PlayQueue
+        queue = PlayQueue.get(self.sdk, int(play_queue_id), own=own,
+                              window=200, includeBefore=True, includeAfter=True,
+                              center=int(center_item_id) if str(center_item_id).isdigit() else None)
+        entries = self._companion_queue_entries(queue) if include_remaining else queue.items
+        tracks = self._companion_queue_tracks(entries)
         return {"queue": tracks, "play_queue_id": str(queue.playQueueID or play_queue_id),
                 "play_queue_version": str(queue.playQueueVersion or ""),
                 "selected_item_id": str(queue.playQueueSelectedItemID or ""),
                 "selected_rating_key": str(queue.playQueueSelectedMetadataItemID or ""),
                 "selected_offset": int(queue.playQueueSelectedItemOffset or 0)}
 
+    def create_local_companion_queue(self, rating_keys: List[int]) -> Dict[str, Any]:
+        """Publish the currently playing track followed by the Deck's upcoming tracks."""
+        keys = list(dict.fromkeys(rating_keys))
+        tracks = {}
+        for offset in range(0, len(keys), 100):
+            for item in self.sdk.fetchItems(keys[offset:offset + 100]):
+                if item.type == "track":
+                    tracks[item.ratingKey] = item
+        if any(key not in tracks for key in keys):
+            raise ValueError("An item in the current queue is unavailable on this Plex server.")
+        queue = self.sdk.createPlayQueue([tracks[key] for key in rating_keys], includeRelated=False, window=200)
+        entries = self._companion_queue_entries(queue)
+        if (not queue.playQueueID or [entry.ratingKey for entry in entries] != rating_keys
+                or any(not entry.playQueueItemID for entry in entries)):
+            raise ValueError("Plex did not return the same tracks in the requested queue order.")
+        server_url = urllib.parse.urlparse(self.base_url)
+        try:
+            token = self.sdk.createToken() or ""
+        except Exception:
+            token = ""
+            logger.debug("Could not delegate a server token for the local Companion queue")
+        return {
+            "play_queue_id": str(queue.playQueueID),
+            "play_queue_version": str(queue.playQueueVersion or ""),
+            "container_key": f"/playQueues/{queue.playQueueID}?window=200",
+            "item_ids": [str(entry.playQueueItemID) for entry in entries],
+            "server_context": {"source": "local", "machine_identifier": self.sdk.machineIdentifier,
+                               "address": server_url.hostname or "", "port": server_url.port or 32400,
+                               "protocol": server_url.scheme, "token": token},
+        }
+
+    def report_companion_queue_timeline(self, timeline: Dict[str, Any]) -> None:
+        # PlexAPI's Playable.updateTimeline does not accept play queue identifiers.
+        # Use the documented timeline endpoint through the SDK's authenticated session.
+        params = {"ratingKey": timeline["ratingKey"], "key": timeline["key"],
+                  "identifier": "com.plexapp.plugins.library", "state": timeline["state"],
+                  "time": timeline["time"], "duration": timeline["duration"],
+                  "playQueueID": timeline["playQueueID"], "playQueueItemID": timeline["playQueueItemID"],
+                  "playQueueVersion": timeline["playQueueVersion"],
+                  "containerKey": f"/playQueues/{timeline['playQueueID']}"}
+        self.sdk.query(f"/:/timeline?{urllib.parse.urlencode(params)}", method=self.session.post,
+                       timeout=min(self.timeout, 2))
+
     def add_companion_queue_item(self, play_queue_id: str, current_item_id: str,
-                                 rating_key: str, play_next: bool) -> Dict[str, Any]:
+                                 rating_key: str, play_next: bool, own: bool = True, *, source_track=None) -> Dict[str, Any]:
         """Add a track to Plex's shared queue and return its real queue item ID."""
         from plexapi.playqueue import PlayQueue
-        queue = PlayQueue.get(self.sdk, int(play_queue_id), own=True,
-                              window=200, includeBefore=True, includeAfter=True,
-                              center=int(current_item_id) if str(current_item_id).isdigit() else None)
+        window_options = {"own": own, "window": 200, "includeBefore": True, "includeAfter": True,
+                          "center": int(current_item_id) if str(current_item_id).isdigit() else None}
+        queue = PlayQueue.get(self.sdk, int(play_queue_id), **window_options)
         old_item_ids = {str(getattr(item, "playQueueItemID", "") or "") for item in queue.items}
-        track = self.sdk.fetchItem(int(rating_key))
+        old_version = queue.playQueueVersion
+        track = source_track if source_track is not None else self.sdk.fetchItem(int(rating_key))
         if getattr(track, "type", "") != "track":
             raise ValueError("Only music tracks can be added to the Plexamp queue")
+        source_id = getattr(getattr(track, "_server", None), "machineIdentifier", self.sdk.machineIdentifier)
+        foreign_track = source_id != self.sdk.machineIdentifier
+        source_uri = f"server://{source_id}/com.plexapp.plugins.library"
+        # The queue's copy of a foreign track is a partial SDK object bound to
+        # the queue server. Serializing it can reload the wrong metadata after
+        # a successful write. Use the original track from its source server.
+        added_track = self._item_dict(track, from_listing=True)
+
+        def added_item(play_queue):
+            new_items = [item for item in play_queue.items if getattr(item, "playQueueItemID", None)
+                         and str(item.playQueueItemID) not in old_item_ids]
+            last_added = getattr(play_queue, "playQueueLastAddedItemID", None)
+            for item in new_items:
+                if (str(getattr(item, "ratingKey", "") or "") == str(rating_key)
+                        and (not foreign_track or vars(item).get("sourceURI") == source_uri)):
+                    return item
+            if foreign_track and len(new_items) == 1 and new_items[0].playQueueItemID == last_added:
+                return new_items[0]
+            return None
+
         queue.addItem(track, playNext=bool(play_next), refresh=False)
-        added = next((item for item in queue.items
-                      if str(getattr(item, "ratingKey", "") or "") == str(rating_key)
-                      and str(getattr(item, "playQueueItemID", "") or "") not in old_item_ids), None)
+        added = added_item(queue)
         if added is None:
-            raise ValueError("Plex updated the queue but did not return the new queue item")
-        added_track = self._item_dict(added)
+            # Some servers acknowledge an edit with a window that omits the
+            # new entry. Reread the queue once without replaying the write.
+            try:
+                queue = PlayQueue.get(self.sdk, int(play_queue_id), **window_options)
+                added = added_item(queue)
+            except Exception as error:
+                logger.warning("Could not verify Companion queue %s after add (%s)", play_queue_id, _plex_error_code(error))
+        if added is None:
+            logger.warning("Plex did not confirm track %s from %s in queue %s on %s (version %s to %s)",
+                           rating_key, source_id, play_queue_id, self.sdk.machineIdentifier, old_version, queue.playQueueVersion)
+            raise RemotePlaybackError("Plex did not confirm that it added this track to the queue.")
+        entries = queue.items
+        position = next(index for index, entry in enumerate(entries) if entry.playQueueItemID == added.playQueueItemID)
+        after_item_id = str(entries[position - 1].playQueueItemID) if position else ""
+        warning = ""
+        destination = "Play Next" if play_next else "the end of the queue"
+        try:
+            if play_next:
+                anchor = next((item for item in entries if str(item.playQueueItemID) == current_item_id), None)
+            else:
+                # Plex's Add to Up Next ends the manual Up Next group. The
+                # Deck browser's Add to Queue appends to the full play queue.
+                anchor = self._companion_queue_entries(queue)[-1]
+                if anchor not in queue:
+                    # The SDK requires both items in the loaded window to move by ID.
+                    entries.append(anchor)
+            if anchor is None:
+                warning = "Plex added the track, but the current track changed before it could play next."
+            elif anchor.playQueueItemID != added.playQueueItemID and str(anchor.playQueueItemID) != after_item_id:
+                queue.moveItem(added, after=anchor, refresh=False)
+                after_item_id = str(anchor.playQueueItemID)
+        except Exception as error:
+            logger.warning("Could not move the newly added item to %s (%s)", destination, _plex_error_code(error))
+            warning = f"Plex added the track, but could not move it to {destination}."
         added_track["playQueueItemID"] = str(getattr(added, "playQueueItemID", "") or "")
+        if foreign_track:
+            added_track["sourceServerId"] = source_id
         return {"track": added_track, "play_queue_id": str(queue.playQueueID or play_queue_id),
-                "play_queue_version": str(queue.playQueueVersion or "")}
+                "play_queue_version": str(queue.playQueueVersion or ""),
+                "after_item_id": after_item_id, "warning": warning}
+
+    def remove_companion_queue_item(self, play_queue_id: str, item_id: str) -> None:
+        from plexapi.playqueue import PlayQueue
+        queue = PlayQueue.get(self.sdk, int(play_queue_id), center=int(item_id), window=1)
+        item = next((entry for entry in queue.items if str(entry.playQueueItemID) == item_id), None)
+        if item is None:
+            raise RemotePlaybackError("Plex could not find this item in the queue.")
+        queue.removeItem(item, refresh=False)
 
     def inspect_stream(self, rating_key: str, stream_url: str) -> Dict[str, Any]:
         """Read a tiny range from the exact stream URL the client rejected."""
@@ -1449,6 +1903,12 @@ class Plugin:
     _resource_cache = None
     _resource_lock = threading.Lock()
     _playback_report_lock = None
+    _companion_report_lock = None
+    _companion_config_lock = None
+    _companion_report_key = None
+    _companion_queue_edit_lock = None
+    _companion_report_at = 0.0
+    _latest_companion_timeline = None
 
     async def _main(self):
         """Called when the plugin is loaded."""
@@ -1479,9 +1939,11 @@ class Plugin:
     def _configure_companion_receiver(self, receiver_id: str, enabled: bool, device_name: str) -> None:
         global _companion_receiver
         if not enabled:
-            if _companion_receiver:
-                _companion_receiver.stop()
-                _companion_receiver = None
+            receiver, _companion_receiver = _companion_receiver, None
+            self._latest_companion_timeline = None
+            if receiver:
+                receiver.disconnect_controllers(shutting_down=True)
+                receiver.stop()
             logger.info("Plex Companion receiver disabled")
             return
         if _companion_receiver and _companion_receiver.is_active():
@@ -1619,8 +2081,13 @@ class Plugin:
                 await self.stop_game_pip()
             receiver_id = str(merged.get("companion_id") or "").strip()
             if receiver_id and ("companion_receiver_enabled" in settings or "companion_device_name" in settings):
-                self._configure_companion_receiver(receiver_id, merged["companion_receiver_enabled"],
-                                                   merged["companion_device_name"])
+                if self._companion_config_lock is None:
+                    self._companion_config_lock = asyncio.Lock()
+                async with self._companion_config_lock:
+                    current = _load_settings()
+                    await asyncio.to_thread(self._configure_companion_receiver, receiver_id,
+                                            current["companion_receiver_enabled"], current["companion_device_name"])
+                merged = _load_settings()
             return self._public_settings(merged)
         except Exception as e:
             logger.error(f"Failed to save settings: {e}")
@@ -1764,36 +2231,64 @@ class Plugin:
             return {"players": [], "error": str(e)}
 
     async def play_remote_queue(self, machine_id: str, rating_keys: List[str], start_rating_key: str) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"success": False, "error": "Not connected to Plex server"}
         try:
-            plex.play_remote_queue(machine_id, rating_keys, start_rating_key)
+            await asyncio.to_thread(plex.play_remote_queue, machine_id, rating_keys, start_rating_key,
+                                    _companion_receiver)
             return {"success": True, "machineIdentifier": machine_id}
-        except Exception as e:
-            logger.error("Failed to start remote Plex queue on %s: %s", machine_id, e, exc_info=True)
+        except RemotePlaybackError as e:
             return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.warning("Failed to start remote Plex queue on %s (%s)", machine_id, _plex_error_code(e))
+            return {"success": False, "error": "Could not start playback. Open the selected Plex player and try again."}
 
     async def control_remote_player(self, machine_id: str, command: str, value: int = 0) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"success": False, "error": "Not connected to Plex server"}
         try:
-            plex.control_remote_player(machine_id, command, value)
+            await asyncio.to_thread(plex.control_remote_player, machine_id, command, value)
             return {"success": True}
-        except Exception as e:
-            logger.error("Remote player command %s failed for %s: %s", command, machine_id, e, exc_info=True)
+        except RemotePlaybackError as e:
             return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.warning("Remote player command failed for %s (%s)", machine_id, _plex_error_code(e))
+            return {"success": False, "error": "Could not control the selected Plex player."}
 
-    async def get_remote_player_status(self, machine_id: str) -> Dict[str, Any]:
-        plex = self._get_plex()
+    async def get_remote_player_status(self, machine_id: str, known_queue_id: str = "", known_version: str = "",
+                                       known_item_id: str = "") -> Dict[str, Any]:
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"state": "disconnected", "error": "Not connected to Plex server"}
         try:
-            return plex.remote_player_status(machine_id)
-        except Exception as e:
-            logger.error("Failed to read remote player %s: %s", machine_id, e)
+            return await asyncio.to_thread(plex.remote_player_status, machine_id, known_queue_id, known_version, known_item_id)
+        except RemotePlaybackError as e:
             return {"state": "error", "error": str(e)}
+        except Exception as e:
+            logger.debug("Failed to read remote player %s (%s)", machine_id, _plex_error_code(e))
+            return {"state": "error", "error": "Could not read the selected Plex player's status."}
+
+    async def edit_remote_music_queue(self, machine_id: str, queue_id: str, action: str,
+                                      item_id: str) -> Dict[str, Any]:
+        if action not in ("next", "append", "remove") or not all(
+                isinstance(value, str) and re.fullmatch(r"[0-9]{1,20}", value) for value in (queue_id, item_id)):
+            return {"success": False, "error": "Invalid play queue edit."}
+        plex = await asyncio.to_thread(self._get_plex)
+        if not plex:
+            return {"success": False, "error": "Not connected to Plex server."}
+        try:
+            return await asyncio.to_thread(plex.edit_remote_music_queue, machine_id, queue_id, action, item_id)
+        except RemotePlaybackError as error:
+            return {"success": False, "error": str(error)}
+        except Exception as error:
+            code = _plex_error_code(error)
+            logger.warning("Plex could not edit remote music queue %s (%s)", queue_id, code)
+            message = "Plex could not edit this queue. Try editing it on the device playing the music."
+            if code.endswith(("HTTP 401", "HTTP 403")):
+                message = "Plex denied permission to edit this queue. Edit it on the device playing the music."
+            return {"success": False, "error": message}
 
     async def get_playback_state(self) -> Dict[str, Any]:
         """Get current playback state from server sessions.
@@ -1860,96 +2355,158 @@ class Plugin:
                                         server_machine_id: str = "", controller_token: str = "",
                                         server_address: str = "", server_port: int = 32400,
                                         server_protocol: str = "http") -> Dict[str, Any]:
-        plex = self._get_plex()
-        settings = _load_settings()
-        # When enabled, incoming Plexamp playback is authorized by the token
-        # sent with that command, regardless of DeckyPlex's signed-in account
-        # or selected server. Keep this path limited to private LAN IPs.
-        if settings.get("allow_signed_out_companion", False):
-            if not controller_token:
-                return {"success": False, "error": "Plexamp did not provide a server access token."}
-            try:
-                if not server_machine_id or server_machine_id == "node":
-                    raise ValueError("Plexamp did not identify a local Plex server")
-                base_url = _private_plex_base_url(server_address, server_port, server_protocol)
-                timeout = int(settings.get("connection_timeout", 8) or 8)
-                verify_tls = bool(settings.get("verify_tls", False))
-                plex = PlexHTTP(base_url, controller_token, timeout=timeout,
-                                verify_tls=verify_tls, account_token=controller_token)
-                try:
-                    return plex.prepare_companion_playback(key, container_key, server_machine_id, controller_token)
-                finally:
-                    plex.session.close()
-            except Exception as exc:
-                logger.warning("Could not prepare signed-out Companion playback: %s", exc)
-                error_text = str(exc)
-                if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized", "404", "not_found")):
-                    error_text = "Plexamp's account was not authorized to play this item. Confirm it has access to the Plex server, or enable ‘Accept playback from any Plex account’ in Players settings."
-                return {"success": False, "error": error_text}
-        if not plex:
-            return {"success": False, "error": "Incoming stream rejected: this device is not connected to Plex. Log in to DeckyPlex or enable ‘Accept playback from any Plex account’ in Players settings."}
-        try:
-            return plex.prepare_companion_playback(key, container_key, server_machine_id, controller_token)
-        except Exception as exc:
-            logger.error("Could not prepare incoming Plex playback: %s", exc, exc_info=True)
-            error_text = str(exc)
-            if any(marker in error_text.lower() for marker in ("401", "403", "unauthorized", "not authorized", "404", "not_found")):
-                error_text = "The Plexamp account does not appear to have access to this item on the selected Plex server. Sign in to Plexamp with an account that can access this server, or enable ‘Accept playback from any Plex account’ in Players settings."
-            return {"success": False, "error": error_text}
+        context = {"source": "companion", "machine_identifier": server_machine_id,
+                   "token": controller_token, "address": server_address, "port": server_port,
+                   "protocol": server_protocol}
 
-    def _companion_plex_for_context(self, context: Dict[str, Any]):
+        def prepare():
+            plex, owns_session = self._companion_plex_for_context(context, for_playback=True)
+            try:
+                return plex.prepare_companion_playback(key, container_key, account_plex=self._get_plex())
+            finally:
+                if owns_session:
+                    plex.session.close()
+        try:
+            return await asyncio.to_thread(prepare)
+        except RemotePlaybackError as error:
+            return {"success": False, "error": str(error)}
+        except Exception as error:
+            code = _plex_error_code(error)
+            logger.warning("Could not prepare incoming Plex playback (%s)", code)
+            return {"success": False, "error": self._companion_track_error(code)}
+
+    @staticmethod
+    def _companion_track_error(code: str) -> str:
+        if code.endswith(("HTTP 401", "HTTP 403")):
+            return "Plex denied access to this track for the current playback session."
+        if code.endswith("HTTP 404"):
+            return "Plex could not find this track on the server for this queue."
+        return "Could not load this track from Plex."
+
+    def _companion_plex_for_context(self, context: Dict[str, Any], *, for_playback: bool = False):
         """Resolve the authorized Plex server for an active Companion session."""
         settings = _load_settings()
-        if settings.get("allow_signed_out_companion", False):
-            token = str(context.get("token") or "")
-            machine_id = str(context.get("machine_identifier") or "")
-            if not token or not machine_id:
-                raise ValueError("Missing Plexamp server authorization.")
+        plex = self._get_plex()
+        expected_id = str(plex.sdk.machineIdentifier or "") if plex else ""
+        requested_id = str(context.get("machine_identifier") or "")
+        token = str(context.get("token") or "")
+        source = context.get("source")
+        allow_sender = settings.get("allow_signed_out_companion", False) and source != "local"
+        linked_plex = plex
+        if plex and requested_id and requested_id != expected_id:
+            server = plex._account_plex_server(requested_id)
+            linked_plex = (PlexHTTP(server._baseurl, server._token, timeout=plex.timeout,
+                                    account_token=plex.account_token, connected_server=server) if server else None)
+        if linked_plex:
+            # A linked account already authorizes requests to this server.
+            # Preserve Plexamp's session credential for streaming, and use the
+            # linked account for queue edits so a read-only cast token is not
+            # the only credential sent to PMS.
+            if not (for_playback and source != "local" and token) or token == linked_plex.token:
+                return linked_plex, False
+            base_url = linked_plex.base_url
+        elif allow_sender:
+            if not token or not requested_id or requested_id == "node":
+                raise RemotePlaybackError("Plexamp did not provide authorization for a Plex Media Server.")
             base_url = _private_plex_base_url(
                 str(context.get("address") or ""), int(context.get("port") or 32400),
                 str(context.get("protocol") or "http"),
             )
-            plex = PlexHTTP(base_url, token,
-                            timeout=int(settings.get("connection_timeout", 8) or 8),
-                            verify_tls=bool(settings.get("verify_tls", False)),
-                            account_token=token)
-            if str(getattr(plex.sdk, "machineIdentifier", "") or "") != machine_id:
-                plex.session.close()
-                raise ValueError("Plexamp server identity changed during playback.")
-            return plex, True
+        elif plex:
+            raise RemotePlaybackError("Plexamp is using a server your linked account could not access. Enable ‘Accept playback from any Plex account’ to receive it with Plexamp’s credentials.")
+        else:
+            raise RemotePlaybackError("Sign in to DeckyPlex or enable ‘Accept playback from any Plex account’ in Players settings.")
+        client = PlexHTTP(base_url, token, timeout=int(settings.get("connection_timeout", 8) or 8),
+                          verify_tls=bool(settings.get("verify_tls", False)), account_token=token)
+        if requested_id and client.sdk.machineIdentifier != requested_id:
+            client.session.close()
+            raise RemotePlaybackError("Plexamp's server identity did not match the playback request.")
+        return client, True
 
-        plex = self._get_plex()
-        if not plex:
-            raise ValueError("Not connected to Plex server")
-        expected_id = str(getattr(plex.sdk, "machineIdentifier", "") or "")
-        requested_id = str(context.get("machine_identifier") or "")
-        if requested_id and expected_id and requested_id != expected_id:
-            raise ValueError("Incoming stream rejected: Plexamp is using a different Plex server. Log in to the same account and server in DeckyPlex, or enable ‘Accept playback from any Plex account’ in Players settings.")
-        return plex, False
+    async def share_local_companion_queue(self, server_id: str, rating_keys: List[str]) -> Dict[str, Any]:
+        receiver = _companion_receiver
+        settings = _load_settings()
+        if not receiver or not receiver.is_active() or not server_id or server_id != settings["selected_server_id"]:
+            return {"success": False, "error": "The Plex Companion receiver or selected server changed."}
+        if (not isinstance(rating_keys, list) or not rating_keys or
+                any(not isinstance(key, str) or not re.fullmatch(r"[0-9]{1,20}", key) for key in rating_keys)):
+            return {"success": False, "error": "The current queue contains a track without a valid Plex ID."}
+
+        def create():
+            plex = self._get_plex()
+            if not plex or plex.sdk.machineIdentifier != server_id:
+                raise ValueError("The selected Plex server changed before the queue was shared.")
+            return plex.create_local_companion_queue([int(key) for key in rating_keys])
+
+        try:
+            result = await asyncio.to_thread(create)
+            if _companion_receiver is not receiver or _load_settings()["selected_server_id"] != server_id:
+                return {"success": False, "error": "The receiver or selected server changed while sharing the queue."}
+            logger.info("Shared Deck music queue %s with Plex Companion (%d tracks)", result["play_queue_id"], len(rating_keys))
+            return {"success": True, **result}
+        except Exception as error:
+            logger.warning("Could not share the Deck music queue: %s", type(error).__name__)
+            return {"success": False, "error": "Plex could not create a shared music queue."}
 
     async def play_companion_track(self, rating_key: str,
-                                   server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                   server_context: Optional[Dict[str, Any]] = None,
+                                   source_server_id: str = "") -> Dict[str, Any]:
         """Get the next Companion queue item's stream using its authorized server context."""
-        plex = None
-        owns_session = False
+        def load():
+            plex, owns_session = self._companion_plex_for_context(server_context or {}, for_playback=True)
+            try:
+                account_plex = self._get_plex() if source_server_id else None
+                return plex.companion_track_streams(str(rating_key), source_server_id, account_plex)
+            finally:
+                if owns_session:
+                    plex.session.close()
+
         try:
-            plex, owns_session = self._companion_plex_for_context(server_context or {})
-            streams = plex.get_stream_urls(str(rating_key))
+            streams = await asyncio.to_thread(load)
             return {"success": True, **streams}
-        except Exception as exc:
-            logger.warning("Could not load Companion queue track %s: %s", rating_key, exc)
-            return {"success": False, "error": str(exc)}
-        finally:
-            if owns_session and plex:
-                plex.session.close()
+        except RemotePlaybackError as error:
+            logger.warning("Could not load Companion queue track %s: %s", rating_key, error)
+            return {"success": False, "error": str(error)}
+        except Exception as error:
+            code = _plex_error_code(error)
+            logger.warning("Could not load Companion queue track %s (%s)", rating_key, code)
+            return {"success": False, "error": self._companion_track_error(code)}
+
+    async def get_music_artwork(self, rating_key: str, server_context: Optional[Dict[str, Any]] = None,
+                                source_server_id: str = "") -> str:
+        if not isinstance(rating_key, str) or not re.fullmatch(r"[0-9]{1,20}", rating_key):
+            return ""
+
+        def load():
+            plex, owns_session = self._companion_plex_for_context(server_context or {})
+            try:
+                server = plex._companion_media_server(source_server_id, self._get_plex())
+                return plex.music_artwork(int(rating_key), server=server)
+            finally:
+                if owns_session:
+                    plex.session.close()
+
+        try:
+            return await asyncio.to_thread(load)
+        except Exception as error:
+            logger.debug("Could not resolve music artwork (%s)", _plex_error_code(error))
+            return ""
 
     async def refresh_companion_queue(self, play_queue_id: str, current_item_id: str,
-                                      server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        plex = None
-        owns_session = False
+                                      server_context: Optional[Dict[str, Any]] = None,
+                                      include_remaining: bool = False) -> Dict[str, Any]:
+        context = server_context or {}
+
+        def load():
+            plex, owns_session = self._companion_plex_for_context(context, for_playback=True)
+            try:
+                return plex.get_companion_queue(play_queue_id, current_item_id,
+                                                 include_remaining=include_remaining or context.get("source") == "local")
+            finally:
+                if owns_session:
+                    plex.session.close()
         try:
-            plex, owns_session = self._companion_plex_for_context(server_context or {})
-            result = plex.get_companion_queue(play_queue_id, current_item_id)
+            result = await asyncio.to_thread(load)
             tracks = result.get("queue", [])
             current_index = next((index for index, item in enumerate(tracks)
                                   if str(item.get("playQueueItemID") or "") == str(current_item_id)), -1)
@@ -1962,70 +2519,162 @@ class Plugin:
         except Exception as exc:
             logger.warning("Could not refresh Companion queue %s: %s", play_queue_id, exc)
             return {"success": False, "error": str(exc)}
-        finally:
-            if owns_session and plex:
-                plex.session.close()
 
     async def add_companion_queue_track(self, rating_key: str, play_queue_id: str,
                                         current_item_id: str,
                                         server_context: Optional[Dict[str, Any]] = None,
-                                        play_next: bool = False) -> Dict[str, Any]:
-        plex = None
-        owns_session = False
+                                        play_next: bool = False, source_server_id: str = "") -> Dict[str, Any]:
+        context = server_context or {}
+        def add():
+            plex, owns_session = self._companion_plex_for_context(context)
+            try:
+                account_plex = self._get_plex()
+                if not account_plex:
+                    raise RemotePlaybackError("Sign in to DeckyPlex to add tracks from your library.")
+                source_id = source_server_id or account_plex.sdk.machineIdentifier
+                source_server = (account_plex.sdk if source_id == account_plex.sdk.machineIdentifier
+                                 else account_plex._account_plex_server(source_id))
+                if not source_server:
+                    raise RemotePlaybackError("DeckyPlex could not access the server for this track.")
+                track = source_server.fetchItem(int(rating_key))
+                return plex.add_companion_queue_item(play_queue_id, current_item_id, rating_key, play_next,
+                                                       source_track=track)
+            finally:
+                if owns_session:
+                    plex.session.close()
         try:
-            plex, owns_session = self._companion_plex_for_context(server_context or {})
-            result = plex.add_companion_queue_item(play_queue_id, current_item_id,
-                                                   rating_key, play_next)
+            if self._companion_queue_edit_lock is None:
+                self._companion_queue_edit_lock = asyncio.Lock()
+            async with self._companion_queue_edit_lock:
+                result = await asyncio.to_thread(add)
+            if result.get("track"):
+                logger.info("Added track %s to Companion queue %s at version %s",
+                            rating_key, play_queue_id, result["play_queue_version"])
             return {"success": True, **result}
-        except Exception as exc:
-            logger.warning("Could not add track %s to Companion queue %s: %s",
-                           rating_key, play_queue_id, exc)
-            detail = str(exc)
-            lowered = detail.lower()
-            if "different plex server" in lowered or "server mismatch" in lowered:
-                message = ("Can't update the Plexamp queue because DeckyPlex is connected to a different Plex server. "
-                           "Select the same server in both apps, or enable ‘Accept playback from any Plex account’ "
-                           "in Players settings.")
-            elif "404" in lowered or "not_found" in lowered:
-                message = ("Can't add this track to Plexamp's queue because it isn't available on Plexamp's active "
-                           "Plex server or library. Select the same server in both apps, or choose a track from a "
-                           "library available to Plexamp.")
-            elif any(marker in lowered for marker in ("unauthorized", "not authorized", "forbidden", "401", "403",
-                                                        "access denied", "permission", "different plex account")):
-                message = ("Can't update the Plexamp queue with DeckyPlex's current Plex account. "
-                           "Sign in with the same Plex account as Plexamp, or enable ‘Accept playback from any Plex account’ "
-                           "in Players settings.")
+        except RemotePlaybackError as error:
+            return {"success": False, "error": str(error)}
+        except Exception as error:
+            code = _plex_error_code(error)
+            logger.warning("Could not add track %s to Companion queue %s (%s)", rating_key, play_queue_id, code)
+            if code.endswith(("HTTP 401", "HTTP 403")):
+                message = "Plex denied permission to add this track. Edit the queue in Plexamp."
+            elif source_server_id and context.get("machine_identifier") not in ("", None, source_server_id):
+                message = "Plex could not add this track from another server to the queue. Try adding it in Plexamp."
             else:
-                message = f"Could not update the Plexamp queue: {detail}"
+                message = "Plex could not add this track to the queue."
             return {"success": False, "error": message}
-        finally:
-            if owns_session and plex:
-                plex.session.close()
+
+    async def remove_companion_queue_track(self, play_queue_id: str, item_id: str,
+                                           server_context: Dict[str, Any]) -> Dict[str, Any]:
+        def remove():
+            plex, owns_session = self._companion_plex_for_context(server_context)
+            try:
+                plex.remove_companion_queue_item(play_queue_id, item_id)
+            finally:
+                if owns_session:
+                    plex.session.close()
+        try:
+            if self._companion_queue_edit_lock is None:
+                self._companion_queue_edit_lock = asyncio.Lock()
+            async with self._companion_queue_edit_lock:
+                await asyncio.to_thread(remove)
+            logger.info("Removed item %s from Companion queue %s", item_id, play_queue_id)
+            return {"success": True}
+        except RemotePlaybackError as error:
+            return {"success": False, "error": str(error)}
+        except Exception as error:
+            code = _plex_error_code(error)
+            logger.warning("Could not remove a shared queue item: %s", code)
+            if code.endswith(("HTTP 401", "HTTP 403")):
+                return {"success": False, "error": "Plex denied permission to remove this track. Remove it in Plexamp."}
+            return {"success": False, "error": "Plex could not remove the queued track."}
 
     async def report_companion_timeline(self, rating_key: str, time_ms: int, duration_ms: int,
                                         state: str, volume: int = 50,
                                         play_queue_id: str = "", play_queue_item_id: str = "",
                                         container_key: str = "", play_queue_version: str = "",
-                                        server_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                        server_context: Optional[Dict[str, Any]] = None,
+                                        can_skip_next: Optional[bool] = None,
+                                        media_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         receiver = _companion_receiver
         if receiver:
             settings = _load_settings()
-            server_url = urllib.parse.urlparse(self._get_plex_server_url())
+            server_url = urllib.parse.urlparse(self._get_plex_server_url(settings))
             context = server_context or {}
-            receiver.set_timeline({"key": f"/library/metadata/{rating_key}" if rating_key else "",
-                                   "state": state, "time": max(0, int(time_ms)),
-                                   "duration": max(0, int(duration_ms)),
-                                   "playQueueID": str(play_queue_id or ""),
-                                   "playQueueItemID": str(play_queue_item_id or ""),
-                                   "containerKey": str(container_key or ""),
-                                   "playQueueVersion": str(play_queue_version or ""),
-                                   "serverId": context.get("machine_identifier") or settings.get("selected_server_id", ""),
-                                   "address": context.get("address") or server_url.hostname or "",
-                                   "port": int(context.get("port") or server_url.port or 32400),
-                                   "protocol": context.get("protocol") or server_url.scheme or "http",
-                                   "token": context.get("token") or self._get_server_access_token(),
-                                   "volume": max(0, min(100, int(volume)))})
+            timeline = {"key": f"/library/metadata/{rating_key}" if rating_key else "", "ratingKey": str(rating_key),
+                        "state": state, "time": max(0, int(time_ms)), "duration": max(0, int(duration_ms)),
+                        "playQueueID": str(play_queue_id or ""), "playQueueItemID": str(play_queue_item_id or ""),
+                        "containerKey": str(container_key or ""), "playQueueVersion": str(play_queue_version or ""),
+                        "serverId": context.get("machine_identifier") or settings.get("selected_server_id", ""),
+                        "address": context.get("address") or server_url.hostname or "",
+                        "port": int(context.get("port") or server_url.port or 32400),
+                        "protocol": context.get("protocol") or server_url.scheme or "http",
+                        "token": context.get("token") or (
+                            "" if context.get("source") == "local" else self._get_server_access_token()),
+                        "volume": max(0, min(100, int(volume))), "canSkipNext": can_skip_next}
+            if media_context:
+                # Plexamp uses the timeline's server to fetch the active play queue.
+                if not timeline["playQueueID"]:
+                    timeline.update(serverId=media_context["machine_identifier"], address=media_context["address"],
+                                    port=media_context["port"], protocol=media_context["protocol"])
+                timeline["token"] = ""
+            identity = ("serverId", "playQueueID", "playQueueItemID")
+            current_track = tuple(timeline[key] for key in identity)
+            version = timeline["playQueueVersion"]
+            latest = self._latest_companion_timeline or {}
+            latest_version = latest.get("playQueueVersion", "")
+            if (version.isdigit() and latest_version.isdigit() and int(version) < int(latest_version)
+                    and current_track == tuple(latest.get(key) for key in identity)):
+                return {"success": True}
+            previous = receiver.timeline
+            previous_version = previous.get("playQueueVersion", "")
+            queue_edited = (not media_context and bool(previous_version and version) and previous_version != version
+                            and current_track == tuple(previous.get(key) for key in identity))
+            self._latest_companion_timeline = timeline
+            # When an edit changes the version mid-track, report it to PMS
+            # before a polling or subscribed Plexamp fetches the new queue.
+            # Initial playback still appears as soon as the receiver is ready.
+            if not queue_edited:
+                receiver.set_timeline(timeline, notify=False)
+            if not media_context:
+                await self._report_companion_queue_position(timeline, context)
+            if _companion_receiver is receiver and self._latest_companion_timeline is timeline:
+                if queue_edited:
+                    if receiver.timeline is not previous:
+                        return {"success": True}
+                    receiver.set_timeline(timeline, notify=False)
+                    logger.info("Published Companion queue %s version %s during playback",
+                                timeline["playQueueID"], timeline["playQueueVersion"])
+                await asyncio.to_thread(receiver.notify_timeline, timeline)
         return {"success": True}
+
+    async def _report_companion_queue_position(self, timeline: Dict[str, Any], context: Dict[str, Any]) -> None:
+        ids = (timeline["playQueueID"], timeline["playQueueItemID"], timeline["ratingKey"])
+        if not all(re.fullmatch(r"[0-9]{1,20}", value) for value in ids) or timeline["state"] not in (
+                "playing", "paused", "stopped"):
+            return
+        key = (timeline["serverId"], *ids, timeline["state"], timeline["playQueueVersion"])
+        def send():
+            plex, owns_session = self._companion_plex_for_context(context)
+            try:
+                plex.report_companion_queue_timeline(timeline)
+            finally:
+                if owns_session:
+                    plex.session.close()
+
+        try:
+            if self._companion_report_lock is None:
+                self._companion_report_lock = asyncio.Lock()
+            async with self._companion_report_lock:
+                now = time.monotonic()
+                if self._latest_companion_timeline is not timeline or (
+                        key == self._companion_report_key and now - self._companion_report_at < 10):
+                    return
+                await asyncio.to_thread(send)
+                self._companion_report_key = key
+                self._companion_report_at = time.monotonic()
+        except Exception as error:
+            logger.debug("Could not update Plex queue %s playback position: %s", ids[0], type(error).__name__)
 
     def _find_active_player(self, plex: PlexHTTP) -> Optional[Dict[str, str]]:
         """Find the player currently controlling playback.

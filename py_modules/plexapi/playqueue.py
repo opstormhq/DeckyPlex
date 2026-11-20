@@ -61,7 +61,14 @@ class PlayQueue(PlexObject):
         )
         self.playQueueVersion = utils.cast(int, data.attrib.get("playQueueVersion"))
         self.size = utils.cast(int, data.attrib.get("size", 0))
-        self.selectedItem = self[self.playQueueSelectedItemOffset]
+        # A centered queue window can omit the selected item. The selected
+        # offset is relative to the whole queue, so it cannot index the window.
+        if self.playQueueSelectedItemID is not None:
+            self.selectedItem = next((item for item in self.items
+                                      if getattr(item, "playQueueItemID", None) == self.playQueueSelectedItemID), None)
+        else:
+            offset = self.playQueueSelectedItemOffset
+            self.selectedItem = self[offset] if offset is not None and 0 <= offset < len(self.items) else None
 
     @cached_data_property
     def items(self):
@@ -275,6 +282,10 @@ class PlayQueue(PlexObject):
         args = {}
         if item.type == "playlist":
             args["playlistID"] = item.ratingKey
+        elif item._server.machineIdentifier != self._server.machineIdentifier:
+            # Plex source URIs identify the source server even when the queue
+            # belongs to another server.
+            args["uri"] = self._createArgs(item._server, item)["uri"]
         else:
             uuid = item.section().uuid
             args["uri"] = f"library://{uuid}/item{item.key}"

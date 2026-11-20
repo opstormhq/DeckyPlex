@@ -410,8 +410,8 @@ export function SettingsPage() {
     const player = players.find(p => p.machineIdentifier === playerId);
     void updatePlayerSettings({
       selected_player_id: playerId,
-      selected_player_name: player?.name || '',
-      playback_target: playerId ? settingsRef.current.playback_target : 'local',
+      selected_player_name: playerId ? player?.name || settingsRef.current.selected_player_name : '',
+      playback_target: playerId ? 'remote' : 'local',
     });
   };
 
@@ -422,21 +422,13 @@ export function SettingsPage() {
       if (result.error) throw new Error(result.error);
       const nextPlayers = result.players || [];
       setPlayers(nextPlayers);
-      if (settingsRef.current.selected_player_id && !nextPlayers.some((p: Player) => p.machineIdentifier === settingsRef.current.selected_player_id)) {
-        const changes = { selected_player_id: "", selected_player_name: "", playback_target: "local" as const };
-        const saved: any = await saveSettings(changes);
-        if (saved?.error) throw new Error(saved.error);
-        const updated = { ...settingsRef.current, ...changes };
-        settingsRef.current = updated;
-        setSettings(updated);
-      }
       setPlayersStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s), including account-registered devices.` : "No Plex players were found through the server or account device list.");
     } catch (e: any) {
       setPlayersStatus(e?.message || "Could not refresh Plex players.");
     } finally {
       setRefreshingPlayers(false);
     }
-  }, [saveSettings]);
+  }, []);
 
   const updateSetting = useCallback((key: keyof Settings, value: any) => {
     const updated = { ...settingsRef.current, [key]: value };
@@ -693,7 +685,7 @@ export function SettingsPage() {
       <PanelSectionRow>
         <DialogCheckbox
           label="Accept playback from any Plex account"
-          description="Use Plexamp’s access token even when DeckyPlex is signed in to another account or server, or signed out. Supports LAN servers and secure plex.direct addresses."
+          description="Receive music over your local network using Plexamp’s access token. Works while signed out of DeckyPlex."
           checked={settings.allow_signed_out_companion}
           disabled={!settingsAvailable || savingPlayerSettings}
           onChange={(enabled: boolean) => updatePlayerSettings({ allow_signed_out_companion: enabled })}
@@ -715,49 +707,36 @@ export function SettingsPage() {
       <PanelSectionRow>
         <div style={{ width: '100%', marginBlock: '0.9rem 0.4rem', paddingTop: '0.9rem', borderTop: '1px solid rgba(255,255,255,0.16)', fontWeight: 600 }}>Send playback</div>
       </PanelSectionRow>
-      {!settings.has_plex_token ? (
-        <PanelSectionRow><DialogBodyText style={{ opacity: 0.65 }}>Log in to Plex to select remote players.</DialogBodyText></PanelSectionRow>
-      ) : <>
-      <PanelSectionRow>
-        <DialogBodyText style={{ opacity: 0.75 }}>
-          Choose where DeckyPlex sends playback. The list includes server-connected clients and devices registered to your Plex account. A registered device may need to be opened or started before it can accept playback.
-        </DialogBodyText>
-      </PanelSectionRow>
       <PanelSectionRow>
         <div style={{ width: '100%' }}>
           <DialogBodyText style={{ marginBottom: '0.25rem' }}>Playback target</DialogBodyText>
           <Dropdown
             rgOptions={[
               { label: 'This Decky device', data: 'local' },
-              { label: 'Selected remote Plex player', data: 'remote' },
+              ...(settings.has_plex_token ? players.map(player => ({
+                label: `${player.name} (${player.product})${player.state && player.state !== 'idle' ? ` — ${player.state}` : ''}`,
+                data: player.machineIdentifier,
+              })) : []),
+              ...(settings.has_plex_token && settings.playback_target === 'remote' && settings.selected_player_id
+                  && !players.some(player => player.machineIdentifier === settings.selected_player_id)
+                ? [{ label: settings.selected_player_name || 'Saved Plex player', data: settings.selected_player_id }]
+                : []),
             ]}
-            selectedOption={settings.playback_target}
-            disabled={!settings.selected_player_id || savingPlayerSettings || refreshingPlayers}
-            onChange={(option: any) => updatePlayerSettings({ playback_target: option.data === 'remote' ? 'remote' : 'local' })}
+            selectedOption={settings.has_plex_token && settings.playback_target === 'remote'
+              ? settings.selected_player_id : 'local'}
+            disabled={!settings.has_plex_token || savingPlayerSettings || refreshingPlayers}
+            onChange={(option: any) => handleSelectPlayer(option.data === 'local' ? '' : option.data)}
           />
         </div>
       </PanelSectionRow>
+      {!settings.has_plex_token ? (
+        <PanelSectionRow><DialogBodyText style={{ opacity: 0.65 }}>Sign in to send music to another device.</DialogBodyText></PanelSectionRow>
+      ) : <>
       <PanelSectionRow>
         <ButtonItem onClick={handleRefreshPlayers} disabled={refreshingPlayers || savingPlayerSettings}>
           Refresh players
         </ButtonItem>
       </PanelSectionRow>
-      {players.length > 0 && (
-        <PanelSectionRow>
-          <div style={{ width: '100%' }}>
-              <DialogBodyText style={{ marginBottom: '0.25rem' }}>Remote player</DialogBodyText>
-            <Dropdown
-              rgOptions={[
-                { label: 'No remote player selected', data: '' },
-                ...players.map(p => ({ label: `${p.name} (${p.product})${p.state && p.state !== 'idle' ? ` — ${p.state}` : ''}`, data: p.machineIdentifier })),
-              ]}
-              selectedOption={settings.selected_player_id}
-              disabled={refreshingPlayers || savingPlayerSettings}
-              onChange={(option: any) => handleSelectPlayer(option.data)}
-            />
-          </div>
-        </PanelSectionRow>
-      )}
       {players.length === 0 && !refreshingPlayers && (
         <PanelSectionRow>
           <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>

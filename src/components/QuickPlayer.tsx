@@ -59,6 +59,8 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
   const [shufflingAll, setShufflingAll] = useState(false);
   const [shuffleError, setShuffleError] = useState('');
   const [showQueue, setShowQueue] = useState(false);
+  const [failedMusicArt, setFailedMusicArt] = useState('');
+  const [relayedMusicArt, setRelayedMusicArt] = useState({ key: '', src: '' });
   const queueContainerRef = useRef<HTMLDivElement | null>(null);
   const queueToggleRef = useRef<HTMLDivElement | null>(null);
   const headingRef = useRef<HTMLDivElement>(null);
@@ -71,14 +73,19 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
     playbackPending: musicPending,
     track,
     volume: musicVolume,
+    localVolume,
+    volumeSliderRevision,
     error,
     progress: musicProgress,
     duration: musicDuration,
     remoteMode,
+    remoteQueueEditable,
+    loadMusicArtwork,
     companionMode,
     remotePlayerName,
     playTrack,
     playRemoteQueue,
+    readMusicPlaybackTarget,
     beginPlaybackRequest,
     play,
     pause,
@@ -105,10 +112,11 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
   const canSelectEpisode = !!playEpisode && (pip ? !pip.busy : !viewer?.transferring);
   const progress = pip ? pip.playback?.position || 0 : viewer?.position ?? musicProgress;
   const duration = pip ? pip.playback?.duration || 0 : viewer?.duration ?? musicDuration;
-  const volume = pip?.volume ?? viewer?.volume ?? musicVolume;
-  const playbackPending = pip?.busy ?? viewer?.busy ?? musicPending;
+  const volume = pip?.volume ?? viewer?.volume ?? (remoteMode ? musicVolume : localVolume);
+  const volumeSource = pip ? 'pip' : viewer ? 'video' : remoteMode ? 'remote' : 'local';
+  const playbackPending = pip?.busy ?? viewer?.busy ?? (musicPending || playbackState === 'starting');
   const seekPlayback = pip ? seekGamePip : viewer?.seek ?? seek;
-  const activeQueue = videoActive
+  const activeQueue: { id: string; title: string; artist: string; playQueueItemID?: string }[] = videoActive
     ? episodes.map(episode => ({ id: episode.id, title: episodeLabel(episode), artist: episode.grandparentTitle || '' }))
     : queue;
   const activeQueueIndex = videoActive ? episodeIndex : queueIndex;
@@ -122,6 +130,13 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
   useEffect(() => {
     setShowQueue(false);
   }, [videoActive]);
+
+  useEffect(() => {
+    if (!activeQueue.length) {
+      pendingQueueFocusId.current = null;
+      setShowQueue(false);
+    }
+  }, [activeQueue.length]);
 
   useEffect(() => {
     if (!showQueue || !pendingQueueFocusId.current) return;
@@ -183,8 +198,20 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
   const isPaused = videoActive ? !isPlaying : playbackState === 'paused';
   const isStopped = playbackState === 'stopped';
 
-  const artwork = video ? video.poster || video.thumb : track?.thumb;
+  const musicArtKey = track ? `${track.sourceServerId || ''}:${track.id}:${track.thumb}` : '';
+  const needsArtworkRelay = !videoActive && !!musicArtKey && (!track?.thumb || failedMusicArt === musicArtKey);
+  const artwork = video ? video.poster || video.thumb
+    : needsArtworkRelay ? relayedMusicArt.key === musicArtKey ? relayedMusicArt.src : '' : track?.thumb;
   const subtitle = video ? video.grandparentTitle || video.parentTitle : [track?.artist, track?.album].filter(Boolean).join(' · ');
+
+  useEffect(() => {
+    if (!needsArtworkRelay || !track?.id) return;
+    let active = true;
+    void loadMusicArtwork(track.id, track.sourceServerId).then(src => {
+      if (active) setRelayedMusicArt({ key: musicArtKey, src });
+    });
+    return () => { active = false; };
+  }, [needsArtworkRelay, musicArtKey, track?.id, track?.sourceServerId, loadMusicArtwork]);
 
   const showPlayerTop = () => {
     window.requestAnimationFrame(() => headingRef.current?.scrollIntoView({ block: 'start', inline: 'nearest' }));
@@ -208,10 +235,11 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
 
   const shuffleAllSongs = async () => {
     if (shufflingAll) return;
-    const playbackToken = remoteMode ? undefined : beginPlaybackRequest();
     setShufflingAll(true);
     setShuffleError('');
     try {
+      const playerId = await readMusicPlaybackTarget();
+      const playbackToken = playerId ? undefined : beginPlaybackRequest();
       const sectionsResult: any = await call('get_library_sections');
       if (sectionsResult?.error) throw new Error(sectionsResult.error);
       const section = sectionsResult?.sections?.[0];
@@ -230,8 +258,8 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
       const queue: ReturnType<typeof toTrack>[] = (firstPage.items || []).filter((item: any) => item.type === 'track').map(toTrack);
       if (!queue.length) throw new Error('No songs were found in your music library.');
 
-      if (remoteMode) {
-        const result = await playRemoteQueue(queue, queue[0]?.id);
+      if (playerId) {
+        const result = await playRemoteQueue(playerId, queue, queue[0]?.id);
         if (!result.success) throw new Error(result.error || 'Could not start shuffled playback.');
       } else {
         const seenIds = new Set(queue.map(item => item.id));
@@ -266,8 +294,9 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
 
   // Status: green=playing, orange=paused, blue=ready (default), red=error
   const hasTrack = !!(video || track);
-  const canPlay = videoActive ? (pip ? !pip.busy : !!viewer?.ready) : hasTrack || remoteMode || queue.length > 0;
-  const canStop = videoActive || (hasTrack && !isStopped);
+  const canPlay = videoActive ? (pip ? !pip.busy : !!viewer?.ready)
+    : remoteMode ? hasTrack && !isStopped && !playbackPending : hasTrack || queue.length > 0;
+  const canStop = videoActive || (hasTrack && !isStopped && (!remoteMode || !musicPending));
   const canSeek = videoActive ? canPlay && duration > 0 : hasTrack;
   const canSkipPrevious = videoActive ? canSelectEpisode && !!previousEpisode : hasTrack;
   const canSkipNext = videoActive ? canSelectEpisode && !!nextEpisode : hasTrack;
@@ -369,8 +398,13 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
           >
             {artwork ? (
               <img
+                key={artwork}
                 src={artwork}
                 alt=""
+                onError={videoActive ? undefined : () => {
+                  if (needsArtworkRelay) setRelayedMusicArt({ key: musicArtKey, src: '' });
+                  else setFailedMusicArt(musicArtKey);
+                }}
                 style={{ width: '100%', height: '100%', objectFit: 'cover' }}
               />
             ) : (
@@ -462,8 +496,9 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
           <Button ref={playPauseRef} preferredFocus={!maintainControlPosition}
             aria-label={isPlaying ? 'Pause' : 'Play'}
             onClick={() => {
-              if (pip) { if (canPlay) toggleGamePipPlayback(); }
-              else if (viewer) { if (canPlay) viewer.toggle(); }
+              if (!canPlay) return;
+              if (pip) toggleGamePipPlayback();
+              else if (viewer) viewer.toggle();
               else if (isPlaying) pause();
               else if (hasTrack || remoteMode) play();
               else if (queue.length) playQueueIndex(Math.max(0, queueIndex));
@@ -518,9 +553,15 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
               {activeQueue.slice(Math.max(0, activeQueueIndex)).map((queuedTrack, index) => {
                 const actualIndex = Math.max(0, activeQueueIndex) + index;
                 const current = actualIndex === activeQueueIndex;
-                return <Button key={videoActive ? queuedTrack.id : `${queuedTrack.id}-${actualIndex}`} ref={(element: HTMLDivElement | null) => { if (element) element.dataset.queueTrackId = queuedTrack.id; }} onClick={() => playQueueEntry(actualIndex)}
-                  onSecondaryActionDescription={videoActive && (current || !canSelectEpisode) ? undefined : 'Remove from queue'}
-                  onSecondaryButton={videoActive && (current || !canSelectEpisode) ? undefined : event => {
+                const canEdit = videoActive ? !current && canSelectEpisode
+                  : remoteMode ? remoteQueueEditable && !musicPending && !current && !!queuedTrack.playQueueItemID : true;
+                const canPlayEntry = videoActive ? canSelectEpisode : !remoteMode;
+                const queueKey = videoActive ? queuedTrack.id
+                  : remoteMode && queuedTrack.playQueueItemID ? queuedTrack.playQueueItemID : `${queuedTrack.id}-${actualIndex}`;
+                return <Button key={queueKey} ref={(element: HTMLDivElement | null) => { if (element) element.dataset.queueTrackId = queuedTrack.id; }}
+                  aria-disabled={!canPlayEntry} onClick={canPlayEntry ? () => playQueueEntry(actualIndex) : undefined}
+                  onSecondaryActionDescription={canEdit ? 'Remove from queue' : undefined}
+                  onSecondaryButton={!canEdit ? undefined : event => {
                     event.preventDefault();
                     event.stopPropagation();
                     removeQueueEntry(queuedTrack.id, actualIndex);
@@ -538,6 +579,7 @@ export function QuickPlayer({ onLogin, onBrowse, onExpandPip, children }: {
       <PanelSectionRow>
         <div style={{ ...rowInset, paddingBlock: '0.55rem 0.2rem' }}>
           <SliderField
+            key={`${volumeSource}:${volumeSliderRevision}`}
             label="Volume"
             layout="below"
             childrenContainerWidth="max"

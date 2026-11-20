@@ -45,11 +45,13 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 - Partially watched movies and the **Play series** and **Play season** actions offer **Resume** or **Start from beginning** when Plex has a saved starting point. Opening a single episode queues it through the end of its season. The next queued episode plays automatically in fullscreen and PiP. Press **X** on an upcoming episode in the Quick Player queue to remove it, or on an episode in the browser while a show is playing to play it next.
 - Set grid columns under **Settings > Interface > Library browser**.
 - Open **Settings** to sign in to Plex and select a server.
-- Select a remote player in **Settings > Players** to send playback and controls to Plexamp or another online Plex client.
+- Choose a device under **Settings > Players > Playback target** to send music to Plexamp or another online Plex client. Quick Player follows the player's shared queue when it is available. Queue edits require permission from Plex.
 
 ### Using Plexamp on a phone as a remote
 
 DeckyPlex advertises a local Plex Companion player endpoint and routes received track, playback, seek, and volume commands to the Decky audio engine. Incoming playback uses the Plex server selected in Settings. Plex Companion discovery requires the devices to share a local network; GDM uses UDP discovery and the receiver uses TCP 32435. The receiver status appears in **Settings > Players**.
+
+With the receiver enabled, DeckyPlex publishes the current song and upcoming music to Plex. Select DeckyPlex as the player in Plexamp to use **Play Next** with the shared queue. Turning on the receiver during a song shares the queue at the current playback position.
 
 ## Development
 
