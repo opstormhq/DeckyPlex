@@ -9,26 +9,32 @@ import {
   TextField,
   Spinner,
   ModalRoot,
-  ConfirmModal,
   Navigation,
   GamepadButton,
   showModal,
   type GamepadEvent,
 } from '@decky/ui';
 import { call, toaster } from '@decky/api';
-import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay, FaFilm, FaImage, FaHome } from 'react-icons/fa';
+import {
+  FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay, FaFilm, FaImage, FaHome, FaBars,
+  FaStepForward, FaListOl, FaPlus, FaMinus,
+  FaSortAlphaDown, FaSortAlphaUp, FaClock, FaCalendarAlt, FaTrash, FaArrowLeft,
+} from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 import { InlineSpinner } from './InlineSpinner';
 import { gamePipFullscreenEvent, getEpisodeQueue, queueGamePipEpisodeNext, stopGamePip, takeGamePipFullscreen,
   useGamePipEpisodeQueue, videoProgressEvent, type VideoItem, type VideoResume } from './GamePip';
 import { MediaViewer, type VideoPresentation } from './MediaViewer';
 import { showPlaybackStartDialog } from './PlaybackStartDialog';
+import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
+import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
 import { collectionResumes, episodeLabel, insertNextEpisode, queueFromEpisode, resumeEpisode, resumePosition } from './VideoQueue';
 
 interface LibraryItem {
   id: string;
   key: string;
   title: string;
+  titleSort?: string;
   type: string;
   thumb?: string;
   poster?: string;
@@ -72,7 +78,10 @@ const browserHeaderStyle: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: '0.5rem', height: '2.65rem',
   paddingInline: '0.35rem', marginBottom: '0.5rem', boxSizing: 'border-box',
 };
+const browserHeaderScrollMargin = `calc(${browserHeaderStyle.height} + ${browserHeaderStyle.marginBottom} + 0.5rem)`;
 const DEFAULT_GRID_COLUMNS = 6;
+const BROWSER_FOOTER_CLEARANCE = 150;
+const ALPHABET_HOLD_DELAY = 450;
 const PAGE_SIZE = 36;
 const LIBRARY_CACHE_TTL = 600000;
 const VIDEO_HOME_ROWS = [
@@ -83,11 +92,16 @@ const VIDEO_HOME_ROWS = [
   { id: 'watchlist', title: 'Watchlist', ttl: 60000 },
 ] as const;
 const VIDEO_SORTS = [
-  { id: 'titleSort:asc', title: 'Title A–Z' },
-  { id: 'titleSort:desc', title: 'Title Z–A' },
-  { id: 'addedAt:desc', title: 'Recently added' },
-  { id: 'originallyAvailableAt:desc', title: 'Newest release' },
+  { id: 'titleSort:asc', title: 'Title A–Z', Icon: FaSortAlphaDown },
+  { id: 'titleSort:desc', title: 'Title Z–A', Icon: FaSortAlphaUp },
+  { id: 'addedAt:desc', title: 'Recently added', Icon: FaClock },
+  { id: 'originallyAvailableAt:desc', title: 'Newest release', Icon: FaCalendarAlt },
 ];
+
+function alphabetGroup(title: string) {
+  const initial = title.trimStart().normalize('NFD').replace(/^\p{M}+/u, '').charAt(0).toUpperCase();
+  return /^[A-Z]$/.test(initial) ? initial : '#';
+}
 type VideoHomeRow = typeof VIDEO_HOME_ROWS[number]['id'];
 type VideoHomeData = Partial<Record<VideoHomeRow, { items: LibraryItem[]; error?: string }>>;
 
@@ -161,6 +175,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const contentRef = useRef<HTMLDivElement | null>(null);
   const moreItemsRef = useRef<HTMLDivElement | null>(null);
   const focusScrollFrame = useRef(0);
+  const fastVerticalNavigation = useRef(false);
+  const contentScrollAnimation = useRef<{ top: number; frame: number } | null>(null);
+  const alphabetOverlayRef = useRef<HTMLDivElement | null>(null);
+  const alphabetHold = useRef<{ button: GamepadButton; item: HTMLElement; timer: number | null } | null>(null);
   const searchFormRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
@@ -175,13 +193,44 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const enterContentPending = useRef(false);
   const viewerOrigin = useRef<{ itemId?: string; scrollTop: number }>({ scrollTop: 0 });
 
+  const cancelContentScroll = useCallback(() => {
+    if (contentScrollAnimation.current) window.cancelAnimationFrame(contentScrollAnimation.current.frame);
+    contentScrollAnimation.current = null;
+  }, []);
+
+  const hideAlphabetOverlay = useCallback(() => {
+    const hold = alphabetHold.current;
+    if (hold?.timer != null) window.clearTimeout(hold.timer);
+    alphabetHold.current = null;
+    const overlay = alphabetOverlayRef.current;
+    if (overlay && !overlay.hidden) overlay.hidden = true;
+  }, []);
+
+  const updateAlphabetOverlay = useCallback((item: HTMLElement) => {
+    const hold = alphabetHold.current;
+    if (!hold) return;
+    const overlay = alphabetOverlayRef.current;
+    const title = item.dataset.browserSortTitle;
+    if (!title || !contentRef.current?.contains(item)) {
+      hideAlphabetOverlay();
+      return;
+    }
+    hold.item = item;
+    if (!overlay || hold.timer != null) return;
+    const label = alphabetGroup(title);
+    if (overlay.textContent !== label) overlay.textContent = label;
+    overlay.hidden = false;
+  }, [hideAlphabetOverlay]);
+
   const invalidateTabLoad = useCallback(() => {
+    cancelContentScroll();
+    hideAlphabetOverlay();
     loadingMoreRef.current = false;
     lastCollectionItem.current = null;
     setLoadingMore(false);
     setPaginationError('');
     return ++tabLoadRequestId.current;
-  }, []);
+  }, [cancelContentScroll, hideAlphabetOverlay]);
 
   const selectTab = useCallback((tab: BrowserTab) => {
     if (tab === activeTabRef.current) return;
@@ -219,32 +268,31 @@ const LibraryBrowser = memo(function LibraryBrowser({
   }, [selectTab, subView, invalidateTabLoad]);
 
   const keepFocusedElementVisible = (element: HTMLElement, sidebar = false) => {
+    cancelContentScroll();
+    hideAlphabetOverlay();
     window.cancelAnimationFrame(focusScrollFrame.current);
     focusScrollFrame.current = window.requestAnimationFrame(() => {
       const viewport = sidebar ? sidebarRef.current : contentRef.current;
       if (!viewport || !viewport.contains(element) || element !== document.activeElement) return;
-      const item = element.closest<HTMLElement>('[data-browser-item-id]') || element;
-      const itemRect = item.getBoundingClientRect();
+      const itemRect = element.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
-      const edgePadding = 28;
-      const firstGridRow = !sidebar && gridView && Number(item.dataset.browserItemIndex) < gridColumns
-        && (!homeView || item.hasAttribute('data-browser-home-start'));
       // Steam overlays a footer on the bottom of routed plugin views. Keep a
-      // generous safe area there so focused cards and the last track stay readable.
-      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? 110 : 150));
-      if (firstGridRow) {
-        viewport.scrollTop = 0;
-      } else if (itemRect.bottom > visibleBottom - edgePadding) {
-        viewport.scrollTop += itemRect.bottom - (visibleBottom - edgePadding);
-      } else if (itemRect.top < viewportRect.top + edgePadding) {
-        viewport.scrollTop -= (viewportRect.top + edgePadding) - itemRect.top;
-      }
-      const itemId = item.dataset.browserItemId;
-      if (!sidebar && itemId && !subView) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: viewport.scrollTop });
+      // safe area for the sidebar and header controls.
+      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? 110 : BROWSER_FOOTER_CLEARANCE));
+      const edgePadding = 28;
+      const bottomOverflow = itemRect.bottom - (visibleBottom - edgePadding);
+      const topOverflow = viewportRect.top + edgePadding - itemRect.top;
+      const offset = bottomOverflow > 0 ? bottomOverflow : -Math.max(0, topOverflow);
+      if (offset === 0) return;
+      if (sidebar) viewport.scrollTop += offset;
+      else viewport.scrollBy({ top: offset, behavior: 'smooth' });
     });
   };
 
-  useEffect(() => () => window.cancelAnimationFrame(focusScrollFrame.current), []);
+  useEffect(() => () => {
+    window.cancelAnimationFrame(focusScrollFrame.current);
+    cancelContentScroll();
+  }, [cancelContentScroll]);
 
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cache = itemCache.current;
@@ -376,18 +424,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
         const result: any = await call("get_settings");
         if (!active || id !== requestId) return;
         const savedColumns = Number(result.grid_columns);
-        setGridPreferenceSet(Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9);
+        const validColumns = Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9;
+        setGridPreferenceSet(validColumns);
         if (!gridDialogRef.current) {
-          if (Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9) {
-            setGridColumns(savedColumns);
-          } else {
-            try {
-              const previousColumns = Number(window.localStorage.getItem('deckyplex-grid-columns'));
-              if (Number.isInteger(previousColumns) && previousColumns >= 3 && previousColumns <= 8) {
-                setGridColumns(previousColumns);
-              }
-            } catch {}
-          }
+          setGridColumns(validColumns ? savedColumns : DEFAULT_GRID_COLUMNS);
         }
         setShowAllMedia(Boolean(result.browse_all_media));
         setOverGamePip(result.over_game_pip === true);
@@ -487,7 +527,6 @@ const LibraryBrowser = memo(function LibraryBrowser({
     if (result?.error) throw new Error(result.error);
     setGridColumns(columns);
     setGridPreferenceSet(true);
-    try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
   }, []);
 
   const openGridColumnsDialog = useCallback(() => {
@@ -653,15 +692,15 @@ const LibraryBrowser = memo(function LibraryBrowser({
       setRestoreFocusTick(value => value + 1);
     };
     const dialog = showModal(
-      <ModalRoot closeModal={() => close()} onCancel={() => close()}>
-        <PanelSection title="Sort by">
-          {VIDEO_SORTS.map(sort => <PanelSectionRow key={sort.id}>
-            <Button preferredFocus={sort.id === sorting} aria-pressed={sort.id === sorting}
-              onClick={() => close(sort.id)} style={{ width: '100%', textAlign: 'left' }}>
-              {sort.title}{sort.id === sorting ? ' ✓' : ''}
-            </Button>
-          </PanelSectionRow>)}
-        </PanelSection>
+      <ModalRoot closeModal={() => close()} onCancel={() => close()} onOK={() => {}}>
+        <ChoiceDialogBody title="Sort by">
+          <ChoiceDialogList>
+            {VIDEO_SORTS.map(({ id, title, Icon }) => (
+              <ChoiceDialogRow key={id} title={title} icon={<Icon />} preferredFocus={id === sorting}
+                selected={id === sorting} badge={id === sorting ? 'Selected' : undefined} onChoose={() => close(id)} />
+            ))}
+          </ChoiceDialogList>
+        </ChoiceDialogBody>
       </ModalRoot>, window, { strTitle: 'Sort library', bNeverPopOut: true, fnOnClose: clearDialog },
     );
     actionDialogRef.current = dialog;
@@ -1243,6 +1282,67 @@ const LibraryBrowser = memo(function LibraryBrowser({
     || (!subView && (!!sectionForTab(activeTab) || ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab)));
   const videoCollection = subView?.mediaType === 'show' || subView?.mediaType === 'season';
   const hasCollectionAction = videoCollection || subView?.type === 'albums' || subView?.type === 'tracks';
+  const alphabeticallySorted = subView ? subView.type === 'albums'
+    : shelf ? sorting.startsWith('titleSort:') : ['artists', 'albums', 'tracks', 'playlists'].includes(activeTab);
+
+  // Steam calls this before positioning its focus ring. A handled scroll
+  // replaces its default scroll, including when gamepad focus is virtual.
+  const itemScroll = {
+    ...focusOutlineProps,
+    fnScrollIntoViewHandler: (focused: { Element?: HTMLElement }, previous?: { Element?: HTMLElement }) => {
+      const viewport = contentRef.current;
+      const item = focused.Element;
+      if (!item || !viewport?.contains(item) || !viewport.offsetHeight) return false;
+      window.cancelAnimationFrame(focusScrollFrame.current);
+
+      const firstRow = Number(item.dataset.browserItemIndex) < (gridView ? gridColumns : 1)
+        && (!homeView || item.hasAttribute('data-browser-home-start'));
+      const viewportRect = viewport.getBoundingClientRect();
+      const itemRect = item.getBoundingClientRect();
+      const scale = viewportRect.height / viewport.offsetHeight;
+      if (scale <= 0) return false;
+      const itemCenter = viewport.scrollTop + ((itemRect.top + itemRect.bottom) / 2 - viewportRect.top) / scale;
+      const visibleHeight = Math.max(0, viewport.clientHeight - BROWSER_FOOTER_CLEARANCE);
+      const viewportCenter = viewport.clientTop + visibleHeight / 2;
+      const maxScroll = viewport.scrollHeight - viewport.clientHeight;
+      const top = firstRow ? 0 : Math.max(0, Math.min(maxScroll, itemCenter - viewportCenter));
+      const movingBetweenItems = !!previous?.Element?.closest('[data-browser-item-id]') && viewport.contains(previous.Element);
+      const activeScroll = contentScrollAnimation.current;
+      if (!activeScroll || Math.abs(activeScroll.top - top) > 1) {
+        cancelContentScroll();
+        const startTop = viewport.scrollTop;
+        const distance = top - startTop;
+        if (movingBetweenItems && Math.abs(distance) > 1 && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+          const duration = fastVerticalNavigation.current || activeScroll ? 90 : 210;
+          const started = performance.now();
+          const animation = { top, frame: 0 };
+          const step = (time: number) => {
+            const progress = Math.max(0, Math.min(1, (time - started) / duration));
+            viewport.scrollTop = startTop + distance * (1 - (1 - progress) ** 3);
+            if (progress < 1) animation.frame = window.requestAnimationFrame(step);
+            else contentScrollAnimation.current = null;
+          };
+          contentScrollAnimation.current = animation;
+          animation.frame = window.requestAnimationFrame(step);
+        } else {
+          viewport.scrollTop = top;
+        }
+      }
+      updateAlphabetOverlay(item);
+
+      const itemId = item.dataset.browserItemId;
+      if (!subView && itemId) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: top });
+      return true;
+    },
+  };
+
+  const scrollContentToTop = useCallback(() => {
+    const viewport = contentRef.current;
+    if (!viewport) return;
+    window.cancelAnimationFrame(focusScrollFrame.current);
+    cancelContentScroll();
+    viewport.scrollTo({ top: 0, behavior: 'instant' });
+  }, [cancelContentScroll]);
 
   const moveBetweenItems = (event: GamepadEvent, index: number) => {
     const { button } = event.detail;
@@ -1260,11 +1360,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
     event.preventDefault();
     event.stopImmediatePropagation();
     if (!items.length) return;
-    if (contentRef.current) contentRef.current.scrollTop = 0;
+    scrollContentToTop();
     firstItemRef.current?.focus({ preventScroll: true });
   };
 
   const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false) => {
+    const sortTitle = alphabeticallySorted ? item.titleSort || item.title : undefined;
     const kind = item.type;
     const showPoster = homeView && kind === 'episode';
     const originalImage = showPoster ? item.poster : kind === 'artist' ? item.art || item.thumb : item.thumb || item.art;
@@ -1293,9 +1394,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
       }
     };
     const focusItem = () => {
+      focusZone.current = 'content';
       focusedItemId.current = item.id;
       if (subView) return;
-      tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
+      if (tabFocusPositions.current.get(activeTab)?.itemId !== item.id) {
+        tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
+      }
       if (!paginationError && idx >= items.length - (gridView ? gridColumns * 2 : 6)) void loadMoreTabPage();
     };
     if (gridView) {
@@ -1305,8 +1409,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
           ref={idx === 0 ? firstItemRef : undefined}
           data-browser-item-id={item.id}
           data-browser-item-index={idx}
+          data-browser-sort-title={sortTitle}
+          data-browser-card=""
           data-browser-home-start={firstHomeRow || undefined}
           onFocus={focusItem}
+          onGamepadFocus={focusItem}
+          {...itemScroll}
           onActivate={onClick}
           onClick={onClick}
           onCancel={handleCancel}
@@ -1316,7 +1424,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
             event.stopPropagation();
             openPlaylistOptions(item);
           } : canQueueNext ? queueNext : sortable ? openSortMenu : undefined}
-          style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0 0.35rem 0.35rem', gap: '0.3rem' }}
+          style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0 0.35rem 0.35rem', gap: '0.3rem',
+            scrollMarginTop: idx < gridColumns && (!homeView || firstHomeRow) ? browserHeaderScrollMargin : undefined }}
         >
           <div style={{ width: '100%', aspectRatio: portrait ? '2 / 3'
               : ['episode', 'clip'].includes(kind) ? '16 / 9' : '1 / 1',
@@ -1393,7 +1502,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
             )}
       </div>
     );
-    const rowStyle = { display: 'block', width: '100%', boxSizing: 'border-box' as const, padding: '0.1rem 0.35rem', borderBottom: '1px solid rgba(255,255,255,0.08)' };
+    const rowStyle = { display: 'block', width: '100%', boxSizing: 'border-box' as const, padding: '0.2rem 0.35rem',
+      borderBottom: '1px solid rgba(255,255,255,0.08)', scrollMarginTop: idx === 0 ? browserHeaderScrollMargin : undefined };
     if (item.type === 'track') {
       const trackInfo = { id: item.id, sectionId: item.sectionId || selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: item.thumb || '' };
       return (
@@ -1402,7 +1512,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
             ref={idx === 0 ? firstItemRef : undefined}
             data-browser-item-id={item.id}
             data-browser-item-index={idx}
+            data-browser-sort-title={sortTitle}
             onFocus={focusItem}
+            onGamepadFocus={focusItem}
+            {...itemScroll}
             onActivate={onClick}
             onClick={onClick}
             onCancel={handleCancel}
@@ -1422,7 +1535,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     }
     return (
       <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id} data-browser-item-index={idx}
-        onFocus={focusItem}
+        data-browser-sort-title={sortTitle}
+        onFocus={focusItem} onGamepadFocus={focusItem} {...itemScroll}
         onActivate={onClick} onClick={onClick}
         onCancel={handleCancel} onGamepadDirection={(event) => moveBetweenItems(event, idx)}
         onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : canQueueNext ? 'Play next' : sortable ? 'Sort by' : undefined}
@@ -1623,13 +1737,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const hasVideoHome = videoLibraries.some(library => library.type === 'movie' || library.type === 'show');
   const tabs: { key: BrowserTab; title: string; icon: React.ReactNode }[] = [
     ...(selectedSection || !libraries.length ? musicTabs : []),
-    { key: 'search', title: 'Search', icon: <FaSearch /> },
     ...(hasVideoHome ? [{ key: 'videoHome' as const, title: 'Home', icon: <FaHome /> }] : []),
     ...videoLibraries.map((library): { key: LibraryTab; title: string; icon: React.ReactNode } => ({
       key: `library:${library.id}`,
       title: library.name,
       icon: library.type === 'photo' ? <FaImage /> : <FaFilm />,
     })),
+    { key: 'search', title: 'Search', icon: <FaSearch /> },
   ];
 
   useEffect(() => {
@@ -1671,8 +1785,33 @@ const LibraryBrowser = memo(function LibraryBrowser({
         firstItemRef.current?.focus({ preventScroll: true });
       }
     };
+    let lastVerticalPress = -Infinity;
+    const recordVerticalPress = (button: GamepadButton | undefined, repeat: boolean, target: EventTarget | null) => {
+      if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) {
+        fastVerticalNavigation.current = false;
+        hideAlphabetOverlay();
+        return;
+      }
+      const now = performance.now();
+      fastVerticalNavigation.current = repeat || now - lastVerticalPress < 225;
+      lastVerticalPress = now;
+      if (alphabetHold.current?.button === button) return;
+      hideAlphabetOverlay();
+
+      // Steam can dispatch focus events from the separate Gaming Mode window.
+      const item = (target as Element | null)?.closest?.<HTMLElement>('[data-browser-sort-title]');
+      if (!item || !contentRef.current?.contains(item)) return;
+      const hold: NonNullable<typeof alphabetHold.current> = { button, item, timer: null };
+      alphabetHold.current = hold;
+      hold.timer = window.setTimeout(() => {
+        if (alphabetHold.current !== hold) return;
+        hold.timer = null;
+        updateAlphabetOverlay(hold.item);
+      }, ALPHABET_HOLD_DELAY);
+    };
     const onButtonDown = (event: Event) => {
       const detail = (event as GamepadEvent).detail;
+      recordVerticalPress(detail?.button, detail?.is_repeat === true, event.target);
       if (detail?.button === GamepadButton.START && connected && !gridDialogRef.current && !actionDialogRef.current) {
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -1682,16 +1821,40 @@ const LibraryBrowser = memo(function LibraryBrowser({
       moveAtBoundary(event, detail?.button);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'ArrowUp') moveAtBoundary(event, GamepadButton.DIR_UP);
-      if (event.key === 'ArrowDown') moveAtBoundary(event, GamepadButton.DIR_DOWN);
+      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+      const button = event.key === 'ArrowUp' ? GamepadButton.DIR_UP : GamepadButton.DIR_DOWN;
+      recordVerticalPress(button, event.repeat, event.target);
+      moveAtBoundary(event, button);
     };
+    const endRepeat = () => {
+      fastVerticalNavigation.current = false;
+      hideAlphabetOverlay();
+    };
+    const releaseDirection = (button?: GamepadButton) => {
+      if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
+      if (!alphabetHold.current || alphabetHold.current.button === button) endRepeat();
+    };
+    const onButtonUp = (event: Event) => releaseDirection((event as GamepadEvent).detail?.button);
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowUp') releaseDirection(GamepadButton.DIR_UP);
+      else if (event.key === 'ArrowDown') releaseDirection(GamepadButton.DIR_DOWN);
+    };
+    const ownerDocument = browser.ownerDocument;
+    const ownerWindow = ownerDocument.defaultView;
     browser.addEventListener('vgp_onbuttondown', onButtonDown, true);
     browser.addEventListener('keydown', onKeyDown, true);
+    ownerDocument.addEventListener('vgp_onbuttonup', onButtonUp, true);
+    ownerDocument.addEventListener('keyup', onKeyUp, true);
+    ownerWindow?.addEventListener('blur', endRepeat);
     return () => {
       browser.removeEventListener('vgp_onbuttondown', onButtonDown, true);
       browser.removeEventListener('keydown', onKeyDown, true);
+      ownerDocument.removeEventListener('vgp_onbuttonup', onButtonUp, true);
+      ownerDocument.removeEventListener('keyup', onKeyUp, true);
+      ownerWindow?.removeEventListener('blur', endRepeat);
+      endRepeat();
     };
-  }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch]);
+  }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, activeTab, sorting, hideAlphabetOverlay, updateAlphabetOverlay]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -1725,13 +1888,20 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
   const browser = !viewerExpanded && (
     <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
+      <FocusOutlineStyles />
+      <style>{`
+        [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
+        [data-browser-alphabet]:not([hidden]) { display: grid; place-items: center; }
+      `}</style>
     <div
       ref={browserRef}
       onFocusCapture={(event) => {
         if (!(event.target instanceof HTMLElement)) return;
         const inSidebar = !!event.target.closest('[data-browser-zone="sidebar"]');
         focusZone.current = inSidebar ? 'sidebar' : 'content';
-        keepFocusedElementVisible(event.target, inSidebar);
+        if (inSidebar || !event.target.closest('[data-browser-item-id]')) {
+          keepFocusedElementVisible(event.target, inSidebar);
+        }
       }}
       style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0,
         overflow: 'hidden' }}
@@ -1760,13 +1930,29 @@ const LibraryBrowser = memo(function LibraryBrowser({
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
               <span style={{ fontWeight: 400, fontSize: '0.85rem', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{title}</span>
+              {tab === 'search' && connected && (
+                <span role="img" aria-label="Start button shortcut" title="Start button shortcut"
+                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginLeft: 'auto',
+                    width: '1.2rem', height: '1rem', border: '1px solid rgba(255,255,255,0.3)', borderRadius: '4px', fontSize: '0.65rem' }}>
+                  <FaBars aria-hidden="true" />
+                </span>
+              )}
             </Focusable>
             </Fragment>
           ))}
         </Focusable>
       </div>
-        <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.5rem 0.5rem 150px 0', boxSizing: 'border-box', scrollPaddingBottom: '150px' }}>
-        {renderContent()}
+      <div style={{ position: 'relative', flex: 1, minWidth: 0, minHeight: 0 }}>
+        <div data-browser-zone="content" ref={contentRef}
+          onWheel={cancelContentScroll} onPointerDown={cancelContentScroll}
+          style={{ height: '100%', overflowY: 'auto', scrollBehavior: 'auto', padding: `0.5rem 0.5rem ${BROWSER_FOOTER_CLEARANCE}px 0`,
+            boxSizing: 'border-box', scrollPaddingTop: '28px', scrollPaddingBottom: `${BROWSER_FOOTER_CLEARANCE}px` }}>
+          {renderContent()}
+        </div>
+        <div ref={alphabetOverlayRef} data-browser-alphabet="" hidden aria-hidden="true"
+          style={{ position: 'absolute', inset: 0, paddingBottom: BROWSER_FOOTER_CLEARANCE, zIndex: 2, pointerEvents: 'none',
+            background: 'rgba(12, 16, 21, 0.55)', backdropFilter: 'blur(4px)', color: '#fff',
+            fontSize: 'clamp(4rem, 12vw, 8rem)', fontWeight: 700 }} />
       </div>
     </div>
     </Focusable>
@@ -1838,9 +2024,10 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
   };
   return (
     <ModalRoot closeModal={cancel} onCancel={cancel} onOK={confirm} bDisableBackgroundDismiss={saving}>
-      <PanelSection title="Choose grid width">
-        <PanelSectionRow>
+      <ChoiceDialogBody title="Choose grid width">
+        <ChoiceDialogList>
           <Focusable
+            {...focusOutlineProps}
             flow-children="horizontal"
             onGamepadDirection={handleDirection}
             onActivate={confirm}
@@ -1861,7 +2048,8 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
                 void confirm();
               }
             }}
-            style={{ width: '100%', padding: '0.55rem 0.7rem', borderRadius: '4px', background: 'rgba(255,255,255,0.06)' }}
+            style={{ boxSizing: 'border-box', padding: '0.65rem 0.8rem', borderRadius: '0.5rem',
+              border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)' }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem' }}>
               <span>Grid columns</span><strong>{columns}</strong>
@@ -1872,7 +2060,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
               ))}
             </div>
           </Focusable>
-        </PanelSectionRow>
+        </ChoiceDialogList>
         <PanelSectionRow>
           <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.8rem' }}>
             <DialogBodyText style={{ opacity: 0.7, margin: 0 }}>Change anytime in Settings › Interface.</DialogBodyText>
@@ -1883,7 +2071,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
           </div>
         </PanelSectionRow>
         {error && <PanelSectionRow><DialogBodyText>{error}</DialogBodyText></PanelSectionRow>}
-      </PanelSection>
+      </ChoiceDialogBody>
     </ModalRoot>
   );
 }
@@ -1893,56 +2081,60 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
   onDeleted: (playlistId: string) => void;
   onClose: () => void;
 }) {
+  const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const deleting = useRef(false);
+  const actionRef = useRef<HTMLDivElement>(null);
 
-  const confirmDelete = () => {
-    let confirmation: { Close: () => void } | null = null;
-    const closeConfirmation = () => confirmation?.Close();
-    const deletePlaylist = async () => {
-      if (busy) return;
-      setBusy(true);
-      try {
-        const result: any = await call('delete_audio_playlist', playlist.id);
-        if (!result?.success) throw new Error(result?.error || 'Could not delete playlist.');
-        closeConfirmation();
-        onDeleted(playlist.id);
-      } catch (error: any) {
-        setMessage(error?.message || 'Could not delete playlist.');
-        closeConfirmation();
-      } finally {
-        setBusy(false);
-      }
-    };
-    confirmation = showModal(
-      <ConfirmModal
-        strTitle="Delete Playlist"
-        strDescription={`Delete “${playlist.title}”? This cannot be undone.`}
-        strOKButtonText="Delete Playlist"
-        strCancelButtonText="Keep Playlist"
-        bAlertDialog
-        bDestructiveWarning
-        onOK={() => { void deletePlaylist(); }}
-        onCancel={closeConfirmation}
-        closeModal={closeConfirmation}
-      />,
-      window,
-      { strTitle: 'Delete Playlist', bNeverPopOut: true },
-    );
+  useEffect(() => {
+    if (busy) return;
+    const frame = window.requestAnimationFrame(() => actionRef.current?.focus({ preventScroll: true }));
+    return () => window.cancelAnimationFrame(frame);
+  }, [confirming, busy]);
+
+  const deletePlaylist = async () => {
+    if (deleting.current) return;
+    deleting.current = true;
+    setBusy(true);
+    try {
+      const result: any = await call('delete_audio_playlist', playlist.id);
+      if (!result?.success) throw new Error(result?.error || 'Could not delete playlist.');
+      onDeleted(playlist.id);
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not delete playlist.');
+      setConfirming(false);
+    } finally {
+      deleting.current = false;
+      setBusy(false);
+    }
+  };
+
+  const cancel = () => {
+    if (deleting.current) return;
+    if (confirming) setConfirming(false);
+    else onClose();
   };
 
   return (
-    <ModalRoot closeModal={onClose} onCancel={onClose}>
-      <PanelSection title={playlist.title}>
-        <PanelSectionRow><DialogBodyText>{playlist.leafCount ?? 0} tracks</DialogBodyText></PanelSectionRow>
-        <PanelSectionRow>
-          <Button disabled={busy} onClick={confirmDelete} onOKButton={(event) => { event.preventDefault(); confirmDelete(); }}>
-            {busy && <InlineSpinner />}
-            {busy ? 'Deleting…' : 'Delete Playlist'}
-          </Button>
-        </PanelSectionRow>
-        {!!message && <PanelSectionRow><DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
-      </PanelSection>
+    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}} bCancelDisabled={busy} bDisableBackgroundDismiss={busy}>
+      <ChoiceDialogBody title={confirming ? 'Delete Playlist' : playlist.title}
+        subtitle={confirming ? `Permanently delete “${playlist.title}”?` : `${playlist.leafCount ?? 0} tracks`}>
+        <ChoiceDialogList>
+          {confirming ? <>
+            <ChoiceDialogRow key="keep" title="Keep Playlist" icon={<FaArrowLeft />} rowRef={actionRef} preferredFocus disabled={busy} onChoose={cancel} />
+            <ChoiceDialogRow key="confirm" title="Delete Playlist" icon={<FaTrash />} destructive disabled={busy}
+              onChoose={() => void deletePlaylist()} />
+          </> : <ChoiceDialogRow key="ask" title="Delete Playlist" icon={<FaTrash />} rowRef={actionRef} destructive preferredFocus onChoose={() => {
+            setMessage('');
+            setConfirming(true);
+          }} />}
+        </ChoiceDialogList>
+        {busy && <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+          <InlineSpinner /> Deleting playlist…
+        </div>}
+        {!!message && <DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText>}
+      </ChoiceDialogBody>
     </ModalRoot>
   );
 }
@@ -1960,6 +2152,7 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const playlistKeyboard = useRef<{ HideVirtualKeyboard: () => void } | null>(null);
   const queueActionInProgress = useRef(false);
   const playlistLoadInProgress = useRef(false);
   const playlistActionInProgress = useRef(false);
@@ -2021,14 +2214,16 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   };
 
   const createPlaylist = async () => {
-    if (playlistActionInProgress.current) return;
+    const name = playlistName.trim();
+    if (!name || playlistActionInProgress.current) return;
     playlistActionInProgress.current = true;
     setBusy(true);
     try {
-      const result: any = await call('create_audio_playlist', playlistName, track.id);
+      playlistKeyboard.current?.HideVirtualKeyboard?.();
+      const result: any = await call('create_audio_playlist', name, track.id);
       if (!result?.success) throw new Error(result?.error || 'Could not create playlist.');
-      setMessage(`Created ${result.playlist || playlistName} and added this song.`);
-      setPlaylists(items => [{ id: result.id, key: '', title: result.playlist || playlistName, type: 'playlist' }, ...items]);
+      setMessage(`Created ${result.playlist || name} and added this song.`);
+      setPlaylists(items => [{ id: result.id, key: '', title: result.playlist || name, type: 'playlist' }, ...items]);
       setView('playlists');
       window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId: result.id } }));
     } catch (error: any) {
@@ -2068,34 +2263,58 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
     }
   };
 
+  const showNewPlaylist = () => {
+    setPlaylistName('');
+    setMessage('');
+    setView('new');
+  };
+
   return (
-    <ModalRoot closeModal={onClose} onCancel={handleDialogCancel}>
-      <div ref={menuRef}>
-      <PanelSection key={view} title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
-        <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
-        {view === 'actions' && <>
-          <PanelSectionRow><Button aria-disabled={busy} onClick={() => void queueTrack(true)}
-            onOKButton={event => { event.preventDefault(); if (!event.detail?.is_repeat) void queueTrack(true); }}>Play Next</Button></PanelSectionRow>
-          <PanelSectionRow><Button aria-disabled={busy} onClick={() => void queueTrack(false)}
-            onOKButton={event => { event.preventDefault(); if (!event.detail?.is_repeat) void queueTrack(false); }}>Add to Queue</Button></PanelSectionRow>
-          <PanelSectionRow><Button onClick={() => void showPlaylists()} onOKButton={(event) => { event.preventDefault(); void showPlaylists(); }}>Add to Playlist</Button></PanelSectionRow>
-          {playlistId && <PanelSectionRow><Button disabled={busy} onClick={() => void removeFromPlaylist()} onOKButton={(event) => { event.preventDefault(); void removeFromPlaylist(); }}>Remove from Playlist</Button></PanelSectionRow>}
-        </>}
+    <ModalRoot closeModal={onClose} onCancel={handleDialogCancel} onOK={() => {}}>
+      <ChoiceDialogBody bodyRef={menuRef} key={view}
+        title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}
+        subtitle={view === 'actions' ? [track.artist, track.album].filter(Boolean).join(' · ') : track.title}>
+        {view === 'actions' && <ChoiceDialogList>
+          <ChoiceDialogRow title="Play Next" icon={<FaStepForward />} disabled={busy} onChoose={() => void queueTrack(true)} />
+          <ChoiceDialogRow title="Add to Queue" icon={<FaListOl />} disabled={busy} onChoose={() => void queueTrack(false)} />
+          <ChoiceDialogRow title="Add to Playlist" icon={<FaListUl />} disabled={busy} onChoose={() => void showPlaylists()} />
+          {playlistId && <ChoiceDialogRow title="Remove from Playlist" icon={<FaMinus />} disabled={busy}
+            onChoose={() => void removeFromPlaylist()} />}
+        </ChoiceDialogList>}
         {view === 'playlists' && <>
-          {loading && <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><InlineSpinner /> Loading playlists…</DialogBodyText></PanelSectionRow>}
+          {loading && <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <InlineSpinner /><DialogBodyText style={{ margin: 0 }}>Loading playlists…</DialogBodyText>
+          </div>}
           {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
-          {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)} onOKButton={(event) => { event.preventDefault(); void addToPlaylist(playlist.id); }}>{playlist.title}</Button></PanelSectionRow>)}
-          {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }} onOKButton={(event) => { event.preventDefault(); setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
+          {!loading && <ChoiceDialogList>
+            {playlists.map(playlist => <ChoiceDialogRow key={playlist.id} title={playlist.title} icon={<FaListUl />}
+              actionDescription="Add to playlist" disabled={busy} onChoose={() => void addToPlaylist(playlist.id)} />)}
+            <ChoiceDialogRow title="New Playlist" icon={<FaPlus />} disabled={busy} onChoose={showNewPlaylist} />
+          </ChoiceDialogList>}
         </>}
-        {view === 'new' && <>
-          <PanelSectionRow><TextField label="Playlist name" value={playlistName} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPlaylistName(e.target.value)} /></PanelSectionRow>
-          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()} onOKButton={(event) => { event.preventDefault(); void createPlaylist(); }}>Create Playlist</Button></PanelSectionRow>
-        </>}
+        {view === 'new' && <ChoiceDialogList>
+          <PanelSectionRow>
+            <TextField label="Playlist name" value={playlistName} disabled={busy}
+              {...{
+                refKeyboardHandle: playlistKeyboard,
+                strEnterKeyLabel: 'Create Playlist',
+                onEnterKeyPress: () => { void createPlaylist(); },
+              }}
+              onChange={event => setPlaylistName(event.target.value)}
+              onKeyDown={event => {
+                if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (!event.repeat) void createPlaylist();
+              }} />
+          </PanelSectionRow>
+          <ChoiceDialogRow title="Create Playlist" icon={<FaPlus />} disabled={busy || !playlistName.trim()}
+            onChoose={() => void createPlaylist()} />
+        </ChoiceDialogList>}
         {busy ? <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
           <InlineSpinner /> {view === 'new' ? 'Creating playlist…' : 'Updating…'}
         </DialogBodyText></PanelSectionRow> : !!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
-      </PanelSection>
-      </div>
+      </ChoiceDialogBody>
     </ModalRoot>
   );
 }

@@ -1,4 +1,6 @@
-import { Button, DialogLabel, Focusable, ModalRoot, PanelSection, PanelSectionRow, showModal } from '@decky/ui';
+import { ModalRoot, showModal } from '@decky/ui';
+import { FaPlay, FaStepBackward } from 'react-icons/fa';
+import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 
 type PlaybackStart = 'resume' | 'beginning';
 
@@ -25,15 +27,16 @@ export function showPlaybackStartDialog({ actionTitle, onClose, ...options }: Pl
     onClose();
   };
   const dialog = showModal(
-    <PlaybackStartDialog {...options} onChoose={finish} onCancel={() => finish()} />,
+    <PlaybackStartDialog {...options} actionTitle={actionTitle} onChoose={finish} onCancel={() => finish()} />,
     window, { strTitle: actionTitle, bNeverPopOut: true, fnOnClose: closedExternally },
   );
   void dialog.ClosedPromise?.then(closedExternally, closedExternally);
   return { Close: () => finish() };
 }
 
-function PlaybackStartDialog({ title, position, resumeLabel, firstLabel, onChoose, onCancel }: {
+function PlaybackStartDialog({ title, actionTitle, position, resumeLabel, firstLabel, onChoose, onCancel }: {
   title: string;
+  actionTitle: string;
   position: number;
   resumeLabel?: string;
   firstLabel?: string;
@@ -45,28 +48,14 @@ function PlaybackStartDialog({ title, position, resumeLabel, firstLabel, onChoos
   const seconds = String(Math.floor(position % 60)).padStart(2, '0');
   const resumeTime = hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
   const resumeDetail = [resumeLabel, position > 0 ? `${resumeTime} in` : null].filter(Boolean).join(' · ');
-  const detailStyle = { fontSize: '0.82rem', opacity: 0.75, overflowWrap: 'anywhere' as const };
   return (
-    <ModalRoot closeModal={onCancel} onCancel={onCancel}>
-      <PanelSection>
-        <PanelSectionRow><DialogLabel style={{ margin: 0 }}>{title}</DialogLabel></PanelSectionRow>
-        <PanelSectionRow>
-          <Focusable flow-children="column" style={{ width: '100%', display: 'grid', gap: '0.45rem' }}>
-            <Button preferredFocus onClick={() => onChoose('resume')} style={{ width: '100%', textAlign: 'left' }}>
-              <span style={{ display: 'grid', gap: '0.2rem' }}>
-                <span>Resume</span>
-                {resumeDetail && <span style={detailStyle}>{resumeDetail}</span>}
-              </span>
-            </Button>
-            <Button onClick={() => onChoose('beginning')} style={{ width: '100%', textAlign: 'left' }}>
-              <span style={{ display: 'grid', gap: '0.2rem' }}>
-                <span>Start from beginning</span>
-                {firstLabel && <span style={detailStyle}>{firstLabel}</span>}
-              </span>
-            </Button>
-          </Focusable>
-        </PanelSectionRow>
-      </PanelSection>
+    <ModalRoot closeModal={onCancel} onCancel={onCancel} onOK={() => {}}>
+      <ChoiceDialogBody title={actionTitle} subtitle={title}>
+        <ChoiceDialogList>
+          <ChoiceDialogRow title="Resume" detail={resumeDetail} icon={<FaPlay />} preferredFocus onChoose={() => onChoose('resume')} />
+          <ChoiceDialogRow title="Start from beginning" detail={firstLabel} icon={<FaStepBackward />} onChoose={() => onChoose('beginning')} />
+        </ChoiceDialogList>
+      </ChoiceDialogBody>
     </ModalRoot>
   );
 }

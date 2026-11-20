@@ -6,6 +6,7 @@ import { PlayerProvider, startLocalVolumeSession } from './context/PlayerContext
 import { BrowserPage } from './components/BrowserPage';
 import { SettingsPage } from './components/SettingsPage';
 import { GamePipHost, gamePipFullscreenEvent, prepareGamePipFullscreen, stopGamePip } from './components/GamePip';
+import { preservePreferencesDuringUpdates } from './packagePreferences';
 
 const BROWSER_ROUTE = "/deckyplex-browser";
 const SETTINGS_ROUTE = "/deckyplex-settings";
@@ -21,6 +22,8 @@ function BrowserPageWithProvider() {
 }
 
 export default definePlugin(() => {
+  try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
+  const stopPreservingPreferences = preservePreferencesDuringUpdates();
   const endLocalVolumeSession = startLocalVolumeSession();
   routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: true });
   routerHook.addRoute(SETTINGS_ROUTE, SettingsPage, { exact: true });
@@ -66,6 +69,7 @@ export default definePlugin(() => {
       </PlayerProvider>
     ),
     onDismount() {
+      stopPreservingPreferences();
       endLocalVolumeSession();
       stopGamePip();
       routerHook.removeGlobalComponent(GAME_PIP_HOST);

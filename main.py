@@ -101,6 +101,39 @@ if not _settings_dir:
 if not _settings_dir:
     _settings_dir = os.path.join(os.environ.get("HOME", "/home/deck"), "homebrew", "settings", "DeckyPlex")
 _settings_file = os.path.join(_settings_dir, "settings.json")
+_settings_stopping = False
+_settings_update_request = ""
+_settings_update_until = 0
+try:
+    _manifest_stat = os.stat(os.path.join(_plugin_dir, "plugin.json"))
+    _manifest_stamp = [_manifest_stat.st_ino, _manifest_stat.st_mtime_ns]
+except OSError:
+    _manifest_stamp = None
+_settings_installation = None
+
+
+def _installation_id() -> Optional[str]:
+    # Decky's ZIP overlay leaves extra files in dist intact. Removing the
+    # plugin directory removes this ID even if the uninstall hook is missed.
+    path = os.path.join(_plugin_dir, "dist", ".deckyplex-installation")
+    try:
+        try:
+            with open(path, encoding="utf-8") as marker:
+                return str(uuid.UUID(marker.read(37)))
+        except FileNotFoundError:
+            installation = str(uuid.uuid4())
+            with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path)) as pending:
+                pending.write(installation)
+                pending.flush()
+                try:
+                    os.link(pending.name, path)
+                except FileExistsError:
+                    with open(path, encoding="utf-8") as marker:
+                        return str(uuid.UUID(marker.read(37)))
+            return installation
+    except (OSError, ValueError) as exc:
+        logger.warning("Could not initialize installation ID: %s", exc)
+    return None
 
 
 def _load_settings() -> Dict[str, Any]:
@@ -109,6 +142,20 @@ def _load_settings() -> Dict[str, Any]:
         if os.path.exists(_settings_file):
             with open(_settings_file, "r") as f:
                 saved = json.load(f)
+                if _manifest_stamp is not None:
+                    installation = saved.get("_installation")
+                    update_until = saved.get("_update_until")
+                    updating = isinstance(update_until, int) and time.time() < update_until
+                    # Existing builds used the manifest inode and mtime. An
+                    # overlay rewrites the manifest in place on those builds.
+                    old_stamp = isinstance(installation, list) and len(installation) == 2
+                    same_manifest = old_stamp and installation[0] == _manifest_stamp[0]
+                    legacy = installation is None and os.fstat(f.fileno()).st_mtime_ns >= _manifest_stamp[1]
+                    if installation != (_settings_installation or _manifest_stamp) and not (
+                        updating or same_manifest or legacy
+                    ):
+                        logger.info("Ignoring DeckyPlex preferences from a previous installation")
+                        return dict(DEFAULT_SETTINGS)
             # Merge with defaults so new keys are present
             merged = {**DEFAULT_SETTINGS, **saved}
             server_id = merged["selected_server_id"]
@@ -129,9 +176,15 @@ def _load_settings() -> Dict[str, Any]:
 
 def _save_settings(settings: Dict[str, Any]) -> None:
     """Save settings to JSON file. Only saves known keys."""
+    if _settings_stopping:
+        raise OSError("DeckyPlex is unloading.")
     try:
         known_keys = set(DEFAULT_SETTINGS.keys())
         filtered = {k: v for k, v in settings.items() if k in known_keys}
+        if _settings_installation or _manifest_stamp:
+            filtered["_installation"] = _settings_installation or _manifest_stamp
+        if time.time() < _settings_update_until:
+            filtered["_update_until"] = _settings_update_until
         settings_dir = os.path.dirname(_settings_file)
         if settings_dir:
             os.makedirs(settings_dir, exist_ok=True)
@@ -148,6 +201,28 @@ def _save_settings(settings: Dict[str, Any]) -> None:
     except Exception as e:
         logger.error(f"Failed to save settings: {e}")
         raise
+
+
+def _allow_decky_shutdown_at_rpc_eof() -> None:
+    # Older Decky socket listeners spin on an empty read after the loader
+    # disconnects, preventing the plugin's uninstall hook from running.
+    module = sys.modules.get("decky_loader.localplatform.localsocket")
+    socket_type = getattr(module, "LocalSocket", None)
+    if socket_type is None or "_read_single_line" in vars(socket_type):
+        return
+    listen = getattr(socket_type, "_listen_for_method_call", None)
+    names = getattr(getattr(listen, "__code__", None), "co_names", ())
+    if "_read_single_line" not in names or "at_eof" in names:
+        return
+    read_line = socket_type._read_single_line
+
+    async def read_line_or_wait_for_shutdown(sock, reader):
+        line = await read_line(sock, reader)
+        if not line and reader.at_eof():
+            await asyncio.Future()
+        return line
+
+    socket_type._read_single_line = read_line_or_wait_for_shutdown
 
 
 def _manual_server_url(settings):
@@ -771,7 +846,7 @@ class PlexHTTP:
 
         result = {
             "id": str(attr("ratingKey")), "key": attr("key"),
-            "title": attr("title"), "type": item_type, "artist": artist,
+            "title": attr("title"), "titleSort": attr("titleSort"), "type": item_type, "artist": artist,
             "thumb": thumb, "art": attr("artUrl"), "poster": poster,
             "summary": attr("summary"), "year": attr("year"),
             "index": attr("index"), "parentIndex": attr("parentIndex"), "parentTitle": attr("parentTitle"),
@@ -1364,7 +1439,7 @@ class PlexHTTP:
             composite = getattr(playlist, "composite", "") or ""
             result.append({
                 "id": str(playlist.ratingKey), "key": playlist.key,
-                "title": playlist.title or "Untitled playlist", "type": "playlist",
+                "title": playlist.title or "Untitled playlist", "titleSort": getattr(playlist, "titleSort", "") or "", "type": "playlist",
                 "thumb": self.sdk.url(composite, includeToken=True) if composite else "",
                 "summary": playlist.summary or "", "leafCount": playlist.leafCount or 0,
                 "duration": playlist.duration or 0,
@@ -1912,7 +1987,11 @@ class Plugin:
 
     async def _main(self):
         """Called when the plugin is loaded."""
+        global _settings_stopping, _settings_installation, _companion_receiver, _companion_event_loop
+        _settings_stopping = False
+        _allow_decky_shutdown_at_rpc_eof()
         logger.info(f"DeckyPlex plugin loaded, settings file: {_settings_file}")
+        logger.info("DeckyPlex preference file present at startup: %s", os.path.isfile(_settings_file))
         settings_dir = os.path.dirname(_settings_file)
         if settings_dir:
             logger.info(f"Settings dir exists: {os.path.exists(settings_dir)}")
@@ -1923,14 +2002,18 @@ class Plugin:
                 logger.error(f"Failed to create settings dir: {e}")
         else:
             logger.warning(f"Settings file has no directory: {_settings_file}")
-        global _companion_receiver, _companion_event_loop
         _companion_event_loop = asyncio.get_running_loop()
+        _settings_installation = _installation_id()
         settings = _load_settings()
         receiver_id = str(settings.get("companion_id") or "").strip()
         if not receiver_id:
             receiver_id = str(uuid.uuid4())
             settings["companion_id"] = receiver_id
+        # Adopt preferences under this installation ID and consume any update marker.
+        try:
             _save_settings(settings)
+        except OSError:
+            pass
         if settings["companion_receiver_enabled"]:
             self._configure_companion_receiver(receiver_id, True, settings["companion_device_name"])
         else:
@@ -1956,7 +2039,8 @@ class Plugin:
 
     async def _unload(self):
         """Called when the plugin is unloaded."""
-        global _companion_receiver, _companion_event_loop
+        global _settings_stopping, _companion_receiver, _companion_event_loop
+        _settings_stopping = True
         _cancel_plex_login()
         await self.stop_game_pip()
         if _companion_receiver:
@@ -1967,6 +2051,11 @@ class Plugin:
 
     async def _uninstall(self):
         """Called when the plugin is uninstalled. Clean up saved settings."""
+        global _settings_stopping
+        _settings_stopping = True
+        if time.time() < _settings_update_until:
+            logger.info("Keeping DeckyPlex preferences for the confirmed update")
+            return
         logger.info("DeckyPlex plugin uninstalled")
         try:
             if os.path.exists(_settings_file):
@@ -1978,6 +2067,25 @@ class Plugin:
                 logger.info(f"Removed empty settings directory: {settings_dir}")
         except Exception as e:
             logger.error(f"Failed to clean up settings on uninstall: {e}")
+
+    async def prepare_package_update(self, request_id: str):
+        global _settings_update_request, _settings_update_until
+        settings = _load_settings()
+        _settings_update_request = request_id
+        _settings_update_until = int(time.time()) + 600
+        try:
+            _save_settings(settings)
+        except OSError:
+            _settings_update_request = ""
+            _settings_update_until = 0
+            raise
+
+    async def finish_package_update(self, request_id: str):
+        global _settings_update_request, _settings_update_until
+        if _settings_update_request == request_id and not _settings_stopping:
+            _settings_update_request = ""
+            _settings_update_until = 0
+            _save_settings(_load_settings())
 
     async def log_message(self, message: str) -> Dict[str, Any]:
         """Log a message from the frontend to the backend log file.

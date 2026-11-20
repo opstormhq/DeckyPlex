@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type Ref } from 'react';
-import { Button, DialogBodyText, DialogCheckbox, DialogHeader, Focusable, ModalRoot, PanelSectionRow } from '@decky/ui';
+import { Button, DialogBodyText, DialogCheckbox, Focusable, ModalRoot, PanelSectionRow } from '@decky/ui';
 import { FaServer } from 'react-icons/fa';
+import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
 
 export interface PlexServerOption {
@@ -113,38 +114,15 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
 
   const cancel = () => { if (!savingRef.current) close(); };
   const defaultServer = servers.find(option => option.id === defaultServerId) || servers[0];
-  const chooseServer = (option: PlexServerOption, event: {
-    preventDefault(): void;
-    stopPropagation(): void;
-  }) => {
-    // Steam's modal can also see A after a child activates. Keep the same
-    // modal open while the server phase changes to its library phase.
-    event.preventDefault();
-    event.stopPropagation();
-    choose(option);
-  };
-
   return (
     <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}} bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
-      <div style={{ width: 'min(31rem, 78vw)', minHeight: '9rem' }}>
-      <DialogHeader style={{ marginBottom: '0.8rem' }}>{server ? 'Choose Plex libraries' : 'Choose a Plex server'}</DialogHeader>
+      <ChoiceDialogBody title={server ? 'Choose Plex libraries' : 'Choose a Plex server'}>
       {!server ? (
-        <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem', maxHeight: '48vh', overflowY: 'auto', padding: '0.18rem' }}>
-          {servers.map(option => (
-            <Focusable key={option.id} ref={option === defaultServer ? firstServerRef : undefined} role="button" tabIndex={0}
-              onOKActionDescription="Choose server"
-              onActivate={event => chooseServer(option, event)}
-              onOKButton={event => chooseServer(option, event)}
-              onClick={event => chooseServer(option, event)}
-              onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') chooseServer(option, event); }}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.8rem', padding: '0.65rem 0.8rem', minHeight: '2.6rem',
-                borderRadius: '0.5rem', border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)' }}>
-              <FaServer aria-hidden="true" style={{ opacity: 0.65, flexShrink: 0 }} />
-              <span style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere', fontWeight: 600 }}>{option.name}</span>
-              {option === defaultServer && <span style={{ color: '#b8ddff', fontSize: '0.8rem', flexShrink: 0 }}>Default</span>}
-            </Focusable>
-          ))}
-        </Focusable>
+        <ChoiceDialogList>
+          {servers.map(option => <ChoiceDialogRow key={option.id} title={option.name} icon={<FaServer />} actionDescription="Choose server"
+            rowRef={option === defaultServer ? firstServerRef : undefined}
+            badge={option === defaultServer ? 'Default' : undefined} onChoose={() => choose(option)} />)}
+        </ChoiceDialogList>
       ) : (
         <>
           <DialogBodyText style={{ margin: '0 0 0.4rem' }}>{server.name}</DialogBodyText>
@@ -159,7 +137,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
           )}
           {catalog?.length === 0 && <DialogBodyText>This server has no supported libraries.</DialogBodyText>}
           {!!catalog?.length && (
-            <Focusable flow-children="column" style={{ maxHeight: '45vh', overflowY: 'auto' }}>
+            <ChoiceDialogList>
               {catalog.map((library, index) => (
                 <LibraryRow key={library.id} library={library} checked={selectedIds.includes(library.id)} disabled={saving}
                   checkboxRef={index === 0 ? firstLibraryRef : undefined}
@@ -167,7 +145,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
                     ? [...new Set([...current, library.id])]
                     : current.filter(id => id !== library.id))} />
               ))}
-            </Focusable>
+            </ChoiceDialogList>
           )}
           {saveError && <DialogBodyText>{saveError}</DialogBodyText>}
           <Focusable flow-children="horizontal" style={{ display: 'flex', gap: '0.5rem', marginTop: '0.6rem' }}>
@@ -179,7 +157,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
           </Focusable>
         </>
       )}
-      </div>
+      </ChoiceDialogBody>
     </ModalRoot>
   );
 }
