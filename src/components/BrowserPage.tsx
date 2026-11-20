@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { Fragment, memo, useState, useEffect, useCallback, useRef, type CSSProperties } from 'react';
 import {
   PanelSection,
   PanelSectionRow,
@@ -13,10 +13,17 @@ import {
   Navigation,
   GamepadButton,
   showModal,
+  type GamepadEvent,
 } from '@decky/ui';
 import { call } from '@decky/api';
-import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay } from 'react-icons/fa';
+import { FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay, FaFilm, FaImage, FaHome } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
+import { InlineSpinner } from './InlineSpinner';
+import { gamePipFullscreenEvent, getEpisodeQueue, queueGamePipEpisodeNext, stopGamePip, takeGamePipFullscreen,
+  useGamePipEpisodeQueue, videoProgressEvent, type VideoItem, type VideoResume } from './GamePip';
+import { MediaViewer, type VideoPresentation } from './MediaViewer';
+import { showPlaybackStartDialog } from './PlaybackStartDialog';
+import { collectionResumes, episodeLabel, insertNextEpisode, queueFromEpisode, resumeEpisode, resumePosition } from './VideoQueue';
 
 interface LibraryItem {
   id: string;
@@ -24,66 +31,139 @@ interface LibraryItem {
   title: string;
   type: string;
   thumb?: string;
+  poster?: string;
+  gridThumb?: string;
+  gridPoster?: string;
   art?: string;
   summary?: string;
   artist?: string;
   year?: number;
   index?: number;
+  parentIndex?: number;
   parentTitle?: string;
   grandparentTitle?: string;
   leafCount?: number;
   viewCount?: number;
+  viewOffset?: number;
   duration?: number;
+  sectionId?: string;
 }
 
-type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search';
-type BrowserSubView = { type: 'albums' | 'tracks' | 'search'; title: string; id?: string; queueLabel?: string } | null;
-interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; hasMore?: boolean; }
+type LibraryTab = `library:${string}`;
+type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search' | 'videoHome' | LibraryTab;
+type BrowserSubView = { type: 'albums' | 'tracks' | 'search' | 'media'; title: string; id?: string; queueLabel?: string; mediaType?: string } | null;
+interface LibrarySection { id: string; name: string; type: string; }
+interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; hasMore?: boolean; nextOffset?: number; }
 
-function versionArtwork(url: string, revision: number): string {
-  if (!url) return '';
-  return `${url}${url.includes('?') ? '&' : '?'}deckyplex_art=${revision}`;
+function sectionForTab(tab: BrowserTab) {
+  return tab.startsWith('library:') ? tab.slice('library:'.length) : '';
 }
+
 interface BrowserHistoryEntry {
   items: LibraryItem[];
   subView: BrowserSubView;
-  searchQuery: string;
   focusedItemId?: string;
   scrollTop: number;
+  hasMore: boolean;
 }
 interface TabFocusPosition { itemId: string; scrollTop: number; }
 
+const browserHeaderStyle: CSSProperties = {
+  display: 'flex', alignItems: 'center', gap: '0.5rem', height: '2.65rem',
+  paddingInline: '0.35rem', marginBottom: '0.5rem', boxSizing: 'border-box',
+};
+const DEFAULT_GRID_COLUMNS = 6;
+const PAGE_SIZE = 36;
+const LIBRARY_CACHE_TTL = 600000;
+const VIDEO_HOME_ROWS = [
+  { id: 'continue', title: 'Continue Watching', ttl: 15000 },
+  { id: 'next', title: 'Watch Next', ttl: 15000 },
+  { id: 'movies', title: 'Recently Added Movies', ttl: 60000 },
+  { id: 'shows', title: 'Recently Added TV', ttl: 60000 },
+  { id: 'watchlist', title: 'Watchlist', ttl: 60000 },
+] as const;
+const VIDEO_SORTS = [
+  { id: 'titleSort:asc', title: 'Title A–Z' },
+  { id: 'titleSort:desc', title: 'Title Z–A' },
+  { id: 'addedAt:desc', title: 'Recently added' },
+  { id: 'originallyAvailableAt:desc', title: 'Newest release' },
+];
+type VideoHomeRow = typeof VIDEO_HOME_ROWS[number]['id'];
+type VideoHomeData = Partial<Record<VideoHomeRow, { items: LibraryItem[]; error?: string }>>;
+
 export function BrowserPage() {
-  const { playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue } = usePlayer();
+  const { playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue, playbackState, pause, localVolume } = usePlayer();
+  return <LibraryBrowser {...{ playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName,
+    addToQueue, playbackState, pause, localVolume }} />;
+}
+
+type BrowserPlayback = Pick<ReturnType<typeof usePlayer>, 'playTrack' | 'playRemoteQueue' | 'beginPlaybackRequest'
+  | 'remoteMode' | 'remotePlayerName' | 'addToQueue' | 'playbackState' | 'pause' | 'localVolume'>;
+const LibraryBrowser = memo(function LibraryBrowser({
+  playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, remotePlayerName, addToQueue, playbackState, pause, localVolume,
+}: BrowserPlayback) {
+  const pipEpisodeQueue = useGamePipEpisodeQueue();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
   const activeTabRef = useRef<BrowserTab>(activeTab);
   activeTabRef.current = activeTab;
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [playbackRequests, setPlaybackRequests] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [paginationError, setPaginationError] = useState('');
   const [tabHasMore, setTabHasMore] = useState(false);
   const [focusTreeVersion, setFocusTreeVersion] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedSection, setSelectedSection] = useState<string>('');
-  const [connected, setConnected] = useState(false);
+  const [libraries, setLibraries] = useState<LibrarySection[]>([]);
+  const [homeData, setHomeData] = useState<VideoHomeData>({});
+  const [videoSorts, setVideoSorts] = useState<Record<string, string>>({});
+  const [loadingLibraries, setLoadingLibraries] = useState(false);
+  const [showAllMedia, setShowAllMedia] = useState(false);
+  const [overGamePip, setOverGamePip] = useState(false);
+  const [librarySelectionKey, setLibrarySelectionKey] = useState('');
+  const [serverId, setServerId] = useState('');
+  const [checkingConnection, setCheckingConnection] = useState(true);
+  const connected = !!serverId;
   const [subView, setSubView] = useState<BrowserSubView>(null);
+  const collectionRequest = useRef<{ key: string; episodes: Promise<VideoItem[]> } | null>(null);
+  const [viewerItem, setViewerItem] = useState<LibraryItem | null>(null);
+  const [viewerResume, setViewerResume] = useState<VideoResume | null>(null);
+  const [viewerPresentation, setViewerPresentation] = useState<VideoPresentation | null>(null);
+  const [viewerStartPosition, setViewerStartPosition] = useState<number | undefined>();
+  const [viewerQueue, setViewerQueueState] = useState<VideoItem[] | null>(null);
+  const latestViewerQueue = useRef<VideoItem[] | null>(null);
+  const setViewerQueue = useCallback((value: React.SetStateAction<VideoItem[] | null>) => {
+    const queue = typeof value === 'function' ? value(latestViewerQueue.current) : value;
+    latestViewerQueue.current = queue;
+    setViewerQueueState(queue);
+  }, []);
+  const viewerExpanded = !!viewerItem;
+  const combinedArtists = libraries.filter(library => library.type === 'artist').length > 1;
   const [history, setHistory] = useState<BrowserHistoryEntry[]>([]);
-  const [gridColumns, setGridColumns] = useState(5);
+  const [gridColumns, setGridColumns] = useState(DEFAULT_GRID_COLUMNS);
   const [gridPreferenceSet, setGridPreferenceSet] = useState(false);
-  const [artworkRevision, setArtworkRevision] = useState(0);
   const [restoreFocusTick, setRestoreFocusTick] = useState(0);
   const itemCache = useRef(new Map<string, ItemCacheEntry>());
+  const pendingItems = useRef(new Map<string, Promise<any>>());
   const firstItemRef = useRef<HTMLDivElement | null>(null);
+  const sortButtonRef = useRef<HTMLDivElement | null>(null);
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
+  const lastCollectionItem = useRef<HTMLElement | null>(null);
   const gridDialogRef = useRef<{ Close: () => void } | null>(null);
   const gridPromptShown = useRef(false);
   const actionDialogRef = useRef<{ Close: () => void } | null>(null);
   const focusZone = useRef<'sidebar' | 'content'>('sidebar');
+  const browserRef = useRef<HTMLDivElement | null>(null);
   const sidebarRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
+  const moreItemsRef = useRef<HTMLDivElement | null>(null);
+  const focusScrollFrame = useRef(0);
+  const searchFormRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
+  const pendingSortFocus = useRef<{ tab: BrowserTab; sort: string; ready: boolean } | null>(null);
   const pendingScrollTop = useRef<number | undefined>(undefined);
   const tabFocusPositions = useRef(new Map<BrowserTab, TabFocusPosition>());
   const pendingSearchFocus = useRef(false);
@@ -92,15 +172,26 @@ export function BrowserPage() {
   const tabLoadRequestId = useRef(0);
   const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
+  const viewerOrigin = useRef<{ itemId?: string; scrollTop: number }>({ scrollTop: 0 });
+
+  const invalidateTabLoad = useCallback(() => {
+    loadingMoreRef.current = false;
+    lastCollectionItem.current = null;
+    setLoadingMore(false);
+    setPaginationError('');
+    return ++tabLoadRequestId.current;
+  }, []);
 
   const selectTab = (tab: BrowserTab) => {
     if (tab === activeTabRef.current) return;
     activeTabRef.current = tab;
     // Invalidate outstanding root and pagination requests synchronously when
     // focus moves between categories. The effect below then loads only the new tab.
-    tabLoadRequestId.current++;
-    loadingMoreRef.current = false;
-    setLoadingMore(false);
+    invalidateTabLoad();
+    pendingSortFocus.current = null;
+    enterContentPending.current = false;
+    pendingSearchFocus.current = false;
+    pendingSearchInputFocus.current = false;
     setItems([]);
     setTabHasMore(false);
     setError(null);
@@ -108,62 +199,84 @@ export function BrowserPage() {
     setActiveTab(tab);
   };
 
-  const keepFocusedElementVisible = (element: HTMLElement) => {
-    window.requestAnimationFrame(() => {
-      const viewport = contentRef.current;
-      if (!viewport || !viewport.contains(element)) return;
+  const keepFocusedElementVisible = (element: HTMLElement, sidebar = false) => {
+    window.cancelAnimationFrame(focusScrollFrame.current);
+    focusScrollFrame.current = window.requestAnimationFrame(() => {
+      const viewport = sidebar ? sidebarRef.current : contentRef.current;
+      if (!viewport || !viewport.contains(element) || element !== document.activeElement) return;
       const item = element.closest<HTMLElement>('[data-browser-item-id]') || element;
       const itemRect = item.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
       const edgePadding = 28;
+      const firstGridRow = !sidebar && gridView && Number(item.dataset.browserItemIndex) < gridColumns
+        && (!homeView || item.hasAttribute('data-browser-home-start'));
       // Steam overlays a footer on the bottom of routed plugin views. Keep a
       // generous safe area there so focused cards and the last track stay readable.
-      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - 150);
-      if (itemRect.bottom > visibleBottom - edgePadding) {
+      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? 110 : 150));
+      if (firstGridRow) {
+        viewport.scrollTop = 0;
+      } else if (itemRect.bottom > visibleBottom - edgePadding) {
         viewport.scrollTop += itemRect.bottom - (visibleBottom - edgePadding);
       } else if (itemRect.top < viewportRect.top + edgePadding) {
         viewport.scrollTop -= (viewportRect.top + edgePadding) - itemRect.top;
       }
       const itemId = item.dataset.browserItemId;
-      if (itemId && !subView) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: viewport.scrollTop });
+      if (!sidebar && itemId && !subView) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: viewport.scrollTop });
     });
   };
 
+  useEffect(() => () => window.cancelAnimationFrame(focusScrollFrame.current), []);
+
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
-    const cached = itemCache.current.get(key);
-    if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore };
-    const result = await request();
-    if (Array.isArray(result?.items) && !result?.error) {
-      itemCache.current.set(key, { items: result.items, hasMore: result.has_more, expiresAt: Date.now() + ttlMs });
-      setArtworkRevision(revision => revision + 1);
-    }
-    return result;
+    const cache = itemCache.current;
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore, next_offset: cached.nextOffset };
+    const pending = pendingItems.current;
+    const existing = pending.get(key);
+    if (existing) return existing;
+    const load = request().then(result => {
+      if (cache === itemCache.current && Array.isArray(result?.items) && !result?.error) {
+        cache.set(key, { items: result.items, hasMore: result.has_more,
+          nextOffset: result.next_offset, expiresAt: Date.now() + ttlMs });
+      }
+      return result;
+    }).finally(() => pending.delete(key));
+    pending.set(key, load);
+    return load;
   }, []);
 
   useEffect(() => {
+    if (viewerExpanded || pendingSortFocus.current || pendingFocusId.current || pendingScrollTop.current != null) return;
     const frame = window.requestAnimationFrame(() => {
-      sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${activeTab}"]`)?.focus();
+      const sidebar = sidebarRef.current;
+      const focused = document.activeElement;
+      if (!sidebar || sidebar.contains(focused) || contentRef.current?.contains(focused)) return;
+      const target = sidebar.querySelector<HTMLElement>(`[data-browser-tab="${activeTabRef.current}"]`)
+        ?? sidebar.querySelector<HTMLElement>('[data-browser-tab]');
+      target?.focus({ preventScroll: true });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, []);
+  }, [activeTab, connected, loadingLibraries, viewerExpanded]);
 
   useEffect(() => {
-    tabLoadRequestId.current++;
-    loadingMoreRef.current = false;
-    setLoadingMore(false);
+    invalidateTabLoad();
     setHistory([]);
     setSubView(null);
-  }, [activeTab]);
+  }, [activeTab, invalidateTabLoad]);
 
   const goBack = useCallback(() => {
     const previous = history[history.length - 1];
     if (previous) {
-      tabLoadRequestId.current++;
+      invalidateTabLoad();
+      enterContentPending.current = false;
+      pendingSearchFocus.current = false;
+      setLoading(false);
+      setError(null);
       restoringHistoryRef.current = previous.subView === null;
       setHistory(history.slice(0, -1));
       setItems(previous.items);
+      setTabHasMore(previous.hasMore);
       setSubView(previous.subView);
-      setSearchQuery(previous.searchQuery);
       focusedItemId.current = previous.focusedItemId;
       // Returning from a search result should restore the search form itself.
       // Search inputs don't have a browser item id, so generic history focus
@@ -175,7 +288,31 @@ export function BrowserPage() {
     } else {
       Navigation.NavigateBack();
     }
-  }, [history, activeTab]);
+  }, [history, activeTab, invalidateTabLoad]);
+
+  const focusBrowserTab = (scrollTop?: number) => {
+    window.requestAnimationFrame(() => {
+      if (scrollTop != null && contentRef.current) contentRef.current.scrollTop = scrollTop;
+      sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${activeTabRef.current}"]`)?.focus();
+    });
+  };
+
+  const restoreBrowserFocus = () => {
+    const { itemId, scrollTop } = viewerOrigin.current;
+    pendingFocusId.current = itemId;
+    pendingScrollTop.current = itemId ? scrollTop : undefined;
+    if (itemId) setRestoreFocusTick(value => value + 1);
+    else focusBrowserTab(scrollTop);
+  };
+
+  const closeMedia = () => {
+    setViewerItem(null);
+    setViewerQueue(null);
+    setViewerResume(null);
+    setViewerPresentation(null);
+    setViewerStartPosition(undefined);
+    restoreBrowserFocus();
+  };
 
   const handleCancel = useCallback((event: Event) => {
     if (history.length === 0 && focusZone.current === 'content') {
@@ -203,54 +340,83 @@ export function BrowserPage() {
 
   useEffect(() => {
     const onBackKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') handleCancel(event);
+      if (event.key === 'Escape' && !viewerExpanded && !gridDialogRef.current && !actionDialogRef.current) handleCancel(event);
     };
     window.addEventListener('keydown', onBackKey, true);
     return () => window.removeEventListener('keydown', onBackKey, true);
-  }, [handleCancel]);
+  }, [handleCancel, viewerExpanded]);
 
   // Check connection status periodically
   useEffect(() => {
+    let active = true;
+    let requestId = 0;
     const checkConnection = async () => {
+      const id = ++requestId;
       try {
         const result: any = await call("get_settings");
+        if (!active || id !== requestId) return;
         const savedColumns = Number(result.grid_columns);
-        setGridPreferenceSet(Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 8);
-        if (Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 8) {
-          setGridColumns(savedColumns);
-        } else {
-          try {
-            const previousColumns = Number(window.localStorage.getItem('deckyplex-grid-columns'));
-            if (Number.isInteger(previousColumns) && previousColumns >= 3 && previousColumns <= 8) {
-              setGridColumns(previousColumns);
-            }
-          } catch {}
+        setGridPreferenceSet(Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9);
+        if (!gridDialogRef.current) {
+          if (Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9) {
+            setGridColumns(savedColumns);
+          } else {
+            try {
+              const previousColumns = Number(window.localStorage.getItem('deckyplex-grid-columns'));
+              if (Number.isInteger(previousColumns) && previousColumns >= 3 && previousColumns <= 8) {
+                setGridColumns(previousColumns);
+              }
+            } catch {}
+          }
         }
-        // The old release kept this preference in webview localStorage. Migrate
-        // it once so uninstalling DeckyPlex cannot leave a stale value behind.
-        try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
-        const wasConnected = connected;
-        setConnected(!!(result.has_plex_token && result.selected_server_id));
-        if (!wasConnected && result.has_plex_token && result.selected_server_id) {
-          loadSections();
-        }
+        setShowAllMedia(Boolean(result.browse_all_media));
+        setOverGamePip(result.over_game_pip === true);
+        setLibrarySelectionKey((result.library_selection_ids || []).join(','));
+        setServerId(result.has_plex_token ? result.selected_server_id || '' : '');
       } catch (e) {
-        setConnected(false);
+        if (active && id === requestId) setServerId('');
+      } finally {
+        if (active && id === requestId) setCheckingConnection(false);
       }
     };
     checkConnection();
     const interval = setInterval(checkConnection, 15000);
-    return () => clearInterval(interval);
-  }, [connected]);
+    window.addEventListener('deckyplex-settings-change', checkConnection);
+    return () => {
+      active = false;
+      clearInterval(interval);
+      window.removeEventListener('deckyplex-settings-change', checkConnection);
+    };
+  }, []);
+
+  const shelf = sectionForTab(activeTab);
+  const sorting = videoSorts[shelf] || VIDEO_SORTS[0].id;
+  const sortable = !subView && libraries.some(library => library.id === shelf
+    && (library.type === 'movie' || library.type === 'show'));
 
   useEffect(() => {
-    if (loading || focusZone.current === 'sidebar') return;
+    if (loading || loadingLibraries || viewerExpanded || (!pendingSortFocus.current && focusZone.current === 'sidebar' && !enterContentPending.current
+      && !pendingSearchFocus.current && !pendingSearchInputFocus.current && pendingScrollTop.current == null)) return;
     let secondFrame = 0;
     const frame = window.requestAnimationFrame(() => {
       secondFrame = window.requestAnimationFrame(() => {
+        const sortFocus = pendingSortFocus.current;
+        if (sortFocus) {
+          // Wait for the chosen sort's data after Steam restores focus from the modal.
+          const sortedPage = itemCache.current.get(`tab:${shelf}:${activeTab}:${sorting}`);
+          if (!sortFocus.ready || sortFocus.tab !== activeTab || sortFocus.sort !== sorting || actionDialogRef.current
+              || (sortedPage?.items !== items && !error)) return;
+          const target = firstItemRef.current ?? sortButtonRef.current;
+          if (!target) return;
+          pendingSortFocus.current = null;
+          if (contentRef.current) contentRef.current.scrollTop = 0;
+          target.focus({ preventScroll: true });
+          return;
+        }
         if (pendingSearchInputFocus.current) {
           pendingSearchInputFocus.current = false;
-          contentRef.current?.querySelector<HTMLElement>('input')?.focus();
+          pendingScrollTop.current = undefined;
+          searchFormRef.current?.querySelector('input')?.focus();
           return;
         }
         if (pendingFocusId.current) {
@@ -271,19 +437,17 @@ export function BrowserPage() {
         }
         if (pendingSearchFocus.current) {
           pendingSearchFocus.current = false;
-          firstItemRef.current?.focus();
+          const target = firstItemRef.current ?? searchFormRef.current?.querySelector('input');
+          target?.focus();
           return;
         }
         if (enterContentPending.current) {
+          if (activeTab === 'videoHome' && !subView && !firstItemRef.current) return;
+          if (contentRef.current) contentRef.current.scrollTop = 0;
           enterContentPending.current = false;
-          if (subView?.type === 'tracks') playCollectionRef.current?.focus();
-          else if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
-          else firstItemRef.current?.focus();
+          if (!subView && activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
+          else firstItemRef.current?.focus({ preventScroll: true });
           return;
-        }
-        if (items.length > 0 && (subView?.type === 'tracks' || subView?.type === 'albums')) {
-          if (subView.type === 'tracks') playCollectionRef.current?.focus();
-          else firstItemRef.current?.focus();
         }
       });
     });
@@ -291,41 +455,48 @@ export function BrowserPage() {
       window.cancelAnimationFrame(frame);
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
-  }, [loading, items, subView, activeTab, restoreFocusTick]);
+  }, [loading, loadingLibraries, items, subView, activeTab, restoreFocusTick, viewerExpanded, shelf, sorting, error]);
 
-  const saveGridColumns = useCallback(async (columns = gridColumns) => {
-    try {
-      const result: any = await call('set_settings', { grid_columns: columns });
-      if (result?.error) throw new Error(result.error);
-      setGridColumns(columns);
-      setGridPreferenceSet(true);
-    } catch {
-      setError('Could not save browser layout preference. You can change it later in Settings > Browser.');
-    }
-  }, [gridColumns]);
-
-  const previewGridColumns = useCallback((columns: number) => {
+  const saveGridColumns = useCallback(async (columns: number) => {
+    const result: any = await call('set_settings', { grid_columns: columns });
+    if (result?.error) throw new Error(result.error);
     setGridColumns(columns);
-    void saveGridColumns(columns);
-  }, [saveGridColumns]);
+    setGridPreferenceSet(true);
+    try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
+  }, []);
 
   const openGridColumnsDialog = useCallback(() => {
-    const close = () => gridDialogRef.current?.Close();
-    gridDialogRef.current = showModal(<GridColumnsDialog initialColumns={gridColumns}
-      onPreview={previewGridColumns} onClose={close} />,
-      window, { strTitle: 'Browser layout', bNeverPopOut: true });
-  }, [gridColumns, previewGridColumns]);
+    if (gridDialogRef.current) return;
+    gridPromptShown.current = true;
+    const clearDialog = () => {
+      if (gridDialogRef.current === dialog) gridDialogRef.current = null;
+    };
+    const close = () => { clearDialog(); dialog.Close(); };
+    const dialog = showModal(<GridColumnsDialog initialColumns={gridColumns}
+      onPreview={setGridColumns} onConfirm={saveGridColumns} onClose={close} />,
+      window, { strTitle: 'Browser layout', bNeverPopOut: true, fnOnClose: clearDialog });
+    gridDialogRef.current = dialog;
+    void dialog.ClosedPromise?.then(clearDialog, clearDialog);
+  }, [gridColumns, saveGridColumns]);
 
   const openTrackOptions = useCallback((track: {
     id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string;
   }, playlistId?: string) => {
-    const close = () => actionDialogRef.current?.Close();
-    actionDialogRef.current = showModal(<TrackOptionsDialog track={track} playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
-      window, { strTitle: track.title, bNeverPopOut: true });
+    const clearDialog = () => {
+      if (actionDialogRef.current === dialog) actionDialogRef.current = null;
+    };
+    const close = () => { clearDialog(); dialog.Close(); };
+    const dialog = showModal(<TrackOptionsDialog track={track} playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
+      window, { strTitle: track.title, bNeverPopOut: true, fnOnClose: clearDialog });
+    actionDialogRef.current = dialog;
+    void dialog.ClosedPromise?.then(clearDialog, clearDialog);
   }, [addToQueue]);
 
   const openPlaylistOptions = useCallback((playlist: LibraryItem) => {
-    const close = () => actionDialogRef.current?.Close();
+    const clearDialog = () => {
+      if (actionDialogRef.current === dialog) actionDialogRef.current = null;
+    };
+    const close = () => { clearDialog(); dialog.Close(); };
     const handleDeleted = (playlistId: string) => {
       itemCache.current.delete(`tab:${selectedSection}:playlists`);
       itemCache.current.delete(`playlist:${playlistId}`);
@@ -333,55 +504,224 @@ export function BrowserPage() {
       window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId } }));
       close();
     };
-    actionDialogRef.current = showModal(<PlaylistOptionsDialog playlist={playlist} onDeleted={handleDeleted} onClose={close} />,
-      window, { strTitle: playlist.title, bNeverPopOut: true });
+    const dialog = showModal(<PlaylistOptionsDialog playlist={playlist} onDeleted={handleDeleted} onClose={close} />,
+      window, { strTitle: playlist.title, bNeverPopOut: true, fnOnClose: clearDialog });
+    actionDialogRef.current = dialog;
+    void dialog.ClosedPromise?.then(clearDialog, clearDialog);
   }, [selectedSection]);
 
   useEffect(() => {
     if (!connected || gridPreferenceSet || gridPromptShown.current) return;
-    gridPromptShown.current = true;
     const timer = window.setTimeout(openGridColumnsDialog, 300);
     return () => window.clearTimeout(timer);
   }, [connected, gridPreferenceSet, openGridColumnsDialog]);
 
-  const loadSections = useCallback(async () => {
-    try {
-      const result: any = await call("get_library_sections");
-      if (result.sections && result.sections.length > 0) {
-        if (!selectedSection) {
-          setSelectedSection(result.sections[0].id);
-        }
-      }
-    } catch (e) {
-      console.error("Failed to load sections:", e);
+  useEffect(() => {
+    setViewerItem(null);
+    setViewerQueue(null);
+    setViewerResume(null);
+    setViewerPresentation(null);
+    setViewerStartPosition(undefined);
+    if (!serverId) {
+      setSelectedSection('');
+      setLibraries([]);
+      setLoadingLibraries(false);
+      return;
     }
-  }, [selectedSection]);
+    let active = true;
+    invalidateTabLoad();
+    setSelectedSection('');
+    setLibraries([]);
+    setHomeData({});
+    setVideoSorts({});
+    setItems([]);
+    setSubView(null);
+    setHistory([]);
+    itemCache.current = new Map();
+    pendingItems.current = new Map();
+    tabFocusPositions.current.clear();
+    restoringHistoryRef.current = false;
+    selectTab('artists');
+    setLoadingLibraries(true);
+    setError(null);
+    void call<[boolean], { sections?: LibrarySection[]; error?: string }>('get_library_sections', showAllMedia)
+      .then(result => {
+        if (!active) return;
+        if (result?.error) throw new Error(result.error);
+        if (!result?.sections?.length) throw new Error('No selected Plex libraries were found. Check Settings › Server.');
+        setSelectedSection(result.sections.find(section => section.type === 'artist')?.id || '');
+        setLibraries(result.sections);
+        const firstMediaLibrary = result.sections.find(section => section.type !== 'artist');
+        if (firstMediaLibrary && !result.sections.some(section => section.type === 'artist') && activeTabRef.current === 'artists') {
+          const tab: BrowserTab = result.sections.some(section => section.type === 'movie' || section.type === 'show')
+            ? 'videoHome' : `library:${firstMediaLibrary.id}`;
+          selectTab(tab);
+          window.requestAnimationFrame(() => {
+            if (active && focusZone.current === 'sidebar' && activeTabRef.current === tab) {
+              sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${tab}"]`)?.focus();
+            }
+          });
+        }
+      })
+      .catch(error => {
+        if (!active) return;
+        setLoading(false);
+        setError(error instanceof Error ? error.message : 'Could not load Plex libraries.');
+      })
+      .finally(() => { if (active) setLoadingLibraries(false); });
+    return () => { active = false; };
+  }, [serverId, showAllMedia, librarySelectionKey, invalidateTabLoad]);
+
+  useEffect(() => {
+    if (!serverId) return;
+    const restoreVideo = () => {
+      const resume = takeGamePipFullscreen(serverId);
+      if (!resume) return;
+      viewerOrigin.current = { scrollTop: contentRef.current?.scrollTop || 0 };
+      setViewerQueue(resume.episodes?.length ? resume.episodes : null);
+      setViewerResume(resume);
+      setViewerPresentation(null);
+      setViewerStartPosition(undefined);
+      setViewerItem(resume.item);
+    };
+    window.addEventListener(gamePipFullscreenEvent, restoreVideo);
+    restoreVideo();
+    return () => window.removeEventListener(gamePipFullscreenEvent, restoreVideo);
+  }, [serverId]);
+
+  useEffect(() => {
+    if (viewerItem?.type !== 'episode' || !serverId) return;
+    if (viewerQueue) return;
+    let active = true;
+    void getEpisodeQueue(viewerItem.id, serverId).then(episodes => {
+      if (active && episodes?.length) {
+        const upcoming = queueFromEpisode(episodes, viewerItem.id);
+        if (!upcoming.length) return;
+        setViewerQueue(previous => previous ?? upcoming);
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [viewerItem, viewerQueue, serverId]);
+
+  const openSortMenu = (event?: GamepadEvent) => {
+    event?.preventDefault();
+    event?.stopPropagation();
+    if (!sortable || actionDialogRef.current) return;
+    const clearDialog = () => {
+      if (actionDialogRef.current === dialog) actionDialogRef.current = null;
+    };
+    const close = (sort?: string) => {
+      if (actionDialogRef.current !== dialog) return;
+      actionDialogRef.current = null;
+      dialog.Close();
+      if (!sort || activeTabRef.current !== activeTab) return;
+      tabFocusPositions.current.delete(activeTab);
+      pendingFocusId.current = undefined;
+      pendingScrollTop.current = undefined;
+      enterContentPending.current = false;
+      pendingSortFocus.current = { tab: activeTab, sort, ready: sort === sorting };
+      if (sort !== sorting) {
+        invalidateTabLoad();
+        setVideoSorts(current => ({ ...current, [shelf]: sort }));
+      }
+      setRestoreFocusTick(value => value + 1);
+    };
+    const dialog = showModal(
+      <ModalRoot closeModal={() => close()} onCancel={() => close()}>
+        <PanelSection title="Sort by">
+          {VIDEO_SORTS.map(sort => <PanelSectionRow key={sort.id}>
+            <Button preferredFocus={sort.id === sorting} aria-pressed={sort.id === sorting}
+              onClick={() => close(sort.id)} style={{ width: '100%', textAlign: 'left' }}>
+              {sort.title}{sort.id === sorting ? ' ✓' : ''}
+            </Button>
+          </PanelSectionRow>)}
+        </PanelSection>
+      </ModalRoot>, window, { strTitle: 'Sort library', bNeverPopOut: true, fnOnClose: clearDialog },
+    );
+    actionDialogRef.current = dialog;
+    void dialog.ClosedPromise?.then(clearDialog, clearDialog);
+  };
+
+  useEffect(() => {
+    if (!connected || loadingLibraries || subView || activeTab !== 'videoHome') return;
+    let active = true;
+    const rows: VideoHomeData = {};
+    const hasMovies = libraries.some(library => library.type === 'movie');
+    const hasTV = libraries.some(library => library.type === 'show');
+    if (!hasMovies) rows.movies = { items: [] };
+    if (!hasTV) rows.shows = { items: [] };
+    setLoading(false);
+    const loadRow = (row: typeof VIDEO_HOME_ROWS[number]) => {
+      void cachedItems(`video-home:${row.id}`, row.ttl,
+        () => call('get_video_home', row.id)).then(result => {
+        if (!active) return;
+        const items: LibraryItem[] = result?.items || [];
+        if (row.id === 'continue') {
+          const next = (item: LibraryItem) => item.type === 'episode' && !item.viewOffset;
+          rows.next = { items: items.filter(next) };
+          rows.continue = { items: items.filter(item => !next(item)), error: result?.error };
+        } else rows[row.id] = { items, error: result?.error };
+      }).catch(() => {
+        if (active) rows[row.id] = { items: [], error: 'Could not load this section.' };
+        if (active && row.id === 'continue') rows.next = { items: [] };
+      }).finally(() => {
+        if (!active) return;
+        setHomeData({ ...rows });
+        setItems(VIDEO_HOME_ROWS.flatMap(entry => rows[entry.id]?.items || []));
+      });
+    };
+    setHomeData({ ...rows });
+    for (const row of VIDEO_HOME_ROWS) {
+      if (row.id !== 'next' && !rows[row.id]) loadRow(row);
+    }
+    const refreshContinueWatching = () => {
+      const refresh = () => {
+        if (!active) return;
+        itemCache.current.delete('video-home:continue');
+        loadRow(VIDEO_HOME_ROWS[0]);
+      };
+      const pending = pendingItems.current.get('video-home:continue');
+      if (pending) void pending.then(refresh, refresh);
+      else refresh();
+    };
+    window.addEventListener(videoProgressEvent, refreshContinueWatching);
+    return () => {
+      active = false;
+      window.removeEventListener(videoProgressEvent, refreshContinueWatching);
+    };
+  }, [activeTab, connected, libraries, loadingLibraries, subView, cachedItems]);
 
   // Load data when tab changes
   useEffect(() => {
-    if (!connected || !selectedSection || subView) return;
+    if (!connected || loadingLibraries || subView) return;
     if (restoringHistoryRef.current) {
       restoringHistoryRef.current = false;
       return;
     }
+    if (activeTab === 'videoHome') return;
     if (activeTab === 'search') {
-      tabLoadRequestId.current++;
-      loadingMoreRef.current = false;
-      setLoadingMore(false);
+      invalidateTabLoad();
       setLoading(false);
       setTabHasMore(false);
       setItems([]);
       return;
     }
-    loadTabData(activeTab);
-  }, [activeTab, connected, selectedSection, subView]);
+    const libraryId = sectionForTab(activeTab);
+    if (libraryId ? libraries.some(library => library.id === libraryId) : selectedSection) loadTabData(activeTab);
+  }, [activeTab, connected, selectedSection, libraries, loadingLibraries, subView, sorting, invalidateTabLoad]);
 
   const loadTabData = useCallback(async (tab: BrowserTab) => {
-    const requestId = ++tabLoadRequestId.current;
-    loadingMoreRef.current = false;
-    setLoadingMore(false);
+    const requestId = invalidateTabLoad();
     setError(null);
-    const cacheKey = `tab:${selectedSection}:${tab}`;
+    const libraryId = sectionForTab(tab);
+    const cacheKey = `tab:${libraryId || selectedSection}:${tab}${libraryId ? `:${sorting}` : ''}`;
+    const finishSortFocus = () => {
+      const focus = pendingSortFocus.current;
+      if (focus?.tab === tab && focus.sort === sorting && !focus.ready) {
+        focus.ready = true;
+        setRestoreFocusTick(value => value + 1);
+      }
+    };
     const cached = itemCache.current.get(cacheKey);
     const expectedTypes: Partial<Record<BrowserTab, string[]>> = {
       artists: ['artist'], albums: ['album'], tracks: ['track'], recent: ['track'],
@@ -391,7 +731,7 @@ export function BrowserPage() {
       ? cached.items.filter(item => expectedTypes[tab]?.includes(item.type))
       : cached?.items;
     const cacheIsFresh = !!cached && cached.expiresAt > Date.now();
-    const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : 300000;
+    const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : LIBRARY_CACHE_TTL;
     if (cached) {
       setItems(cachedTabItems || []);
       setTabHasMore(Boolean(cached.hasMore));
@@ -399,11 +739,18 @@ export function BrowserPage() {
       setItems([]);
       setTabHasMore(false);
     }
-    setLoading(!cacheIsFresh);
-    if (cacheIsFresh) return;
+    setLoading(!cached);
+    if (cacheIsFresh) {
+      finishSortFocus();
+      return;
+    }
     try {
       let result: any;
-      if (tab === 'recent') {
+      if (libraryId) {
+        result = await cachedItems(cacheKey, ttl, () => call('get_section_contents', libraryId, '', PAGE_SIZE, 0, sorting));
+      } else if (tab === 'artists' && combinedArtists) {
+        result = await cachedItems(cacheKey, ttl, () => call('get_music_artists', PAGE_SIZE, 0));
+      } else if (tab === 'recent') {
         result = await cachedItems(cacheKey, ttl, () => call('get_recently_played', selectedSection, 100));
       } else if (tab === 'recentlyAdded') {
         result = await cachedItems(cacheKey, ttl, () => call('get_recently_added', selectedSection, 100));
@@ -411,10 +758,10 @@ export function BrowserPage() {
         result = await cachedItems(cacheKey, ttl, () => call('get_audio_playlists', 100));
       } else {
         const typeFilter = tab === 'artists' ? 'artist' : tab === 'albums' ? 'album' : 'track';
-        result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, 100, 0));
+        result = await cachedItems(cacheKey, ttl, () => call("get_section_contents", selectedSection, typeFilter, PAGE_SIZE, 0));
       }
       if (requestId !== tabLoadRequestId.current) return;
-      if (tab === 'artists' || tab === 'albums' || tab === 'tracks') setTabHasMore(Boolean(result.has_more));
+      if (libraryId || tab === 'artists' || tab === 'albums' || tab === 'tracks') setTabHasMore(Boolean(result.has_more));
       if (result.error) {
         if (!cached) {
           setError(result.error);
@@ -425,14 +772,16 @@ export function BrowserPage() {
         const tabItems = expectedTypes[tab]
           ? result.items.filter((item: LibraryItem) => expectedTypes[tab]?.includes(item.type))
           : result.items;
-        const firstPageIds = new Set(tabItems.map((item: LibraryItem) => item.id));
-        const mergedItems = cached
-          ? [...tabItems, ...(cachedTabItems || []).filter(item => !firstPageIds.has(item.id))]
+        const ids = new Set(tabItems.map((item: LibraryItem) => item.id));
+        const keepMusicPages = cached && !libraryId && cached.hasMore && (cachedTabItems?.length || 0) > tabItems.length;
+        const displayedItems = keepMusicPages
+          ? [...tabItems, ...(cachedTabItems || []).filter(item => !ids.has(item.id))]
           : tabItems;
-        setItems(mergedItems);
+        setItems(displayedItems);
         itemCache.current.set(cacheKey, {
-          items: mergedItems,
+          items: displayedItems,
           hasMore: Boolean(result.has_more),
+          nextOffset: keepMusicPages ? cached.nextOffset ?? displayedItems.length : result.next_offset ?? result.items.length,
           expiresAt: Date.now() + ttl,
         });
       } else {
@@ -445,9 +794,12 @@ export function BrowserPage() {
         setItems([]);
       }
     } finally {
-      if (requestId === tabLoadRequestId.current) setLoading(false);
+      if (requestId === tabLoadRequestId.current) {
+        setLoading(false);
+        finishSortFocus();
+      }
     }
-  }, [selectedSection, cachedItems]);
+  }, [selectedSection, combinedArtists, sorting, cachedItems]);
 
   useEffect(() => {
     const refreshPlaylists = () => {
@@ -459,56 +811,68 @@ export function BrowserPage() {
   }, [selectedSection, activeTab, subView, loadTabData]);
 
   const loadMoreTabPage = useCallback(async () => {
-    if (!tabHasMore || loadingMoreRef.current || !selectedSection || subView || !['artists', 'albums', 'tracks'].includes(activeTab)) return;
+    const mediaLibrary = sectionForTab(activeTab);
+    const section = mediaLibrary || selectedSection;
+    if (!tabHasMore || loadingMoreRef.current || !section || subView
+      || (!mediaLibrary && !['artists', 'albums', 'tracks'].includes(activeTab))) return;
     const requestId = tabLoadRequestId.current;
     const requestedTab = activeTab;
     loadingMoreRef.current = true;
+    setPaginationError('');
     setLoadingMore(true);
-    const focusedId = document.activeElement instanceof HTMLElement
-      ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
-      : focusedItemId.current;
-    const savedScrollTop = contentRef.current?.scrollTop || 0;
     try {
-      const typeFilter = activeTab === 'artists' ? 'artist' : activeTab === 'albums' ? 'album' : 'track';
-      const offset = items.length;
-      const cacheKey = `tab:${selectedSection}:${activeTab}:${offset}`;
-      const result: any = await cachedItems(cacheKey, 300000,
-        () => call('get_section_contents', selectedSection, typeFilter, 100, offset));
+      const typeFilter = mediaLibrary ? '' : activeTab === 'artists' ? 'artist' : activeTab === 'albums' ? 'album' : 'track';
+      const baseKey = `tab:${section}:${activeTab}${mediaLibrary ? `:${sorting}` : ''}`;
+      const offset = itemCache.current.get(baseKey)?.nextOffset ?? items.length;
+      const cacheKey = `${baseKey}:${offset}`;
+      const result: any = await cachedItems(cacheKey, LIBRARY_CACHE_TTL,
+        () => activeTab === 'artists' && combinedArtists
+          ? call('get_music_artists', PAGE_SIZE, offset)
+          : call('get_section_contents', section, typeFilter, PAGE_SIZE, offset, sorting));
       if (requestId !== tabLoadRequestId.current || requestedTab !== activeTab) return;
       if (result.error) {
-        setError(result.error);
+        setPaginationError('Could not load more library items.');
         return;
       }
       const nextPage: LibraryItem[] = Array.isArray(result.items) ? result.items : [];
       const existing = new Set(items.map(item => item.id));
       const mergedItems = [...items, ...nextPage.filter(item => !existing.has(item.id))];
-      if (focusedId) {
-        pendingFocusId.current = focusedId;
-        pendingScrollTop.current = savedScrollTop;
-        setRestoreFocusTick(value => value + 1);
-      }
+      const nextOffset = result.next_offset ?? offset + nextPage.length;
+      const hasMore = Boolean(result.has_more) && nextOffset > offset;
       setItems(mergedItems);
-      setTabHasMore(Boolean(result.has_more));
-      const baseKey = `tab:${selectedSection}:${activeTab}`;
+      setTabHasMore(hasMore);
       itemCache.current.set(baseKey, {
         items: mergedItems,
-        hasMore: Boolean(result.has_more),
-        expiresAt: Date.now() + 300000,
+        hasMore,
+        nextOffset,
+        expiresAt: Date.now() + LIBRARY_CACHE_TTL,
       });
     } catch (e) {
-      if (requestId === tabLoadRequestId.current && requestedTab === activeTab) setError('Could not load more music library items.');
+      if (requestId === tabLoadRequestId.current && requestedTab === activeTab) setPaginationError('Could not load more library items.');
     } finally {
       if (requestId === tabLoadRequestId.current) {
         loadingMoreRef.current = false;
         setLoadingMore(false);
       }
     }
-  }, [tabHasMore, selectedSection, subView, activeTab, items.length, cachedItems]);
+  }, [tabHasMore, selectedSection, combinedArtists, subView, activeTab, items.length, sorting, cachedItems]);
+
+  useEffect(() => {
+    const viewport = contentRef.current;
+    const target = moreItemsRef.current;
+    if (!viewport || !target || !tabHasMore || loading || loadingMore || paginationError || viewerExpanded) return;
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) void loadMoreTabPage();
+    }, { root: viewport, rootMargin: '0px 0px 160px' });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [tabHasMore, loading, loadingMore, paginationError, loadMoreTabPage, viewerExpanded]);
 
   const loadAlbums = useCallback(async (artistId: string, artistName?: string) => {
-    const requestId = ++tabLoadRequestId.current;
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    const requestId = invalidateTabLoad();
+    setHistory(previous => [...previous, { items, subView, focusedItemId: focusedItemId.current, hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
+    enterContentPending.current = true;
     setLoading(true);
     setError(null);
     setSubView({ type: 'albums', title: artistName || 'Albums', id: artistId });
@@ -527,12 +891,13 @@ export function BrowserPage() {
     } finally {
       if (requestId === tabLoadRequestId.current) setLoading(false);
     }
-  }, [items, subView, searchQuery, cachedItems]);
+  }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
 
   const loadPlaylistTracks = useCallback(async (playlistId: string, playlistName: string) => {
-    const requestId = ++tabLoadRequestId.current;
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    const requestId = invalidateTabLoad();
+    setHistory(previous => [...previous, { items, subView, focusedItemId: focusedItemId.current, hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
+    enterContentPending.current = true;
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: playlistName || 'Playlist', id: playlistId, queueLabel: 'Play Playlist' });
@@ -548,7 +913,7 @@ export function BrowserPage() {
     } finally {
       if (requestId === tabLoadRequestId.current) setLoading(false);
     }
-  }, [items, subView, searchQuery, cachedItems]);
+  }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
 
   useEffect(() => {
     const refreshVisiblePlaylist = (event: Event) => {
@@ -556,7 +921,9 @@ export function BrowserPage() {
       if (!playlistId) return;
       itemCache.current.delete(`playlist:${playlistId}`);
       if (subView?.type !== 'tracks' || subView.queueLabel !== 'Play Playlist' || subView.id !== playlistId) return;
-      const requestId = ++tabLoadRequestId.current;
+      const requestId = invalidateTabLoad();
+      pendingFocusId.current = focusedItemId.current;
+      pendingScrollTop.current = contentRef.current?.scrollTop;
       setLoading(true);
       setError(null);
       call('get_playlist_tracks', playlistId, 200).then((result: any) => {
@@ -574,12 +941,13 @@ export function BrowserPage() {
     };
     window.addEventListener('deckyplex-playlists-change', refreshVisiblePlaylist);
     return () => window.removeEventListener('deckyplex-playlists-change', refreshVisiblePlaylist);
-  }, [subView]);
+  }, [subView, invalidateTabLoad]);
 
   const loadTracks = useCallback(async (albumId: string, albumName?: string) => {
-    const requestId = ++tabLoadRequestId.current;
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    const requestId = invalidateTabLoad();
+    setHistory(previous => [...previous, { items, subView, focusedItemId: focusedItemId.current, hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
     setFocusTreeVersion(version => version + 1);
+    enterContentPending.current = true;
     setLoading(true);
     setError(null);
     setSubView({ type: 'tracks', title: albumName || 'Tracks', id: albumId, queueLabel: 'Play Album' });
@@ -598,44 +966,46 @@ export function BrowserPage() {
     } finally {
       if (requestId === tabLoadRequestId.current) setLoading(false);
     }
-  }, [items, subView, searchQuery, cachedItems]);
+  }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
 
   const handleSearch = useCallback(async () => {
-    if (!searchQuery.trim()) return;
-    const requestId = ++tabLoadRequestId.current;
-    setHistory(previous => [...previous, { items, subView, searchQuery, focusedItemId: focusedItemId.current, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    const query = searchQuery.trim();
+    if (!query) return;
+    const requestId = invalidateTabLoad();
+    if (subView?.type !== 'search') {
+      setHistory(previous => [...previous, { items, subView, focusedItemId: focusedItemId.current, hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    }
     pendingSearchFocus.current = true;
+    setItems([]);
     setLoading(true);
     setError(null);
     setSubView({ type: 'search', title: 'Search Results' });
     try {
-      const cacheKey = `search:${selectedSection}:${searchQuery.trim().toLowerCase()}`;
-      const result: any = await cachedItems(cacheKey, 30000, () => call("search_library", searchQuery, selectedSection, 30));
+      const section = showAllMedia || libraries.length > 1 ? '' : selectedSection;
+      const cacheKey = `search:${showAllMedia ? 'all' : section}:${query.toLowerCase()}`;
+      const result: any = await cachedItems(cacheKey, 30000, () => call("search_library", query, section, 30, showAllMedia));
       if (requestId !== tabLoadRequestId.current) return;
-      if (Array.isArray(result.items)) {
-        setItems(result.items);
-        if (result.items.length === 0) pendingSearchFocus.current = false;
-      } else {
-        pendingSearchFocus.current = false;
-      }
+      if (result?.error) throw new Error(result.error);
+      setItems(Array.isArray(result?.items) ? result.items : []);
     } catch (e) {
       if (requestId !== tabLoadRequestId.current) return;
       setError("Search failed.");
     } finally {
       if (requestId === tabLoadRequestId.current) setLoading(false);
     }
-  }, [searchQuery, selectedSection, items, subView, cachedItems]);
+  }, [searchQuery, selectedSection, items, subView, tabHasMore, showAllMedia, libraries.length, cachedItems, invalidateTabLoad]);
 
   const startTrackQueue = useCallback(async (sourceItems: LibraryItem[], startId?: string, requestedTrack?: LibraryItem) => {
+    setPlaybackRequests(count => count + 1);
     try {
       const fullTrackQueue = sourceItems.filter(entry => entry.type === 'track').map(entry => ({
         id: entry.id,
-        sectionId: selectedSection,
+        sectionId: entry.sectionId || selectedSection,
         title: entry.title || 'Unknown',
         artist: entry.grandparentTitle || entry.artist || '',
         album: entry.parentTitle || '',
         duration: entry.duration || 0,
-        thumb: versionArtwork(entry.thumb || '', artworkRevision),
+        thumb: entry.thumb || '',
       }));
       if (!fullTrackQueue.length) throw new Error('No tracks found to play.');
       let selectedIndex = startId == null ? 0 : fullTrackQueue.findIndex(track => String(track.id) === String(startId));
@@ -643,11 +1013,11 @@ export function BrowserPage() {
         // A click can race a paginated list refresh. Preserve the clicked song
         // as the queue head instead of silently starting at item one.
         const clickedTrack = {
-          id: String(requestedTrack.id), sectionId: selectedSection,
+          id: String(requestedTrack.id), sectionId: requestedTrack.sectionId || selectedSection,
           title: requestedTrack.title || 'Unknown',
           artist: requestedTrack.grandparentTitle || requestedTrack.artist || '',
           album: requestedTrack.parentTitle || '', duration: requestedTrack.duration || 0,
-          thumb: versionArtwork(requestedTrack.thumb || '', artworkRevision),
+          thumb: requestedTrack.thumb || '',
         };
         fullTrackQueue.unshift(clickedTrack);
         selectedIndex = 0;
@@ -665,8 +1035,7 @@ export function BrowserPage() {
       const playbackToken = beginPlaybackRequest();
       // Get stream URL first, then play — playTrack must be called with a valid URL
       // so audio.play() can start immediately from this call stack.
-      const result: any = await call("play_track", trackInfo.id, selectedSection);
-      console.log(`[DeckyPlex] play_track result:`, result);
+      const result: any = await call("play_track", trackInfo.id, trackInfo.sectionId);
       if (!result?.success) {
         const message = result?.error || "Plex did not return a playable audio stream.";
         setError(message);
@@ -682,17 +1051,19 @@ export function BrowserPage() {
     } catch (e) {
       console.error(`[DeckyPlex] play_track exception:`, e);
       setError("Failed to play track.");
+    } finally {
+      setPlaybackRequests(count => count - 1);
     }
-  }, [selectedSection, playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode, artworkRevision]);
+  }, [selectedSection, playTrack, playRemoteQueue, beginPlaybackRequest, remoteMode]);
 
   const handlePlayTrack = useCallback((item: LibraryItem) => {
     void startTrackQueue(items, item.id, item);
   }, [items, startTrackQueue]);
 
   const handlePlayCollection = useCallback(async () => {
-    if (!subView) return;
+    if (!subView || playbackRequests) return;
     if (subView.type === 'albums' && subView.id) {
-      setLoading(true);
+      setPlaybackRequests(count => count + 1);
       setError(null);
       try {
         const result: any = await cachedItems(`artistTracks:${subView.id}`, 300000,
@@ -702,12 +1073,119 @@ export function BrowserPage() {
       } catch (e: any) {
         setError(e?.message || 'Failed to load artist tracks.');
       } finally {
-        setLoading(false);
+        setPlaybackRequests(count => count - 1);
       }
     } else {
       await startTrackQueue(items);
     }
-  }, [subView, cachedItems, startTrackQueue, items]);
+  }, [subView, playbackRequests, cachedItems, startTrackQueue, items]);
+
+  const loadMediaCollection = useCallback(async (item: LibraryItem) => {
+    const requestId = invalidateTabLoad();
+    setHistory(previous => [...previous, { items, subView, focusedItemId: item.id,
+      hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
+    enterContentPending.current = true;
+    setSubView({ type: 'media', id: item.id, title: item.title, mediaType: item.type });
+    setItems([]);
+    setTabHasMore(false);
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await cachedItems(`children:${item.id}`, 60000, () => call('get_metadata_children', item.id));
+      if (requestId !== tabLoadRequestId.current) return;
+      if (result?.error) throw new Error(result.error);
+      setItems(result?.items || []);
+    } catch (error) {
+      if (requestId === tabLoadRequestId.current) {
+        setError(error instanceof Error ? error.message : 'Could not load this Plex collection.');
+      }
+    } finally {
+      if (requestId === tabLoadRequestId.current) setLoading(false);
+    }
+  }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
+
+  const openMedia = useCallback((item: LibraryItem, collectionQueue?: VideoItem[], startPosition?: number) => {
+    if (item.type !== 'photo') stopGamePip();
+    setViewerResume(null);
+    setViewerPresentation(null);
+    setViewerStartPosition(startPosition);
+    const queue = collectionQueue ?? (item.type === 'episode' && subView?.mediaType === 'season'
+      ? queueFromEpisode(items.filter(entry => entry.type === 'episode'), item.id) : undefined);
+    setViewerQueue(queue?.length ? queue : null);
+    viewerOrigin.current = { itemId: collectionQueue ? focusedItemId.current : item.id, scrollTop: contentRef.current?.scrollTop || 0 };
+    setViewerItem(item);
+  }, [items, subView?.mediaType]);
+
+  const collectionId = subView?.mediaType === 'show' || subView?.mediaType === 'season' ? subView.id : undefined;
+  const collectionKey = collectionId && serverId ? `${serverId}:${collectionId}` : '';
+  const requestCollection = useCallback(() => {
+    if (!collectionKey || !collectionId) return Promise.resolve([]);
+    if (collectionRequest.current?.key === collectionKey) return collectionRequest.current.episodes;
+    const episodes = getEpisodeQueue(collectionId, serverId);
+    collectionRequest.current = { key: collectionKey, episodes };
+    // Prefetch and playback share this request. A failed prefetch must allow a later retry.
+    void episodes.then(items => {
+      if (!items?.length && collectionRequest.current?.episodes === episodes) collectionRequest.current = null;
+    }, () => {
+      if (collectionRequest.current?.episodes === episodes) collectionRequest.current = null;
+    });
+    return episodes;
+  }, [collectionKey, collectionId, serverId]);
+
+  useEffect(() => {
+    if (!collectionKey) return;
+    if (viewerExpanded) {
+      collectionRequest.current = null;
+      return;
+    }
+    const refresh = () => { void requestCollection().catch(() => {}); };
+    const progressChanged = () => {
+      collectionRequest.current = null;
+      refresh();
+    };
+    refresh();
+    window.addEventListener(videoProgressEvent, progressChanged);
+    return () => window.removeEventListener(videoProgressEvent, progressChanged);
+  }, [collectionKey, requestCollection, viewerExpanded]);
+
+  const playVideoCollection = async () => {
+    if (!collectionKey || !subView || playbackRequests || actionDialogRef.current) return;
+    const requestId = tabLoadRequestId.current;
+    setPlaybackRequests(count => count + 1);
+    setError(null);
+    try {
+      const collection = await requestCollection();
+      if (requestId !== tabLoadRequestId.current) return;
+      const first = collection[0];
+      if (!first) throw new Error('No episodes are available in this Plex collection.');
+      const resume = resumeEpisode(collection);
+      if (!resume || !collectionResumes(collection)) {
+        openMedia(first, collection, 0);
+        return;
+      }
+
+      const position = resumePosition(resume.viewOffset || 0, resume.duration || 0);
+      actionDialogRef.current = showPlaybackStartDialog({
+        title: subView.title,
+        actionTitle: subView.mediaType === 'show' ? 'Play series' : 'Play season',
+        firstLabel: episodeLabel(first),
+        resumeLabel: episodeLabel(resume),
+        position,
+        onClose: start => {
+          actionDialogRef.current = null;
+          if (requestId !== tabLoadRequestId.current) return;
+          if (start === 'resume') openMedia(resume, queueFromEpisode(collection, resume.id), position);
+          if (start === 'beginning') openMedia(first, collection, 0);
+        },
+      });
+    } catch (error) {
+      if (requestId === tabLoadRequestId.current) {
+        setError(error instanceof Error ? error.message : 'Could not play this Plex collection.');
+      }
+    } finally {
+      setPlaybackRequests(count => count - 1);
+    }
+  };
 
   const handleItemClick = useCallback((item: LibraryItem) => {
     focusedItemId.current = item.id;
@@ -719,19 +1197,12 @@ export function BrowserPage() {
       loadPlaylistTracks(item.id, item.title);
     } else if (item.type === 'track') {
       handlePlayTrack(item);
+    } else if (['show', 'season', 'photoalbum'].includes(item.type)) {
+      void loadMediaCollection(item);
+    } else if (['movie', 'episode', 'clip', 'photo'].includes(item.type)) {
+      openMedia(item);
     }
-  }, [loadAlbums, loadTracks, loadPlaylistTracks, handlePlayTrack]);
-
-  const handleSearchItemClick = useCallback((item: LibraryItem) => {
-    focusedItemId.current = item.id;
-    if (item.type === 'track') {
-      handlePlayTrack(item);
-    } else if (item.type === 'album') {
-      loadTracks(item.id, item.title);
-    } else if (item.type === 'artist') {
-      loadAlbums(item.id, item.title);
-    }
-  }, [loadAlbums, loadTracks, handlePlayTrack]);
+  }, [loadAlbums, loadTracks, loadPlaylistTracks, handlePlayTrack, loadMediaCollection, openMedia]);
 
   const formatDuration = (ms: number) => {
     const seconds = Math.floor(ms / 1000);
@@ -740,82 +1211,107 @@ export function BrowserPage() {
     return `${minutes}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const gridView = subView?.type === 'albums' || (!subView && ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab));
+  const homeView = !subView && activeTab === 'videoHome';
+  const gridView = homeView || subView?.type === 'albums' || subView?.type === 'media'
+    || (!subView && (!!sectionForTab(activeTab) || ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab)));
+  const videoCollection = subView?.mediaType === 'show' || subView?.mediaType === 'season';
+  const hasCollectionAction = videoCollection || subView?.type === 'albums' || subView?.type === 'tracks';
 
-  const handleGridDirection = (event: import('@decky/ui').GamepadEvent) => {
-    if (event.detail.button !== GamepadButton.DIR_UP) return;
-    if (subView?.type === 'tracks') {
-      const focusedId = document.activeElement instanceof HTMLElement
-        ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
-        : undefined;
-      if (items.length && focusedId === items[0].id) {
-        event.preventDefault();
-        event.stopPropagation();
-        playCollectionRef.current?.focus();
-      }
-      return;
-    }
-    if (subView) return;
-    const focusedId = document.activeElement instanceof HTMLElement
-      ? document.activeElement.closest<HTMLElement>('[data-browser-item-id]')?.dataset.browserItemId
-      : undefined;
-    const focusedIndex = items.findIndex(item => item.id === (focusedId || focusedItemId.current));
-    const isTopRow = gridView ? focusedIndex >= 0 && focusedIndex < gridColumns : focusedIndex === 0;
-    if (isTopRow) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
+  const moveBetweenItems = (event: GamepadEvent, index: number) => {
+    const { button } = event.detail;
+    if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
+    const nextIndex = index + (button === GamepadButton.DIR_UP ? -1 : 1);
+    const target = nextIndex < 0 ? playCollectionRef.current ?? searchFormRef.current?.querySelector('input')
+      : nextIndex < items.length ? contentRef.current?.querySelector<HTMLElement>(`[data-browser-item-index="${nextIndex}"]`) : null;
+    if (!target) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    target.focus({ preventScroll: true });
   };
 
   const jumpToListTop = (event: import('@decky/ui').GamepadEvent) => {
     event.preventDefault();
-    event.stopPropagation();
+    event.stopImmediatePropagation();
     if (!items.length) return;
     if (contentRef.current) contentRef.current.scrollTop = 0;
-    const firstItem = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
-      .find(element => element.dataset.browserItemId === items[0].id);
-    if (firstItem) firstItem.focus({ preventScroll: true });
+    firstItemRef.current?.focus({ preventScroll: true });
   };
 
-  const renderItemRow = (item: LibraryItem, idx: number | string, onClick: () => void) => {
-    const imageUrl = versionArtwork(item.type === 'artist' ? (item.art || item.thumb || '') : (item.thumb || item.art || ''), artworkRevision);
-    const fallbackIcon = item.type === 'track' ? <FaMusic /> : item.type === 'album' ? <FaCompactDisc /> : item.type === 'playlist' ? <FaListUl /> : <FaUser />;
+  const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false) => {
+    const kind = item.type;
+    const showPoster = homeView && kind === 'episode';
+    const originalImage = showPoster ? item.poster : kind === 'artist' ? item.art || item.thumb : item.thumb || item.art;
+    const imageUrl = (showPoster ? item.gridPoster : item.gridThumb) || originalImage;
+    const portrait = showPoster || ['movie', 'show', 'season'].includes(kind);
+    const canQueueNext = kind === 'episode' && (pipEpisodeQueue || !!viewerQueue && viewerItem?.type === 'episode');
+    const queueNext = (event: GamepadEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (pipEpisodeQueue) queueGamePipEpisodeNext(item);
+      else if (viewerItem) setViewerQueue(queue => insertNextEpisode(queue ?? [viewerItem], viewerItem.id, item));
+    };
+    const title = episodeLabel(item);
+    const subtitle = showPoster && item.grandparentTitle
+      ? title
+      : kind === 'album' ? item.artist || item.grandparentTitle || item.parentTitle
+      : kind === 'artist' && combinedArtists && !subView ? libraries.find(library => library.id === item.sectionId)?.name
+      : undefined;
+    const fallbackIcon = kind === 'track' ? <FaMusic />
+      : kind === 'album' ? <FaCompactDisc /> : kind === 'playlist' ? <FaListUl />
+      : ['movie', 'show', 'season', 'episode', 'clip'].includes(kind) ? <FaFilm />
+      : ['photo', 'photoalbum'].includes(kind) ? <FaImage /> : <FaUser />;
+    const restoreOriginalImage = (event: React.SyntheticEvent<HTMLImageElement>) => {
+      if (originalImage && event.currentTarget.getAttribute('src') !== originalImage) {
+        event.currentTarget.src = originalImage;
+      }
+    };
+    const focusItem = () => {
+      focusedItemId.current = item.id;
+      if (subView) return;
+      tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
+      if (!paginationError && idx >= items.length - (gridView ? gridColumns * 2 : 6)) void loadMoreTabPage();
+    };
     if (gridView) {
       return (
         <Focusable
           key={item.id}
           ref={idx === 0 ? firstItemRef : undefined}
           data-browser-item-id={item.id}
-          onFocus={() => {
-            focusedItemId.current = item.id;
-            if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
-            if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
-          }}
+          data-browser-item-index={idx}
+          data-browser-home-start={firstHomeRow || undefined}
+          onFocus={focusItem}
           onActivate={onClick}
           onClick={onClick}
           onCancel={handleCancel}
-          onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : undefined}
+          onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : canQueueNext ? 'Play next' : sortable ? 'Sort by' : undefined}
           onSecondaryButton={item.type === 'playlist' ? (event) => {
             event.preventDefault();
             event.stopPropagation();
             openPlaylistOptions(item);
-          } : undefined}
-          style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0.35rem', gap: '0.3rem' }}
+          } : canQueueNext ? queueNext : sortable ? openSortMenu : undefined}
+          style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0 0.35rem 0.35rem', gap: '0.3rem' }}
         >
-          <div style={{ width: '100%', aspectRatio: '1 / 1', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            {imageUrl ? <img src={imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
+          <div style={{ width: '100%', aspectRatio: portrait ? '2 / 3'
+              : ['episode', 'clip'].includes(kind) ? '16 / 9' : '1 / 1',
+            contain: 'paint', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            {imageUrl ? <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
+              style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
           </div>
           <div style={{ fontWeight: 500, lineHeight: '1.2', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
-            {item.title || '(unknown)'}
+            {(showPoster ? item.grandparentTitle || title : title) || '(unknown)'}
           </div>
-          {(item.type === 'album' && (item.artist || item.grandparentTitle || item.parentTitle)) && (
+          {subtitle && (
             <div style={{ fontSize: '0.75rem', lineHeight: '1.15', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
-              {item.artist || item.grandparentTitle || item.parentTitle}
+              {subtitle}
             </div>
           )}
           {item.type === 'playlist' && item.leafCount != null && (
             <div style={{ fontSize: '0.75rem', lineHeight: '1.15', opacity: 0.65, margin: 0 }}>{item.leafCount} tracks</div>
           )}
+          {item.type === 'movie' && item.year ? (
+            <div style={{ fontSize: '0.75rem', opacity: 0.65 }}>{item.year}</div>
+          ) : null}
         </Focusable>
       );
     }
@@ -830,7 +1326,8 @@ export function BrowserPage() {
                 flexShrink: 0,
                 backgroundColor: 'rgba(255,255,255,0.1)',
               }}>
-                <img src={imageUrl} alt="" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
+                  style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
               </div>
             ) : (
               <div style={{ minWidth: '1.5rem', textAlign: 'center' }}>
@@ -839,7 +1336,7 @@ export function BrowserPage() {
             )}
             <div style={{ display: 'flex', flex: 1, minWidth: 0, flexDirection: 'column', justifyContent: 'center', gap: '0.1rem', overflow: 'hidden' }}>
               <div style={{ fontWeight: 500, lineHeight: '1.15', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
-                {item.title || '(unknown)'}
+                {title || '(unknown)'}
               </div>
               {item.type === 'track' && (item.grandparentTitle || item.artist || item.parentTitle) && (
                 <div style={{ fontSize: '0.75rem', lineHeight: '1.1', opacity: 0.65, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
@@ -871,20 +1368,18 @@ export function BrowserPage() {
     );
     const rowStyle = { display: 'block', width: '100%', boxSizing: 'border-box' as const, padding: '0.1rem 0.35rem', borderBottom: '1px solid rgba(255,255,255,0.08)' };
     if (item.type === 'track') {
-      const trackInfo = { id: item.id, sectionId: selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: versionArtwork(item.thumb || '', artworkRevision) };
+      const trackInfo = { id: item.id, sectionId: item.sectionId || selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: item.thumb || '' };
       return (
         <Focusable
           key={item.id}
             ref={idx === 0 ? firstItemRef : undefined}
             data-browser-item-id={item.id}
-          onFocus={() => {
-            focusedItemId.current = item.id;
-            if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
-            if (typeof idx === 'number' && idx >= items.length - 6) void loadMoreTabPage();
-          }}
+            data-browser-item-index={idx}
+            onFocus={focusItem}
             onActivate={onClick}
             onClick={onClick}
             onCancel={handleCancel}
+            onGamepadDirection={(event) => moveBetweenItems(event, idx)}
             onSecondaryActionDescription="Options"
             onSecondaryButton={(event) => {
               event.preventDefault();
@@ -899,18 +1394,16 @@ export function BrowserPage() {
       );
     }
     return (
-      <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id}
-        onFocus={() => {
-          focusedItemId.current = item.id;
-          if (!subView) tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
-        }} onActivate={onClick} onClick={onClick}
-        onCancel={handleCancel}
-        onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : undefined}
+      <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id} data-browser-item-index={idx}
+        onFocus={focusItem}
+        onActivate={onClick} onClick={onClick}
+        onCancel={handleCancel} onGamepadDirection={(event) => moveBetweenItems(event, idx)}
+        onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : canQueueNext ? 'Play next' : sortable ? 'Sort by' : undefined}
         onSecondaryButton={item.type === 'playlist' ? (event) => {
           event.preventDefault();
           event.stopPropagation();
           openPlaylistOptions(item);
-        } : undefined}
+        } : canQueueNext ? queueNext : sortable ? openSortMenu : undefined}
         style={rowStyle}>
         {rowDetails}
       </Focusable>
@@ -918,6 +1411,19 @@ export function BrowserPage() {
   };
 
   const renderContent = () => {
+    const title = subView?.title || tabs.find(tab => tab.key === activeTab)?.title || 'Library';
+    const initialLoading = (
+      <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minHeight: '2.5rem', paddingInline: '0.35rem' }}>
+        <InlineSpinner />
+        <DialogBodyText style={{ margin: 0 }}>{checkingConnection ? 'Checking Plex connection…' : 'Loading…'}</DialogBodyText>
+      </div>
+    );
+    if (checkingConnection) {
+      return <div>
+        <div style={browserHeaderStyle}><DialogLabel style={{ margin: 0 }}>{title}</DialogLabel></div>
+        {initialLoading}
+      </div>;
+    }
     if (!connected) {
       return (
         <PanelSection>
@@ -931,37 +1437,40 @@ export function BrowserPage() {
     }
 
     return (
-      <PanelSection>
-        <PanelSectionRow>
-          <DialogLabel style={{ flex: 1, minWidth: 0 }}>
-            {subView?.title || (activeTab === 'recentlyAdded' ? 'Recently Added' : activeTab === 'recent' ? 'Recently Played' : activeTab === 'playlists' ? 'Playlists' : activeTab === 'search' ? 'Search' : activeTab === 'tracks' ? 'Songs' : activeTab[0].toUpperCase() + activeTab.slice(1))}
+      <div>
+        <div style={browserHeaderStyle}>
+          <DialogLabel style={{ flex: 1, minWidth: 0, margin: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {title}
           </DialogLabel>
-          {loading && <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />}
-          {subView && (subView.type === 'albums' || subView.type === 'tracks') && (
-            <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef} onClick={handlePlayCollection} onCancelButton={handleCancel} disabled={loading}>
-              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
-            </Button>
-          )}
-        </PanelSectionRow>
-
-        {remoteMode && (
-          <PanelSectionRow>
-            <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem' }}>
+          {playbackRequests > 0 && <InlineSpinner />}
+          {sortable && <Button ref={sortButtonRef} onClick={() => openSortMenu()} onCancelButton={handleCancel}>
+            {VIDEO_SORTS.find(sort => sort.id === sorting)?.title || 'Sort by'}
+          </Button>}
+          {remoteMode && (
+            <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem', margin: 0 }}>
               Playback target: {remotePlayerName || 'remote Plex player'}
             </DialogBodyText>
-          </PanelSectionRow>
-        )}
+          )}
+          {hasCollectionAction && subView && !loading && (
+            <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef}
+              onClick={videoCollection ? playVideoCollection : handlePlayCollection} onCancelButton={handleCancel}
+              onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
+              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{videoCollection
+                ? subView.mediaType === 'show' ? 'Play series' : 'Play season'
+                : remoteMode ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
+            </Button>
+          )}
+        </div>
 
-        {!subView && activeTab === 'search' && (
-          <PanelSectionRow>
-            <div style={{ width: '100%', padding: '0.55rem 0 0.7rem', boxSizing: 'border-box' }}>
+        {activeTab === 'search' && (!subView || subView.type === 'search') && (
+            <div ref={searchFormRef} style={{ width: '100%', padding: '0 0.35rem 0.7rem', boxSizing: 'border-box' }}>
               <Focusable flow-children="horizontal" onCancel={handleCancel} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
                 label=""
                 style={{ flex: '1 1 32rem', minWidth: '320px', width: '32rem', maxWidth: '70vw', boxSizing: 'border-box' }}
                 value={searchQuery}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSearchQuery(e.target.value)}
-                placeholder="Search artists, albums, tracks..."
+                placeholder={showAllMedia ? 'Search your Plex libraries…' : 'Search artists, albums, tracks…'}
                 onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
                   if (e.key === 'Enter') {
                     e.preventDefault();
@@ -969,12 +1478,11 @@ export function BrowserPage() {
                   }
                 }}
               />
-              <Button onClick={handleSearch}>
+              <Button onClick={handleSearch} aria-label="Search">
                 <FaSearch />
               </Button>
             </Focusable>
             </div>
-          </PanelSectionRow>
         )}
 
         {error && (
@@ -983,36 +1491,62 @@ export function BrowserPage() {
           </PanelSectionRow>
         )}
 
-        {gridView && !gridPreferenceSet && (
-          <PanelSectionRow><Button onClick={openGridColumnsDialog}>Choose browser grid width</Button></PanelSectionRow>
+        {(loading || loadingLibraries) && initialLoading}
+        {homeView && !loadingLibraries && !error && (
+          <Focusable flow-children="geometric" onCancel={handleCancel}
+            onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
+            {VIDEO_HOME_ROWS.map((row, rowIndex) => {
+              const result = homeData[row.id];
+              if (result && !result.error && !result.items.length) return null;
+              const startIndex = VIDEO_HOME_ROWS.slice(0, rowIndex)
+                .reduce((count, previous) => count + (homeData[previous.id]?.items.length || 0), 0);
+              return <section key={row.id} style={{ marginBottom: '1rem' }}>
+                <div style={{ padding: '0.25rem 0.35rem 0.5rem' }}>
+                  <DialogLabel style={{ margin: 0 }}>{row.title}</DialogLabel>
+                </div>
+                {!result ? <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginInline: '0.35rem' }}>
+                  <InlineSpinner /><span>Loading…</span>
+                </div> : result.error ? <DialogBodyText style={{ margin: '0 0.35rem', opacity: 0.7 }}>
+                  {result.error}
+                </DialogBodyText> :
+                  <div style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem' }}>
+                    {result.items.map((item, index) => renderItemRow(item, startIndex + index, () => handleItemClick(item), startIndex === 0))}
+                  </div>}
+              </section>;
+            })}
+          </Focusable>
         )}
-
-        {!loading && !error && items.length > 0 && (
-          <PanelSectionRow>
-            <div style={{ width: '100%', paddingTop: subView?.type === 'search' ? '0.45rem' : 0, boxSizing: 'border-box' }}>
+        {!homeView && !loading && !loadingLibraries && !error && items.length > 0 && (
+            <div style={{ width: '100%' }}>
             {gridView ? (
-              <Focusable flow-children="geometric" onCancel={handleCancel} onGamepadDirection={handleGridDirection}
+              <Focusable flow-children="geometric" onCancel={handleCancel}
                 onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
                 style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem', width: '100%' }}>
                 {items.map((item, idx) => {
-                  const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
+                  const handleClick = () => handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
                 })}
               </Focusable>
             ) : (
               <Focusable key={`list-${activeTab}-${subView?.type || 'root'}-${subView?.id || ''}-${focusTreeVersion}`} flow-children="column" onCancel={handleCancel}
-                onGamepadDirection={handleGridDirection} onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
+                onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
                 style={{ display: 'flex', flexDirection: 'column', width: '100%' }}>
                 {items.map((item, idx) => {
-                  const handleClick = () => subView?.type === 'search' ? handleSearchItemClick(item) : handleItemClick(item);
+                  const handleClick = () => handleItemClick(item);
                   return renderItemRow(item, idx, handleClick);
                 })}
               </Focusable>
             )}
             </div>
-          </PanelSectionRow>
         )}
-        {loadingMore && (
+        {gridView && !gridPreferenceSet && (
+          <PanelSectionRow><Button onClick={openGridColumnsDialog}>Choose browser grid width</Button></PanelSectionRow>
+        )}
+        {!subView && tabHasMore && <div ref={moreItemsRef} aria-hidden="true" style={{ height: 1 }} />}
+        {!subView && paginationError && (
+          <PanelSectionRow><Button onClick={() => void loadMoreTabPage()}>Retry loading more</Button></PanelSectionRow>
+        )}
+        {!subView && loadingMore && (
           <PanelSectionRow>
             <div style={{ display: 'flex', justifyContent: 'center', width: '100%', padding: '0.35rem 0' }}>
               <Spinner style={{ width: '18px', height: '18px', flexShrink: 0 }} />
@@ -1020,7 +1554,8 @@ export function BrowserPage() {
           </PanelSectionRow>
         )}
 
-        {!loading && !error && items.length === 0 && !subView && activeTab !== 'search' && (
+        {!loading && !loadingLibraries && !error && items.length === 0 && !subView && activeTab !== 'search'
+          && (!homeView || VIDEO_HOME_ROWS.every(row => homeData[row.id] && !homeData[row.id]?.error)) && (
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.5 }}>
               No items found.
@@ -1042,20 +1577,85 @@ export function BrowserPage() {
             <DialogBodyText style={{ opacity: 0.5 }}>No tracks found.</DialogBodyText>
           </PanelSectionRow>
         )}
-      </PanelSection>
+        {!loading && !error && items.length === 0 && subView?.type === 'media' && (
+          <PanelSectionRow><DialogBodyText style={{ opacity: 0.5 }}>No items found.</DialogBodyText></PanelSectionRow>
+        )}
+      </div>
     );
   };
 
-  const tabKeys: BrowserTab[] = ['artists', 'albums', 'tracks', 'recent', 'recentlyAdded', 'playlists', 'search'];
-  const tabConfig = [
-    { title: 'Artists', icon: <FaUser /> },
-    { title: 'Albums', icon: <FaCompactDisc /> },
-    { title: 'Songs', icon: <FaMusic /> },
-    { title: 'Recently Played', icon: <FaHistory /> },
-    { title: 'Recently Added', icon: <FaCompactDisc /> },
-    { title: 'Playlists', icon: <FaListUl /> },
-    { title: 'Search', icon: <FaSearch /> },
+  const musicTabs = [
+    { key: 'artists', title: 'Artists', icon: <FaUser /> },
+    { key: 'albums', title: 'Albums', icon: <FaCompactDisc /> },
+    { key: 'tracks', title: 'Songs', icon: <FaMusic /> },
+    { key: 'recent', title: 'Recently Played', icon: <FaHistory /> },
+    { key: 'recentlyAdded', title: 'Recently Added', icon: <FaCompactDisc /> },
+    { key: 'playlists', title: 'Playlists', icon: <FaListUl /> },
+  ] as const;
+  const videoLibraries = libraries.filter(library => library.type !== 'artist');
+  const hasVideoHome = videoLibraries.some(library => library.type === 'movie' || library.type === 'show');
+  const tabs: { key: BrowserTab; title: string; icon: React.ReactNode }[] = [
+    ...(selectedSection || !libraries.length ? musicTabs : []),
+    { key: 'search', title: 'Search', icon: <FaSearch /> },
+    ...(hasVideoHome ? [{ key: 'videoHome' as const, title: 'Home', icon: <FaHome /> }] : []),
+    ...videoLibraries.map((library): { key: LibraryTab; title: string; icon: React.ReactNode } => ({
+      key: `library:${library.id}`,
+      title: library.name,
+      icon: library.type === 'photo' ? <FaImage /> : <FaFilm />,
+    })),
   ];
+
+  useEffect(() => {
+    const browser = browserRef.current;
+    if (viewerExpanded || !browser) return;
+    const moveAtBoundary = (event: Event, button: GamepadButton) => {
+      if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
+      // Steam sends controller input to the focused navigation node, which can
+      // differ from the DOM's active element when Gaming Mode uses virtual focus.
+      const active = event.target as HTMLElement | null;
+      if (!active?.closest) return;
+      const sidebar = sidebarRef.current;
+      const content = contentRef.current;
+      let target: HTMLElement | null | undefined;
+      if (sidebar?.contains(active)) {
+        const tab = active.closest('[data-browser-tab]');
+        if (!tab) return;
+        const tabs = Array.from(sidebar.querySelectorAll<HTMLElement>('[data-browser-tab]'));
+        if (tab !== (button === GamepadButton.DIR_UP ? tabs[0] : tabs[tabs.length - 1])) return;
+      } else if (content?.contains(active)) {
+        const collection = playCollectionRef.current;
+        if (collection?.contains(active)) {
+          if (button === GamepadButton.DIR_DOWN) {
+            target = lastCollectionItem.current ?? firstItemRef.current;
+            lastCollectionItem.current = null;
+          }
+        } else if (button === GamepadButton.DIR_UP) {
+          const card = active.closest<HTMLElement>('[data-browser-item-index]');
+          if (!card || Number(card.dataset.browserItemIndex) >= (gridView ? gridColumns : 1)
+              || (homeView && !card.hasAttribute('data-browser-home-start'))) return;
+          lastCollectionItem.current = collection ? card : null;
+          target = collection ?? searchFormRef.current?.querySelector('input');
+        } else return;
+      } else return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (target?.isConnected) target.focus({ preventScroll: true });
+      else if (button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active)) {
+        firstItemRef.current?.focus({ preventScroll: true });
+      }
+    };
+    const onButtonDown = (event: Event) => moveAtBoundary(event, (event as GamepadEvent).detail?.button);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'ArrowUp') moveAtBoundary(event, GamepadButton.DIR_UP);
+      if (event.key === 'ArrowDown') moveAtBoundary(event, GamepadButton.DIR_DOWN);
+    };
+    browser.addEventListener('vgp_onbuttondown', onButtonDown, true);
+    browser.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      browser.removeEventListener('vgp_onbuttondown', onButtonDown, true);
+      browser.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [viewerExpanded, gridView, gridColumns, homeView]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -1066,66 +1666,130 @@ export function BrowserPage() {
       pendingScrollTop.current = savedPosition.scrollTop;
       setRestoreFocusTick(value => value + 1);
     }
-    if (!loading && (items.length > 0 || activeTab === 'search')) {
+    if (!loading && !loadingLibraries && (items.length > 0 || activeTab === 'search')) {
       if (!savedPosition) {
         enterContentPending.current = false;
-        if (activeTab === 'search') contentRef.current?.querySelector<HTMLElement>('input,button,[tabindex]')?.focus();
-        else firstItemRef.current?.focus();
+        if (searchFormRef.current) searchFormRef.current.querySelector('input')?.focus();
+        else firstItemRef.current?.focus({ preventScroll: homeView });
       }
     }
   };
 
-  return (
+  const episodes = viewerItem?.type === 'episode' ? viewerQueue ?? [viewerItem] : [];
+  const playEpisode = (id: string, presentation: VideoPresentation) => {
+    const next = latestViewerQueue.current?.find(episode => episode.id === id);
+    if (!next || viewerItem?.id === id) return false;
+    if (viewerOrigin.current.itemId && items.some(entry => entry.id === next.id)) viewerOrigin.current.itemId = next.id;
+    setViewerResume(null);
+    setViewerPresentation(presentation);
+    setViewerStartPosition(undefined);
+    setViewerItem(next);
+    return true;
+  };
+
+  const browser = !viewerExpanded && (
     <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
     <div
+      ref={browserRef}
       onFocusCapture={(event) => {
-        focusZone.current = event.target instanceof HTMLElement && event.target.closest('[data-browser-zone="sidebar"]') ? 'sidebar' : 'content';
-        if (focusZone.current === 'content' && event.target instanceof HTMLElement) {
-          keepFocusedElementVisible(event.target);
-        }
+        if (!(event.target instanceof HTMLElement)) return;
+        const inSidebar = !!event.target.closest('[data-browser-zone="sidebar"]');
+        focusZone.current = inSidebar ? 'sidebar' : 'content';
+        keepFocusedElementVisible(event.target, inSidebar);
       }}
-      style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0, overflow: 'hidden' }}
+      style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0,
+        overflow: 'hidden' }}
     >
       <div data-browser-zone="sidebar" ref={sidebarRef}
-        style={{ width: '22%', minWidth: '180px', maxWidth: '260px', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)', padding: '0.35rem 0.45rem 0.5rem 0.2rem', overflowY: 'auto' }}>
-        <DialogLabel style={{ display: 'block', padding: '0.5rem 0.65rem 0.8rem' }}>DeckyPlex</DialogLabel>
+        style={{ width: 'clamp(140px, 13vw, 175px)', boxSizing: 'border-box', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)',
+          padding: '0.5rem 0.4rem 110px 0.2rem', scrollPaddingBottom: '110px', overflowY: 'auto' }}>
+        <div style={browserHeaderStyle}><DialogLabel style={{ margin: 0 }}>DeckyPlex</DialogLabel></div>
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
-          {tabConfig.map((config, idx) => (
+          {tabs.map(({ key: tab, title, icon }) => (
+            <Fragment key={tab}>
+            {(hasVideoHome ? tab === 'videoHome' : tab === `library:${videoLibraries[0]?.id}`) &&
+              <div style={{ margin: '0.45rem 0.65rem 0.35rem', fontSize: '0.73rem', color: '#aeb9c5' }}>Video</div>}
             <Focusable
-              key={tabKeys[idx]}
-              data-browser-tab={tabKeys[idx]}
+              data-browser-tab={tab}
+              preferredFocus={tab === activeTab}
               onFocus={() => {
                 focusZone.current = 'sidebar';
-                selectTab(tabKeys[idx]);
+                selectTab(tab);
               }}
               onActivate={enterContent}
               onClick={enterContent}
-              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tabKeys[idx] ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tabKeys[idx] ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px', whiteSpace: 'nowrap' }}
+              onSecondaryActionDescription={sortable && tab === activeTab ? 'Sort by' : undefined}
+              onSecondaryButton={sortable && tab === activeTab ? openSortMenu : undefined}
+              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px', whiteSpace: 'nowrap' }}
             >
-              <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{config.icon}</span>
-              <span style={{ fontWeight: 400 }}>{config.title}</span>
+              <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
+              <span style={{ fontWeight: 400, fontSize: '0.85rem', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{title}</span>
             </Focusable>
+            </Fragment>
           ))}
         </Focusable>
       </div>
-        <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.75rem 0.5rem 150px 0', boxSizing: 'border-box', scrollPaddingBottom: '150px' }}>
+        <div data-browser-zone="content" ref={contentRef} style={{ flex: 1, minWidth: 0, minHeight: 0, height: '100%', overflowY: 'auto', padding: '0.5rem 0.5rem 150px 0', boxSizing: 'border-box', scrollPaddingBottom: '150px' }}>
         {renderContent()}
       </div>
     </div>
     </Focusable>
   );
-}
 
-function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
+  return (
+    <>
+      {browser}
+      {viewerItem && <MediaViewer key={viewerResume ? `${viewerItem.id}-from-pip` : viewerItem.id} item={viewerItem}
+        subtitle={viewerItem.grandparentTitle || viewerItem.parentTitle}
+        photo={viewerItem.type === 'photo'} initialVolume={localVolume} initialPlayback={viewerResume}
+        initialPosition={viewerStartPosition}
+        initialPresentation={viewerPresentation} close={closeMedia}
+        overGamePip={overGamePip}
+        episodes={episodes} episodeQueueReady={!!viewerQueue} playEpisode={playEpisode}
+        removeEpisode={id => {
+          if (id !== viewerItem.id) setViewerQueue(queue => queue?.filter(episode => episode.id !== id) ?? null);
+        }}
+        onPlaying={() => { if (!remoteMode && playbackState === 'playing') pause(); }} />}
+    </>
+  );
+});
+
+function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
   initialColumns: number;
   onPreview: (columns: number) => void;
+  onConfirm: (columns: number) => Promise<void>;
   onClose: () => void;
 }) {
   const [columns, setColumns] = useState(initialColumns);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const commitInProgress = useRef(false);
   const changeColumns = (next: number) => {
-    const value = Math.max(3, Math.min(8, next));
+    if (commitInProgress.current) return;
+    const value = Math.max(3, Math.min(9, next));
     setColumns(value);
     onPreview(value);
+  };
+  const saveColumns = async (value: number) => {
+    if (commitInProgress.current) return;
+    commitInProgress.current = true;
+    setSaving(true);
+    setError('');
+    try {
+      await onConfirm(value);
+      onClose();
+    } catch {
+      setError('Could not save the grid width.');
+      setSaving(false);
+      commitInProgress.current = false;
+    }
+  };
+  const confirm = () => saveColumns(columns);
+  const cancel = () => {
+    if (commitInProgress.current) return;
+    setColumns(DEFAULT_GRID_COLUMNS);
+    onPreview(DEFAULT_GRID_COLUMNS);
+    void saveColumns(DEFAULT_GRID_COLUMNS);
   };
   const handleDirection = (event: import('@decky/ui').GamepadEvent) => {
     if (event.detail.button === GamepadButton.DIR_LEFT) {
@@ -1137,18 +1801,19 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
     }
   };
   return (
-    <ModalRoot closeModal={onClose} onCancel={onClose} onOK={onClose}>
+    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={confirm} bDisableBackgroundDismiss={saving}>
       <PanelSection title="Choose grid width">
         <PanelSectionRow>
           <Focusable
             flow-children="horizontal"
             onGamepadDirection={handleDirection}
-            onActivate={onClose}
-            onClick={onClose}
+            onActivate={confirm}
+            onClick={confirm}
+            onOKActionDescription="Confirm"
             role="slider"
             aria-label="Grid columns"
             aria-valuemin={3}
-            aria-valuemax={8}
+            aria-valuemax={9}
             aria-valuenow={columns}
             tabIndex={0}
             onKeyDown={(event) => {
@@ -1157,7 +1822,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
                 changeColumns(columns + (event.key === 'ArrowRight' ? 1 : -1));
               } else if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
-                onClose();
+                void confirm();
               }
             }}
             style={{ width: '100%', padding: '0.55rem 0.7rem', borderRadius: '4px', background: 'rgba(255,255,255,0.06)' }}
@@ -1165,16 +1830,23 @@ function GridColumnsDialog({ initialColumns, onPreview, onClose }: {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem' }}>
               <span>Grid columns</span><strong>{columns}</strong>
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '0.28rem' }}>
-              {Array.from({ length: 6 }, (_, index) => (
-                <div key={index} style={{ height: '0.45rem', borderRadius: '3px', background: index < columns - 2 ? '#66c0f4' : 'rgba(255,255,255,0.2)' }} />
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(9, 1fr)', gap: '0.28rem' }}>
+              {Array.from({ length: 9 }, (_, index) => (
+                <div key={index} style={{ height: '0.45rem', borderRadius: '3px', background: index < columns ? '#66c0f4' : 'rgba(255,255,255,0.2)' }} />
               ))}
             </div>
           </Focusable>
         </PanelSectionRow>
         <PanelSectionRow>
-          <DialogBodyText style={{ opacity: 0.7 }}>Use left and right to adjust. Press A to save; B closes.</DialogBodyText>
+          <div style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.8rem' }}>
+            <DialogBodyText style={{ opacity: 0.7, margin: 0 }}>Change anytime in Settings › Interface.</DialogBodyText>
+            <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+              {saving ? <InlineSpinner /> : <span aria-hidden="true" style={{ display: 'grid', placeItems: 'center', border: '1px solid currentColor', borderRadius: '50%', width: '1.15rem', height: '1.15rem', fontSize: '0.75rem' }}>A</span>}
+              {saving ? 'Saving…' : 'Confirm'}
+            </span>
+          </div>
         </PanelSectionRow>
+        {error && <PanelSectionRow><DialogBodyText>{error}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
     </ModalRoot>
   );
@@ -1229,6 +1901,7 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
         <PanelSectionRow><DialogBodyText>{playlist.leafCount ?? 0} tracks</DialogBodyText></PanelSectionRow>
         <PanelSectionRow>
           <Button disabled={busy} onClick={confirmDelete} onOKButton={(event) => { event.preventDefault(); confirmDelete(); }}>
+            {busy && <InlineSpinner />}
             {busy ? 'Deleting…' : 'Delete Playlist'}
           </Button>
         </PanelSectionRow>
@@ -1241,7 +1914,7 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
 function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string };
   playlistId?: string;
-  addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => void;
+  addToQueue: (track: { id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string }, playNext?: boolean) => Promise<{ success: boolean; error?: string }>;
   onClose: () => void;
 }) {
   const [view, setView] = useState<'actions' | 'playlists' | 'new'>('actions');
@@ -1253,6 +1926,24 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
   const menuRef = useRef<HTMLDivElement | null>(null);
   const playlistLoadInProgress = useRef(false);
   const playlistActionInProgress = useRef(false);
+
+  const queueTrack = async (playNext: boolean) => {
+    if (busy) return;
+    setBusy(true);
+    setMessage('');
+    try {
+      const result = await addToQueue(track, playNext);
+      if (!result.success) {
+        setMessage(result.error || 'Could not update the queue.');
+        return;
+      }
+      onClose();
+    } catch (error: any) {
+      setMessage(error?.message || 'Could not update the queue.');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
@@ -1266,7 +1957,7 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
     playlistLoadInProgress.current = true;
     setView('playlists');
     setLoading(true);
-    setMessage('Loading playlists…');
+    setMessage('');
     try {
       const result: any = await call('get_audio_playlists', 100);
       if (result?.error) throw new Error(result.error);
@@ -1351,22 +2042,24 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
       <PanelSection key={view} title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}>
         <PanelSectionRow><DialogBodyText>{track.artist}{track.album ? ` · ${track.album}` : ''}</DialogBodyText></PanelSectionRow>
         {view === 'actions' && <>
-          <PanelSectionRow><Button onClick={() => { addToQueue(track, true); onClose(); }}>Play Next</Button></PanelSectionRow>
-          <PanelSectionRow><Button onClick={() => { addToQueue(track); onClose(); }}>Add to Queue</Button></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy} onClick={() => void queueTrack(true)}>Play Next</Button></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy} onClick={() => void queueTrack(false)}>Add to Queue</Button></PanelSectionRow>
           <PanelSectionRow><Button onClick={() => void showPlaylists()} onOKButton={(event) => { event.preventDefault(); void showPlaylists(); }}>Add to Playlist</Button></PanelSectionRow>
           {playlistId && <PanelSectionRow><Button disabled={busy} onClick={() => void removeFromPlaylist()} onOKButton={(event) => { event.preventDefault(); void removeFromPlaylist(); }}>Remove from Playlist</Button></PanelSectionRow>}
         </>}
         {view === 'playlists' && <>
-          {loading && <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><Spinner style={{ width: '18px', height: '18px' }} /> Loading playlists…</DialogBodyText></PanelSectionRow>}
+          {loading && <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><InlineSpinner /> Loading playlists…</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.length === 0 && !message && <PanelSectionRow><DialogBodyText>No audio playlists yet. Create one for this song.</DialogBodyText></PanelSectionRow>}
           {!loading && playlists.map(playlist => <PanelSectionRow key={playlist.id}><Button disabled={busy} onClick={() => void addToPlaylist(playlist.id)} onOKButton={(event) => { event.preventDefault(); void addToPlaylist(playlist.id); }}>{playlist.title}</Button></PanelSectionRow>)}
           {!loading && <PanelSectionRow><Button disabled={busy} onClick={() => { setPlaylistName(''); setMessage(''); setView('new'); }} onOKButton={(event) => { event.preventDefault(); setPlaylistName(''); setMessage(''); setView('new'); }}>New Playlist</Button></PanelSectionRow>}
         </>}
         {view === 'new' && <>
           <PanelSectionRow><TextField label="Playlist name" value={playlistName} onChange={(e: React.ChangeEvent<HTMLInputElement>) => setPlaylistName(e.target.value)} /></PanelSectionRow>
-          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()} onOKButton={(event) => { event.preventDefault(); void createPlaylist(); }}>{busy ? 'Creating…' : 'Create Playlist'}</Button></PanelSectionRow>
+          <PanelSectionRow><Button disabled={busy || !playlistName.trim()} onClick={() => void createPlaylist()} onOKButton={(event) => { event.preventDefault(); void createPlaylist(); }}>Create Playlist</Button></PanelSectionRow>
         </>}
-        {!!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
+        {busy ? <PanelSectionRow><DialogBodyText style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          <InlineSpinner /> {view === 'new' ? 'Creating playlist…' : 'Updating…'}
+        </DialogBodyText></PanelSectionRow> : !!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </PanelSection>
       </div>
     </ModalRoot>

@@ -37,6 +37,8 @@ interface PlayerState {
 }
 
 interface PlayerContextType extends PlayerState {
+  playbackPending: boolean;
+  localVolume: number;
   playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl?: string, loadMore?: () => Promise<TrackInfo[]>, requestToken?: number) => void;
   beginPlaybackRequest: () => number;
   playRemoteQueue: (queue: TrackInfo[], startId?: string) => Promise<{ success: boolean; error?: string }>;
@@ -47,8 +49,9 @@ interface PlayerContextType extends PlayerState {
   skipPrevious: () => void;
   playQueueIndex: (index: number) => void;
   removeFromQueue: (index: number) => void;
-  addToQueue: (track: TrackInfo, playNext?: boolean) => void;
+  addToQueue: (track: TrackInfo, playNext?: boolean) => Promise<{ success: boolean; error?: string }>;
   setVolume: (volume: number) => void;
+  setLocalVolume: (volume: number) => void;
   seek: (time: number) => void;
 }
 
@@ -67,6 +70,26 @@ const sharedAudio: HTMLAudioElement = engine.audio;
 if (!engine.audioInitialized) {
   sharedAudio.volume = 0.5;
   engine.audioInitialized = true;
+}
+if (!engine.gamePipAudioHook) {
+  sharedAudio.addEventListener('play', () => window.dispatchEvent(new Event('deckyplex-local-music-playing')));
+  engine.gamePipAudioHook = true;
+}
+
+function isPlaybackPending() {
+  return Boolean(engine.pendingRequestId || engine.queueLoadInProgress || engine.remoteCommandsPending);
+}
+
+function setPendingPlaybackRequest(requestId: number) {
+  if (engine.pendingRequestId === requestId) return;
+  engine.pendingRequestId = requestId;
+  window.dispatchEvent(new Event('deckyplex-playback-pending'));
+}
+
+function setQueueLoading(loading: boolean) {
+  if (engine.queueLoadInProgress === loading) return;
+  engine.queueLoadInProgress = loading;
+  window.dispatchEvent(new Event('deckyplex-playback-pending'));
 }
 
 // Send a debug message from the browser to the backend log file
@@ -127,7 +150,7 @@ function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) 
 
 function stopSharedPlayback(report = true) {
   engine.requestId++;
-  engine.pendingRequestId = 0;
+  setPendingPlaybackRequest(0);
   engine.explicitlyStopped = true;
   if (report) reportTimeline('stopped', true);
   sharedAudio.pause();
@@ -139,7 +162,7 @@ function stopSharedPlayback(report = true) {
   engine.queueIndex = -1;
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   engine.queueLoader = null;
-  engine.queueLoadInProgress = false;
+  setQueueLoading(false);
   window.dispatchEvent(new Event('deckyplex-track-change'));
 }
 
@@ -149,7 +172,7 @@ async function playStreamWithFallback(primaryUrl: string, fallbackUrl: string, t
   try {
     for (let index = 0; index < candidates.length; index++) {
       if (requestId !== engine.requestId) return false;
-      engine.pendingRequestId = requestId;
+      setPendingPlaybackRequest(requestId);
       engine.diagnosedSource = '';
       engine.explicitlyStopped = false;
       sharedAudio.pause();
@@ -168,7 +191,7 @@ async function playStreamWithFallback(primaryUrl: string, fallbackUrl: string, t
     }
     throw lastError || new Error('No playable stream URL was returned');
   } finally {
-    if (engine.pendingRequestId === requestId) engine.pendingRequestId = 0;
+    if (engine.pendingRequestId === requestId) setPendingPlaybackRequest(0);
   }
 }
 
@@ -176,7 +199,7 @@ async function playQueuedIndex(index: number) {
   const nextTrack = engine.queue[index];
   if (!nextTrack) return;
   const requestId = ++engine.requestId;
-  engine.pendingRequestId = requestId;
+  setPendingPlaybackRequest(requestId);
   engine.failedRequestId = 0;
   engine.explicitlyStopped = true;
   sharedAudio.pause();
@@ -202,7 +225,7 @@ async function playQueuedIndex(index: number) {
       : await call('play_track', nextTrack.id, nextTrack.sectionId);
     if (requestId !== engine.requestId) return;
     if (!result?.success || !result.stream_url) throw new Error(result?.error || 'Could not load queued track');
-    logToBackend(`queue: stream URL for ${nextTrack.id} = ${String(result.stream_url).substring(0, 120)}...`);
+    logToBackend(`queue: Plex provided audio for track ${nextTrack.id}`);
     engine.explicitlyStopped = false;
     const started = await playStreamWithFallback(result.stream_url, result.fallback_stream_url || '', nextTrack.title, requestId);
     if (requestId === engine.requestId && !started) throw new Error('Playback request was interrupted');
@@ -217,7 +240,7 @@ async function playQueuedIndex(index: number) {
     logToBackend(`queue: failed to load track ${nextTrack.title}: ${message}`);
     engine.explicitlyStopped = true;
     engine.failedRequestId = requestId;
-    engine.pendingRequestId = 0;
+    setPendingPlaybackRequest(0);
     sharedAudio.pause();
     sharedAudio.removeAttribute('src');
     sharedAudio.load();
@@ -250,11 +273,11 @@ sharedAudio.addEventListener('error', () => {
   if (!trackId || !source || source === engine.diagnosedSource) return;
   engine.diagnosedSource = source;
   const mediaError = sharedAudio.error;
-  logToBackend(`audio source rejected for track ${trackId}: code=${mediaError?.code || 0} ${mediaError?.message || ''}; networkState=${sharedAudio.networkState}; readyState=${sharedAudio.readyState}`);
+  logToBackend(`audio source rejected for track ${trackId}: code=${mediaError?.code || 0}; networkState=${sharedAudio.networkState}; readyState=${sharedAudio.readyState}`);
   call('inspect_stream', trackId, source).then((result: any) => {
-    logToBackend(`stream diagnostic for ${trackId}: ${JSON.stringify(result)}`);
-  }).catch((e: Error) => {
-    logToBackend(`stream diagnostic failed for ${trackId}: ${e.message}`);
+    logToBackend(`stream diagnostic for ${trackId}: HTTP ${result?.status || 'unavailable'}; range=${Boolean(result?.content_range)}; bytes=${result?.bytes || 0}`);
+  }).catch(() => {
+    logToBackend(`stream diagnostic failed for track ${trackId}`);
   });
 });
 sharedAudio.addEventListener('ended', () => {
@@ -277,7 +300,7 @@ window.setInterval(() => {
 
 async function loadMoreQueue() {
   if (!engine.queueLoader || engine.queueLoadInProgress) return;
-  engine.queueLoadInProgress = true;
+  setQueueLoading(true);
   const requestId = engine.requestId;
   try {
     const tracks = await engine.queueLoader();
@@ -292,7 +315,7 @@ async function loadMoreQueue() {
     logToBackend(`queue: could not load next shuffle page: ${e?.message || e}`);
     stopSharedPlayback(false);
   } finally {
-    engine.queueLoadInProgress = false;
+    setQueueLoading(false);
   }
 }
 
@@ -344,7 +367,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   engine.companionContainerKey = prepared.container_key || '';
   engine.companionPlayQueueVersion = prepared.play_queue_version || '';
   engine.remoteActive = false;
-  engine.pendingRequestId = requestId;
+  setPendingPlaybackRequest(requestId);
   engine.failedRequestId = 0;
   engine.explicitlyStopped = true;
   sharedAudio.pause();
@@ -354,7 +377,7 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   engine.queue = queue.length ? queue : [selected];
   engine.queueIndex = Math.max(0, engine.queue.findIndex((item: TrackInfo) => item.id === selected.id));
   engine.queueLoader = null;
-  engine.queueLoadInProgress = false;
+  setQueueLoading(false);
   rememberCompanionSession();
   window.dispatchEvent(new Event('deckyplex-queue-change'));
   window.dispatchEvent(new Event('deckyplex-track-change'));
@@ -517,12 +540,12 @@ startCompanionCommandPolling();
 
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const volumeSaveTimer = useRef<number | null>(null);
-  const volumePreferenceLoaded = useRef(false);
+  const [localVolume, setLocalVolumeState] = useState(() => Math.round(sharedAudio.volume * 100));
+  const [playbackPending, setPlaybackPending] = useState(isPlaybackPending);
   const [state, setState] = useState<PlayerState>({
     playbackState: "stopped",
     track: engine.track,
-    volume: 50,
+    volume: localVolume,
     error: null,
     progress: 0,
     duration: 0,
@@ -534,9 +557,16 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     queueIndex: engine.queueIndex,
   });
 
+  useEffect(() => {
+    const onPendingChange = () => setPlaybackPending(isPlaybackPending());
+    window.addEventListener('deckyplex-playback-pending', onPendingChange);
+    onPendingChange();
+    return () => window.removeEventListener('deckyplex-playback-pending', onPendingChange);
+  }, []);
+
   const beginPlaybackRequest = useCallback(() => {
     const requestId = ++engine.requestId;
-    engine.pendingRequestId = 0;
+    setPendingPlaybackRequest(0);
     engine.explicitlyStopped = true;
     if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
     engine.companionActive = false;
@@ -550,7 +580,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     engine.queue = [];
     engine.queueIndex = -1;
     engine.queueLoader = null;
-    engine.queueLoadInProgress = false;
+    setQueueLoading(false);
     window.dispatchEvent(new Event('deckyplex-queue-change'));
     window.dispatchEvent(new Event('deckyplex-track-change'));
     return requestId;
@@ -617,7 +647,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     const onCompanionStop = () => setState(s => ({ ...s, companionMode: false }));
     const onVolumeChange = (event: Event) => {
       const volume = Number((event as CustomEvent<number>).detail);
-      if (Number.isFinite(volume)) setState(s => ({ ...s, volume }));
+      if (Number.isFinite(volume)) {
+        setLocalVolumeState(volume);
+        setState(s => s.remoteMode ? s : { ...s, volume });
+      }
     };
     const onPlaybackError = (event: Event) => {
       const detail = (event as CustomEvent<{ message?: string; requestId?: number }>).detail;
@@ -670,22 +703,24 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       try {
         const settings: any = await call('get_settings');
         if (!mounted) return;
-        if (!volumePreferenceLoaded.current) {
+        if (!engine.volumePreferenceLoaded) {
           const savedVolume = Number(settings.volume);
           if (Number.isFinite(savedVolume)) {
             const normalizedVolume = Math.max(0, Math.min(100, savedVolume));
             sharedAudio.volume = normalizedVolume / 100;
-            setState(s => ({ ...s, volume: normalizedVolume }));
+            window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: normalizedVolume }));
           }
-          volumePreferenceLoaded.current = true;
+          engine.volumePreferenceLoaded = true;
         }
+        const remoteMode = !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id;
         setState(s => ({
           ...s,
-          remoteMode: !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id,
+          remoteMode,
+          volume: remoteMode ? s.volume : Math.round(sharedAudio.volume * 100),
           remotePlayerId: settings.selected_player_id || '',
           remotePlayerName: settings.selected_player_name || '',
         }));
-        engine.remoteActive = !engine.companionActive && settings.playback_target === 'remote' && !!settings.selected_player_id;
+        engine.remoteActive = remoteMode;
       } catch {}
     };
     refreshTarget();
@@ -742,7 +777,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (!playable.length) return { success: false, error: 'No tracks found to play.' };
     const selected = playable.find(track => track.id === startId) || playable[0];
     const requestId = ++engine.requestId;
-    engine.pendingRequestId = 0;
+    setPendingPlaybackRequest(0);
     engine.explicitlyStopped = true;
     if (engine.track && !engine.remoteActive) reportTimeline('stopped', true);
     engine.remoteActive = true;
@@ -769,6 +804,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const controlRemotePlayer = useCallback(async (command: string, value = 0) => {
     if (!state.remotePlayerId) return false;
+    engine.remoteCommandsPending = (engine.remoteCommandsPending || 0) + 1;
+    window.dispatchEvent(new Event('deckyplex-playback-pending'));
     try {
       const result: any = await call('control_remote_player', state.remotePlayerId, command, Math.round(value));
       if (!result?.success) throw new Error(result?.error || `Could not ${command} remote player.`);
@@ -777,6 +814,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     } catch (e: any) {
       setState(s => ({ ...s, error: e?.message || 'Remote player command failed.' }));
       return false;
+    } finally {
+      engine.remoteCommandsPending--;
+      window.dispatchEvent(new Event('deckyplex-playback-pending'));
     }
   }, [state.remotePlayerId]);
 
@@ -790,9 +830,9 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (requestToken != null && requestToken !== engine.requestId) return;
     const requestId = requestToken ?? ++engine.requestId;
     engine.failedRequestId = 0;
-    engine.pendingRequestId = requestId;
+    setPendingPlaybackRequest(requestId);
 
-    logToBackend(`playTrack: URL = ${streamUrl.substring(0, 120)}...`);
+    logToBackend(`playTrack: starting audio for track ${trackInfo.id}`);
     engine.explicitlyStopped = false;
     if (engine.track && engine.track.id !== trackInfo.id && !wasRemotePlayback) reportTimeline('stopped', true);
     engine.remoteActive = false;
@@ -805,7 +845,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       engine.queueIndex = 0;
     }
     engine.queueLoader = loadMore || null;
-    engine.queueLoadInProgress = false;
+    setQueueLoading(false);
     window.dispatchEvent(new Event('deckyplex-queue-change'));
     logToBackend(`queue: set ${engine.queue.length} track(s), starting at ${engine.queueIndex + 1}`);
     window.dispatchEvent(new Event('deckyplex-track-change'));
@@ -826,7 +866,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       logToBackend(errDetail);
       engine.explicitlyStopped = true;
       engine.failedRequestId = requestId;
-      engine.pendingRequestId = 0;
+      setPendingPlaybackRequest(0);
       sharedAudio.pause();
       sharedAudio.removeAttribute('src');
       sharedAudio.load();
@@ -882,7 +922,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
     if (audioRef.current) {
       engine.requestId++;
-      engine.pendingRequestId = 0;
+      setPendingPlaybackRequest(0);
       reportTimeline('paused', true);
       audioRef.current.pause();
     }
@@ -948,21 +988,25 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     window.dispatchEvent(new Event('deckyplex-queue-change'));
   }, [state.remoteMode]);
 
-  const addToQueue = useCallback((track: TrackInfo, playNext = false) => {
-    if (!track.id) return;
+  const addToQueue = useCallback(async (track: TrackInfo, playNext = false) => {
+    if (!track.id) return { success: false, error: 'This track has no Plex ID.' };
     if (engine.companionActive) {
       if (!engine.companionPlayQueueId || !engine.track?.playQueueItemID) {
         logToBackend('queue: cannot edit Plexamp queue because its active queue item is unknown');
-        setState(s => ({ ...s, error: 'Plexamp did not provide a queue that DeckyPlex can update.' }));
-        return;
+        const error = 'Plexamp did not provide an editable queue for this session.';
+        setState(s => ({ ...s, error }));
+        return { success: false, error };
       }
       const queueId = engine.companionPlayQueueId;
-      void call('add_companion_queue_track', track.id, queueId,
-        engine.track.playQueueItemID, engine.companionServerContext || {}, playNext).then((result: any) => {
+      try {
+        const result: any = await call('add_companion_queue_track', track.id, queueId,
+          engine.track.playQueueItemID, engine.companionServerContext || {}, playNext);
         if (!result?.success || !result.track?.playQueueItemID) {
           throw new Error(result?.error || 'Plex did not confirm the queued track');
         }
-        if (!engine.companionActive || engine.companionPlayQueueId !== queueId) return;
+        if (!engine.companionActive || engine.companionPlayQueueId !== queueId) {
+          return { success: false, error: 'Plexamp playback changed before the queue update completed.' };
+        }
         const queuedTrack: TrackInfo = { ...track, playQueueItemID: result.track.playQueueItemID };
         if (playNext) engine.queue.splice(Math.max(0, engine.queueIndex + 1), 0, queuedTrack);
         else engine.queue.push(queuedTrack);
@@ -971,11 +1015,13 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         window.dispatchEvent(new Event('deckyplex-queue-change'));
         reportTimeline(sharedAudio.paused ? 'paused' : 'playing', true);
         logToBackend(`queue: added ${track.title} to Plexamp queue (${playNext ? 'next' : 'upcoming'})`);
-      }).catch((error: any) => {
+        return { success: true };
+      } catch (error: any) {
         logToBackend(`queue: could not update Plexamp queue: ${error?.message || error}`);
-        setState(s => ({ ...s, error: error?.message || 'Could not update the Plexamp queue.' }));
-      });
-      return;
+        const message = error?.message || 'Could not update the Plexamp queue.';
+        setState(s => ({ ...s, error: message }));
+        return { success: false, error: message };
+      }
     }
     if (!engine.queue.length) {
       engine.queue = [track];
@@ -986,24 +1032,30 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       engine.queue.push(track);
     }
     window.dispatchEvent(new Event('deckyplex-queue-change'));
+    return { success: true };
+  }, []);
+
+  const setLocalVolume = useCallback((volume: number) => {
+    const normalizedVolume = Math.max(0, Math.min(100, Math.round(volume)));
+    engine.volumePreferenceLoaded = true;
+    sharedAudio.volume = normalizedVolume / 100;
+    window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: normalizedVolume }));
+    window.clearTimeout(engine.volumeSaveTimer);
+    engine.volumeSaveTimer = window.setTimeout(() => {
+      void call('set_settings', { volume: normalizedVolume }).catch(() => {});
+      engine.volumeSaveTimer = undefined;
+    }, 250);
   }, []);
 
   const setVolume = useCallback((volume: number) => {
-    const normalizedVolume = Math.max(0, Math.min(100, Math.round(volume)));
-    setState(s => ({ ...s, volume: normalizedVolume }));
-    if (state.remoteMode) {
-      void controlRemotePlayer('volume', normalizedVolume);
+    if (!state.remoteMode) {
+      setLocalVolume(volume);
       return;
     }
-    if (audioRef.current) {
-      audioRef.current.volume = normalizedVolume / 100;
-    }
-    if (volumeSaveTimer.current !== null) window.clearTimeout(volumeSaveTimer.current);
-    volumeSaveTimer.current = window.setTimeout(() => {
-      void call('set_settings', { volume: normalizedVolume }).catch(() => {});
-      volumeSaveTimer.current = null;
-    }, 250);
-  }, [state.remoteMode, controlRemotePlayer]);
+    const normalizedVolume = Math.max(0, Math.min(100, Math.round(volume)));
+    setState(s => ({ ...s, volume: normalizedVolume }));
+    void controlRemotePlayer('volume', normalizedVolume);
+  }, [state.remoteMode, controlRemotePlayer, setLocalVolume]);
 
   const seek = useCallback((time: number) => {
     if (state.remoteMode) {
@@ -1019,6 +1071,8 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     <PlayerContext.Provider
       value={{
         ...state,
+        localVolume,
+        playbackPending,
         beginPlaybackRequest,
         playTrack,
         playRemoteQueue,
@@ -1031,6 +1085,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         removeFromQueue,
         addToQueue,
         setVolume,
+        setLocalVolume,
         seek,
       }}
     >

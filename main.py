@@ -8,15 +8,20 @@ import re
 import secrets
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
+from copy import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
 # Add py_modules to Python path so bundled dependencies (plexapi, requests) are available
-_py_modules_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modules")
+_plugin_dir = os.path.dirname(os.path.abspath(__file__))
+if _plugin_dir not in sys.path:
+    sys.path.insert(0, _plugin_dir)
+_py_modules_dir = os.path.join(_plugin_dir, "py_modules")
 if os.path.isdir(_py_modules_dir):
     if _py_modules_dir in sys.path:
         sys.path.remove(_py_modules_dir)
@@ -49,17 +54,41 @@ DEFAULT_SETTINGS = {
     "selected_player_id": "",
     "selected_player_name": "",
     "grid_columns": 0,
+    "library_selections": {},
+    "video_quality": "auto",
+    "over_game_pip": False,
+    "pip_position": "bottom-left",
+    "pip_size": 29,
     "volume": 50,
     "manual_server_url": "",
+    "manual_server_id": "",
     "playback_target": "local",
     "connection_timeout": 8,
     "verify_tls": False,
     "logged_in_username": "",
     "server_access_token": "",
     "companion_id": "",
-    "companion_receiver_enabled": True,
+    "companion_receiver_enabled": False,
+    "companion_device_name": "DeckyPlex",
     "allow_signed_out_companion": False,
+    "hide_quick_login": False,
+    "quick_player_maintain_x": False,
 }
+
+LIBRARY_TYPES = ("artist", "movie", "show", "photo")
+VIDEO_TYPES = ("movie", "episode", "clip")
+PIP_POSITIONS = ("bottom-left", "bottom-right", "top-left", "top-right")
+VIDEO_SORTS = {
+    "titleSort:asc", "titleSort:desc", "addedAt:desc", "originallyAvailableAt:desc",
+}
+VIDEO_QUALITY = {
+    "auto": (None, None),
+    "1080p": ("1920x1080", 8000),
+    "720p": ("1280x720", 4000),
+    "480p": ("854x480", 1500),
+}
+VIDEO_DIRECT_AUDIO = {"mp4": {"aac", "mp3"}, "m4v": {"aac", "mp3"}, "webm": {"opus", "vorbis"}}
+
 
 # Settings file path — Decky provides this directory
 try:
@@ -81,6 +110,14 @@ def _load_settings() -> Dict[str, Any]:
                 saved = json.load(f)
             # Merge with defaults so new keys are present
             merged = {**DEFAULT_SETTINGS, **saved}
+            server_id = merged["selected_server_id"]
+            if saved.get("media_scope") == "all" and server_id:
+                selections = merged["library_selections"]
+                selections = dict(selections) if isinstance(selections, dict) else {}
+                selections.setdefault(server_id, "all")
+                merged["library_selections"] = selections
+            if merged["manual_server_url"] and "manual_server_id" not in saved:
+                merged["manual_server_id"] = server_id
             # Filter to known keys only
             known_keys = set(DEFAULT_SETTINGS.keys())
             return {k: v for k, v in merged.items() if k in known_keys}
@@ -97,12 +134,44 @@ def _save_settings(settings: Dict[str, Any]) -> None:
         settings_dir = os.path.dirname(_settings_file)
         if settings_dir:
             os.makedirs(settings_dir, exist_ok=True)
-        with open(_settings_file, "w") as f:
-            json.dump(filtered, f, indent=4)
+        pending_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=settings_dir or ".", delete=False) as pending:
+                pending_path = pending.name
+                json.dump(filtered, pending, indent=4)
+            os.replace(pending_path, _settings_file)
+        finally:
+            if pending_path and os.path.exists(pending_path):
+                os.unlink(pending_path)
         logger.debug(f"Settings saved to: {_settings_file}")
     except Exception as e:
         logger.error(f"Failed to save settings: {e}")
         raise
+
+
+def _manual_server_url(settings):
+    if settings["manual_server_id"] == settings["selected_server_id"]:
+        return settings["manual_server_url"].strip()
+    return ""
+
+
+def _server_settings(server, account_token):
+    return {
+        "selected_server_id": server["id"],
+        "selected_server_name": server.get("name", ""),
+        "selected_server_url": server.get("base_url", ""),
+        "server_access_token": server.get("access_token") or account_token,
+    }
+
+
+def _library_choice(settings):
+    selections = settings["library_selections"]
+    return selections.get(settings["selected_server_id"]) if isinstance(selections, dict) else None
+
+
+def _set_library_choice(settings, server_id, libraries):
+    selections = settings["library_selections"]
+    settings["library_selections"] = {**(selections if isinstance(selections, dict) else {}), server_id: libraries}
 
 
 def _private_plex_base_url(address: str, port: int, protocol: str) -> str:
@@ -155,10 +224,26 @@ def _private_plex_base_url(address: str, port: int, protocol: str) -> str:
 
 # Store PIN state across calls
 _pin_state: Dict[str, Any] = {}
-_plex_cache_key = None
-_plex_cache_instance = None
+_plex_cache = (None, None)
+_plex_connect_lock = threading.Lock()
 _companion_receiver = None
 _companion_event_loop = None
+_next_account_check = 0.0
+
+
+def _cancel_plex_login() -> None:
+    task = _pin_state.get("task")
+    if task:
+        task.cancel()
+    _pin_state.clear()
+
+
+def _check_plex_account(token: str) -> None:
+    import requests
+    from plexapi.myplex import MyPlexAccount
+
+    with requests.Session() as session:
+        MyPlexAccount(token=token, session=session, timeout=5)
 
 
 class PlexCompanionReceiver:
@@ -166,8 +251,9 @@ class PlexCompanionReceiver:
     HTTP_PORT = int(os.environ.get("DECKYPLEX_COMPANION_PORT", "32435"))
     GDM_PORT = 32412
 
-    def __init__(self, machine_id: str, event_loop=None):
+    def __init__(self, machine_id: str, event_loop=None, device_name="DeckyPlex"):
         self.machine_id = machine_id
+        self.device_name = device_name
         self.event_loop = event_loop
         self.httpd = None
         self.http_thread = None
@@ -182,7 +268,7 @@ class PlexCompanionReceiver:
     def _response_headers(self) -> bytes:
         return ("HTTP/1.0 200 OK\r\n"
                 "Content-Type: plex/media-player\r\n"
-                "Name: DeckyPlex\r\n"
+                f"Name: {self.device_name}\r\n"
                 f"Port: {self.HTTP_PORT}\r\n"
                 "Product: DeckyPlex\r\n"
                 "Protocol: plex\r\n"
@@ -292,7 +378,7 @@ class PlexCompanionReceiver:
                     requests.post(url, data=media, timeout=0.35,
                                   headers={"Content-Type": "application/xml",
                                            "X-Plex-Client-Identifier": self.machine_id,
-                                           "X-Plex-Device-Name": "DeckyPlex"})
+                                           "X-Plex-Device-Name": self.device_name.encode("utf-8")})
                 except Exception as exc:
                     logger.debug("Companion timeline delivery failed: %s", exc)
         except Exception as exc:
@@ -369,8 +455,9 @@ class PlexCompanionReceiver:
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path in ("/", "/resources"):
                     local_address = self._local_address()
-                    root = (f'<MediaContainer friendlyName="DeckyPlex" machineIdentifier="{receiver.machine_id}">'
-                            f'<Player title="DeckyPlex" machineIdentifier="{receiver.machine_id}" '
+                    name = html.escape(receiver.device_name, quote=True)
+                    root = (f'<MediaContainer friendlyName="{name}" machineIdentifier="{receiver.machine_id}">'
+                            f'<Player title="{name}" machineIdentifier="{receiver.machine_id}" '
                             'product="DeckyPlex" version="1.0.0" platform="SteamOS" '
                             'protocolVersion="1" protocolCapabilities="timeline,playback,playqueues" deviceClass="stb">'
                             f'<Connection protocol="http" address="{local_address}" port="{receiver.HTTP_PORT}" '
@@ -442,12 +529,11 @@ class PlexCompanionReceiver:
         if not self.gdm_socket:
             return
         self.gdm_socket.settimeout(1.0)
-        response = self._response_headers()
         while self.gdm_socket:
             try:
                 packet, address = self.gdm_socket.recvfrom(2048)
                 if packet.startswith(b"M-SEARCH"):
-                    self.gdm_socket.sendto(response, address)
+                    self.gdm_socket.sendto(self._response_headers(), address)
             except socket.timeout:
                 continue
             except OSError:
@@ -505,31 +591,70 @@ class PlexHTTP:
         return self._account
 
     @staticmethod
-    def _item_dict(item: Any) -> Dict[str, Any]:
+    def _item_dict(item: Any, *, from_listing: bool = False) -> Dict[str, Any]:
+        from plexapi.base import PlexPartialObject
+
+        if from_listing and isinstance(item, PlexPartialObject):
+            # SDK objects from listings can fetch full metadata on every missing field.
+            # Cards can use the data from the listing; opening an item fetches its details.
+            item = copy(item)
+            item._autoReload = False
+
         def attr(name, default=""):
             value = getattr(item, name, default)
             return default if value is None else value
 
         item_type = attr("type")
         artist = attr("grandparentTitle")
+        episode_card = from_listing and item_type == "episode"
+        # An Episode's parentThumb property can query the season even with auto-reload off.
+        episode_season_thumb = ""
+        if episode_card:
+            episode_season_thumb = vars(item).get("_parentThumb") or vars(item).get("parentThumb") or ""
+        thumb_path = ""
+        if from_listing:
+            thumb_path = attr("thumb") or (episode_season_thumb if episode_card else attr("parentThumb")) or attr("grandparentThumb")
+        thumb = attr("thumbUrl") if not episode_card else ""
+        if episode_card and thumb_path:
+            thumb = item._server.url(thumb_path, includeToken=True)
+        poster_path = ""
+        poster = ""
+        if item_type == "episode":
+            poster_path = attr("grandparentThumb") or (episode_season_thumb if episode_card else attr("parentThumb"))
+            if poster_path:
+                poster = item._server.url(poster_path, includeToken=True)
         if item_type == "album":
             artist = artist or attr("parentTitle")
-            if not artist:
+            if not artist and not from_listing:
                 try:
                     artist = item.artist().title or ""
                 except Exception:
                     artist = ""
 
-        return {
+        result = {
             "id": str(attr("ratingKey")), "key": attr("key"),
             "title": attr("title"), "type": item_type, "artist": artist,
-            "thumb": attr("thumbUrl"), "art": attr("artUrl"),
+            "thumb": thumb, "art": attr("artUrl"), "poster": poster,
             "summary": attr("summary"), "year": attr("year"),
-            "index": attr("index"), "parentTitle": attr("parentTitle"),
+            "index": attr("index"), "parentIndex": attr("parentIndex"), "parentTitle": attr("parentTitle"),
             "grandparentTitle": attr("grandparentTitle"),
             "leafCount": attr("leafCount", 0), "viewCount": attr("viewCount", 0),
+            "viewOffset": attr("viewOffset", 0),
             "duration": attr("duration", 0), "sectionId": str(attr("librarySectionID", "") or ""),
         }
+        if from_listing and hasattr(item, "_server") and hasattr(item._server, "transcodeImage"):
+            # Request appropriately sized artwork using Plex's cacheable image endpoint.
+            def thumbnail(path, height):
+                if isinstance(path, str) and path.startswith("/library/"):
+                    return item._server.transcodeImage(path, height=height, width=320, minSize=False, upscale=False)
+                return ""
+
+            if item_type == "artist":
+                thumb_path = attr("art") or thumb_path
+            height = 480 if item_type in ("movie", "show", "season") else 180 if item_type in ("episode", "clip") else 320
+            result["gridThumb"] = thumbnail(thumb_path, height)
+            result["gridPoster"] = thumbnail(poster_path, 480)
+        return result
 
     def discover_players(self) -> List[Dict[str, str]]:
         sessions = {}
@@ -607,7 +732,7 @@ class PlexHTTP:
         sort = "random" if randomize else "titleSort:asc"
         tracks = section.search(libtype="track", sort=sort, container_start=offset,
                                 container_size=limit, maxresults=limit)
-        items = [self._item_dict(item) for item in tracks if getattr(item, "type", "") == "track"]
+        items = [self._item_dict(item, from_listing=True) for item in tracks if getattr(item, "type", "") == "track"]
         return {"items": items, "has_more": len(items) == limit}
 
     def get_sessions(self) -> List[Any]:
@@ -756,15 +881,88 @@ class PlexHTTP:
                 for section in self.sdk.library.sections()]
 
     def get_section_contents(self, section_id: str, type_filter: str = "", limit: int = 100,
-                             offset: int = 0) -> Dict[str, Any]:
+                             offset: int = 0, sort: str = "titleSort:asc") -> Dict[str, Any]:
         section = self.sdk.library.sectionByID(int(section_id))
-        item_type = type_filter if type_filter in ("artist", "album", "track") else "artist"
+        section_type = section.type
+        if section_type not in LIBRARY_TYPES:
+            raise ValueError("This Plex library type is unsupported")
+        if type_filter and (section_type != "artist" or type_filter not in ("artist", "album", "track")):
+            raise ValueError("Media type does not match this library")
         limit = max(1, min(int(limit), 250))
         offset = max(0, int(offset))
-        items = [self._item_dict(item) for item in section.search(
-            libtype=item_type, sort="titleSort:asc", container_start=offset,
-            container_size=limit, maxresults=limit)]
-        return {"items": items, "has_more": len(items) == limit}
+        if section_type not in ("movie", "show") or sort not in VIDEO_SORTS:
+            sort = "titleSort:asc"
+        options = {"sort": sort, "container_start": offset, "container_size": limit + 1, "maxresults": limit + 1}
+        results = section.search(libtype=type_filter, **options) if type_filter else section.all(**options)
+        items = [self._item_dict(item, from_listing=True) for item in results[:limit]]
+        return {"items": items, "has_more": len(results) > limit, "next_offset": offset + len(items)}
+
+    def get_video_home(self, row: str, libraries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        limit = 8
+        if not libraries:
+            return []
+        library_ids = {library["id"] for library in libraries}
+        if row == "continue":
+            items = [item for item in self.sdk.continueWatching()
+                     if item.type in ("movie", "episode") and str(vars(item).get("librarySectionID")) in library_ids]
+            # Plex's hub contains resumed titles as well as the next available episodes.
+            watch_next = [item for item in items if item.type == "episode" and not vars(item).get("viewOffset")]
+            resumes = [item for item in items if item.type != "episode" or vars(item).get("viewOffset")]
+            items = [*resumes[:limit], *watch_next[:limit]]
+        elif row in ("movies", "shows"):
+            kind = "movie" if row == "movies" else "show"
+            items = [item for library in libraries if library["type"] == kind
+                     for item in self.sdk.library.sectionByID(int(library["id"])).recentlyAdded(
+                         maxresults=limit, libtype=kind)]
+            items.sort(key=lambda item: item.addedAt.timestamp() if item.addedAt else 0, reverse=True)
+        else:
+            watchlist = self.account.watchlist(maxresults=limit)
+            matches = {}
+            guids_by_type = {kind: [item.guid for item in watchlist if item.type == kind and item.guid]
+                             for kind in ("movie", "show")}
+            for library in libraries:
+                guids = guids_by_type[library["type"]]
+                if guids:
+                    section = self.sdk.library.sectionByID(int(library["id"]))
+                    for item in section.search(guid=guids, maxresults=limit):
+                        matches.setdefault(item.guid, item)
+            items = [matches[item.guid] for item in watchlist if item.guid in matches]
+        cards = []
+        show_art = {}
+        for item in (items if row == "continue" else items[:limit]):
+            card = self._item_dict(item, from_listing=True)
+            show_key = vars(item).get("grandparentKey")
+            if item.type == "episode" and not card["poster"] and show_key:
+                if show_key not in show_art:
+                    try:
+                        show_art[show_key] = self._item_dict(item.show(), from_listing=True)
+                    except Exception:
+                        show_art[show_key] = {}
+                show = show_art[show_key]
+                card["poster"] = show.get("thumb", "")
+                card["gridPoster"] = show.get("gridThumb", "")
+            cards.append(card)
+        return cards
+
+    def get_music_artists(self, sections: List[Dict[str, Any]], limit: int, offset: int) -> Dict[str, Any]:
+        """Page through the selected music sections in Plex library order."""
+        limit = max(1, min(int(limit), 250))
+        offset = max(0, int(offset))
+        items = []
+        for section_info in sections:
+            section_id = section_info["id"]
+            if offset:
+                section = self.sdk.library.sectionByID(int(section_id))
+                count = section.totalViewSize(libtype="artist", includeCollections=False)
+                if offset >= count:
+                    offset -= count
+                    continue
+            page = self.get_section_contents(section_id, "artist", limit - len(items), offset)
+            items.extend({**item, "sectionId": section_id} for item in page["items"])
+            if len(items) == limit:
+                return {"items": items, "has_more": True}
+            offset = 0
+        return {"items": items, "has_more": False}
 
     def get_shuffled_tracks(self, section_id: str) -> List[Dict[str, Any]]:
         """Return every track in a music section in randomized queue order."""
@@ -775,7 +973,7 @@ class PlexHTTP:
         if not tracks:
             return []
         random.shuffle(tracks)
-        return [self._item_dict(track) for track in tracks if getattr(track, "type", "") == "track"]
+        return [self._item_dict(track, from_listing=True) for track in tracks if getattr(track, "type", "") == "track"]
 
     def get_metadata_children(self, metadata_id: str) -> List[Dict[str, Any]]:
         item = self.sdk.fetchItem(int(metadata_id))
@@ -790,16 +988,22 @@ class PlexHTTP:
             children = item.tracks()
             if not children:
                 children = item.fetchItems(f"{item.key}/children")
+        elif item.type == "show":
+            children = item.seasons()
+        elif item.type == "season":
+            children = item.episodes()
+        elif item.type == "photoalbum":
+            children = item.albums() + item.photos() + item.clips()
         else:
             children = item.fetchItems(f"{item.key}/children")
-        return [self._item_dict(child) for child in children]
+        return [self._item_dict(child, from_listing=True) for child in children]
 
     def get_artist_tracks(self, artist_id: str) -> List[Dict[str, Any]]:
         artist = self.sdk.fetchItem(int(artist_id))
         if getattr(artist, "type", "") != "artist":
             raise ValueError("Selected Plex item is not an artist")
         tracks = artist.tracks(maxresults=1000)
-        return [self._item_dict(track) for track in tracks]
+        return [self._item_dict(track, from_listing=True) for track in tracks]
 
     def get_recently_played(self, section_id: str = "", limit: int = 50) -> List[Dict[str, Any]]:
         """Return recently played tracks using PlexAPI's server history endpoint."""
@@ -817,14 +1021,14 @@ class PlexHTTP:
                     history_item = source
             except Exception:
                 pass
-            result.append(self._item_dict(history_item))
+            result.append(self._item_dict(history_item, from_listing=True))
         return result
 
     def get_recently_added(self, section_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Return the newest albums in a music library, using PlexAPI sorting."""
         section = self.sdk.library.sectionByID(int(section_id))
         albums = section.search(libtype="album", sort="addedAt:desc", maxresults=max(1, min(int(limit), 100)))
-        return [self._item_dict(album) for album in albums]
+        return [self._item_dict(album, from_listing=True) for album in albums]
 
     def get_audio_playlists(self, limit: int = 100) -> List[Dict[str, Any]]:
         playlists = self.sdk.playlists(playlistType="audio", sort="titleSort:asc")
@@ -884,20 +1088,107 @@ class PlexHTTP:
         playlist = next((item for item in playlists if str(item.ratingKey) == str(playlist_id)), None)
         if playlist is None:
             raise ValueError("Audio playlist not found")
-        return [self._item_dict(item) for item in playlist.items(libtype="track")[:max(1, min(int(limit), 200))]]
+        return [self._item_dict(item, from_listing=True) for item in playlist.items(libtype="track")[:max(1, min(int(limit), 200))]]
 
-    def search_library(self, query: str, section_id: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+    def search_library(self, query: str, section_id: str = "", limit: int = 20,
+                       library_ids=None, include_other_media: bool = False) -> List[Dict[str, Any]]:
         if section_id:
             results = self.sdk.library.sectionByID(int(section_id)).search(title=query, maxresults=limit)
         else:
-            results = self.sdk.search(query, mediatype="audio", limit=limit)
-        return [self._item_dict(item) for item in results]
+            results = self.sdk.search(query, limit=limit)
+        supported = ("artist", "album", "track")
+        if include_other_media:
+            supported += VIDEO_TYPES + ("show", "season", "photoalbum", "photo")
+        if library_ids is not None:
+            return [self._item_dict(item, from_listing=True) for item in results
+                    if getattr(item, "type", "") in supported
+                    and str(getattr(item, "librarySectionID", "")) in library_ids]
+        return [self._item_dict(item, from_listing=True) for item in results if getattr(item, "type", "") in supported]
+
+    def get_media_source(self, rating_key: str, quality: str = "auto") -> Dict[str, Any]:
+        item = self.sdk.fetchItem(int(rating_key))
+        if item.type not in (*VIDEO_TYPES, "photo"):
+            raise ValueError("This Plex item cannot be played directly")
+        primary_media = next(iter(item.media or []), None)
+        parts = [part for part in getattr(primary_media, "parts", []) if part.key]
+        part = parts[0] if parts else None
+        direct_url = self.sdk.url(part.key, includeToken=True) if part else ""
+        if item.type == "photo":
+            images = list(dict.fromkeys(url for url in (direct_url, item.thumbUrl) if url))
+            return {"streams": [{"kind": "image", "url": url} for url in images]}
+
+        resolution, bitrate = VIDEO_QUALITY.get(quality, VIDEO_QUALITY["auto"])
+        if quality == "auto":
+            width = getattr(primary_media, "width", None)
+            height = getattr(primary_media, "height", None)
+            if width and height:
+                resolution = f"{width}x{height}"
+            bitrate = getattr(primary_media, "bitrate", None) or None
+        audio_tracks = part.audioStreams() if part else []
+        audio = next((track for track in audio_tracks if track.selected), audio_tracks[0] if audio_tracks else None)
+        codec = str(getattr(audio, "codec", None) or getattr(primary_media, "audioCodec", "") or "").lower()
+        video_codec = str(getattr(primary_media, "videoCodec", "") or "").lower()
+        channels = getattr(audio, "channels", None) or getattr(primary_media, "audioChannels", None)
+        container = str(getattr(part, "container", "") or "").lower()
+        compatible_audio = not codec or (codec in VIDEO_DIRECT_AUDIO.get(container, ()) and (channels or 2) <= 2)
+
+        def transcode(protocol, container, session_id, copy_video=False, copy_audio=False):
+            return item.getStreamURL(protocol=protocol, directPlay=0, directStream=int(copy_video), directStreamAudio=int(copy_audio),
+                                     audioChannelCount=2, partIndex=0 if len(parts) == 1 else -1,
+                                     videoResolution=(resolution or "") if not copy_video else "",
+                                     maxVideoBitrate=bitrate if not copy_video else None,
+                                     videoBitrate=bitrate if not copy_video else None,
+                                     transcodeSessionId=session_id,
+                                     **{"X-Plex-Client-Identifier": self.sdk._headers()["X-Plex-Client-Identifier"],
+                                        "X-Plex-Session-Identifier": session_id,
+                                        "X-Plex-Client-Profile-Name": "Generic",
+                                        "X-Plex-Client-Profile-Extra":
+                                            "add-transcode-target(type=videoProfile&context=streaming&"
+                                            f"protocol={protocol}&container={container}&videoCodec=h264&audioCodec=aac&replace=true)"})
+
+        hls_url = transcode("hls", "mpegts", str(uuid.uuid4()))
+        # The SDK builds a manifest path. Use the documented binary HTTP
+        # response as another fallback when the webview can't load HLS.
+        url = urllib.parse.urlsplit(transcode("http", "mp4", str(uuid.uuid4())))
+        mp4_url = urllib.parse.urlunsplit(url._replace(path=url.path.removesuffix(".m3u8") + ".mp4"))
+        streams = [{"kind": "hls", "url": hls_url, "fallback_url": transcode("hls", "mpegts", str(uuid.uuid4()))},
+                   {"kind": "http", "url": mp4_url}]
+        if quality == "auto" and len(parts) == 1:
+            if container in VIDEO_DIRECT_AUDIO and compatible_audio:
+                streams.insert(0, {"kind": "direct", "url": direct_url})
+            elif video_codec == "h264":
+                # Preserve H.264 in the compatibility stream where Plex can copy it. Convert incompatible audio to AAC.
+                copy_audio = codec in ("aac", "mp3") and (channels or 2) <= 2
+                streams.insert(0, {"kind": "hls", "mode": "direct-stream" if copy_audio else "audio-conversion",
+                                   "url": transcode("hls", "mpegts", str(uuid.uuid4()), copy_video=True, copy_audio=copy_audio)})
+        logger.info("Video source item=%d quality=%s container=%s video=%s audio=%s channels=%s candidates=%s",
+                    int(rating_key), quality, re.sub(r"[^a-z0-9_-]", "", container)[:32] or "unknown",
+                    re.sub(r"[^a-z0-9_-]", "", video_codec)[:32] or "unknown",
+                    re.sub(r"[^a-z0-9_-]", "", codec)[:32] or "unknown", channels,
+                    ",".join(stream.get("mode", stream["kind"]) for stream in streams))
+        return {"streams": streams, "resume_ms": getattr(item, "viewOffset", 0) or 0,
+                "duration_ms": getattr(item, "duration", 0) or 0, "has_audio": bool(codec)}
+
+    def report_video_progress(self, rating_key: str, time_ms: int, duration_ms: int, state: str) -> None:
+        item = self.sdk.fetchItem(int(rating_key))
+        if item.type in VIDEO_TYPES and state in ("playing", "paused", "stopped"):
+            item.updateTimeline(max(0, int(time_ms)), state=state, duration=max(0, int(duration_ms)))
+
+    def get_episode_queue(self, rating_key: str) -> List[Dict[str, Any]]:
+        item = self.sdk.fetchItem(int(rating_key))
+        if item.type == "episode":
+            item = item.season()
+        if item.type not in ("season", "show"):
+            return []
+        episodes = sorted(item.episodes(),
+                          key=lambda entry: (entry.parentIndex or 0, entry.index or 0, entry.ratingKey))
+        return [self._item_dict(entry, from_listing=True) for entry in episodes]
 
     def get_hubs(self, section_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         hubs = self.sdk.library.hubs(sectionID=section_ids or None)
         result = []
         for hub in hubs:
-            items = [self._item_dict(item) for item in hub.items()]
+            items = [self._item_dict(item, from_listing=True) for item in hub.items()]
             if items:
                 result.append({"title": hub.title or "", "key": hub.key or "",
                                "type": hub.type or "", "items": items})
@@ -1139,21 +1430,25 @@ class PlexHTTP:
         try:
             body = next(response.iter_content(256), b"")
             content_type = response.headers.get("Content-Type", "")
-            result = {
+            return {
                 "status": response.status_code,
                 "content_type": content_type,
                 "content_range": response.headers.get("Content-Range", ""),
-                "prefix_hex": body[:32].hex(),
+                "bytes": len(body),
             }
-            if "text" in content_type or "json" in content_type or "xml" in content_type:
-                result["body_preview"] = body[:256].decode("utf-8", errors="replace")
-            return result
         finally:
             response.close()
 
 
 class Plugin:
     """Decky plugin backend for Plexamp integration."""
+
+    _game_video = None
+    _game_video_revision = 0
+    _video_handoff_sources = None
+    _resource_cache = None
+    _resource_lock = threading.Lock()
+    _playback_report_lock = None
 
     async def _main(self):
         """Called when the plugin is loaded."""
@@ -1176,12 +1471,12 @@ class Plugin:
             receiver_id = str(uuid.uuid4())
             settings["companion_id"] = receiver_id
             _save_settings(settings)
-        if settings.get("companion_receiver_enabled", True):
-            self._configure_companion_receiver(receiver_id, True)
+        if settings["companion_receiver_enabled"]:
+            self._configure_companion_receiver(receiver_id, True, settings["companion_device_name"])
         else:
             logger.info("Plex Companion receiver is disabled in settings")
 
-    def _configure_companion_receiver(self, receiver_id: str, enabled: bool) -> None:
+    def _configure_companion_receiver(self, receiver_id: str, enabled: bool, device_name: str) -> None:
         global _companion_receiver
         if not enabled:
             if _companion_receiver:
@@ -1190,15 +1485,18 @@ class Plugin:
             logger.info("Plex Companion receiver disabled")
             return
         if _companion_receiver and _companion_receiver.is_active():
+            _companion_receiver.device_name = device_name
             return
         if _companion_receiver:
             _companion_receiver.stop()
-        _companion_receiver = PlexCompanionReceiver(receiver_id, _companion_event_loop)
+        _companion_receiver = PlexCompanionReceiver(receiver_id, _companion_event_loop, device_name)
         _companion_receiver.start()
 
     async def _unload(self):
         """Called when the plugin is unloaded."""
         global _companion_receiver, _companion_event_loop
+        _cancel_plex_login()
+        await self.stop_game_pip()
         if _companion_receiver:
             _companion_receiver.stop()
             _companion_receiver = None
@@ -1237,10 +1535,37 @@ class Plugin:
         settings = _load_settings()
         return self._public_settings(settings)
 
+    async def get_quick_player_settings(self) -> Dict[str, Any]:
+        """Check for account revocation without treating a network outage as logout."""
+        from plexapi.exceptions import Unauthorized
+
+        global _next_account_check
+        settings = _load_settings()
+        token = settings["plex_token"]
+        if token and time.monotonic() >= _next_account_check:
+            _next_account_check = time.monotonic() + 300
+            try:
+                await asyncio.to_thread(_check_plex_account, token)
+            except Unauthorized:
+                if _load_settings()["plex_token"] == token:
+                    return await self.logout()
+            except Exception:
+                logger.debug("Could not check the Plex account session")
+            settings = _load_settings()
+        return self._public_settings(settings)
+
     @staticmethod
     def _public_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(settings)
         result.pop("companion_id", None)
+        result.pop("library_selections", None)
+        result.pop("manual_server_id", None)
+        result["manual_server_url"] = _manual_server_url(settings)
+        choice = _library_choice(settings)
+        result["library_selection_configured"] = isinstance(choice, list)
+        result["library_selection_ids"] = [entry["id"] for entry in choice] if isinstance(choice, list) else []
+        result["browse_all_media"] = (any(entry["type"] != "artist" for entry in choice)
+                                      if isinstance(choice, list) else choice == "all")
         result["has_plex_token"] = bool(settings.get("plex_token"))
         result["plex_token"] = ""
         result["server_access_token"] = ""
@@ -1252,12 +1577,28 @@ class Plugin:
             merged = _load_settings()
             for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns", "volume",
                         "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
-                        "allow_signed_out_companion"):
+                        "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
+                        "quick_player_maintain_x", "video_quality", "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
                     merged[key] = settings[key]
-            merged["companion_receiver_enabled"] = bool(merged.get("companion_receiver_enabled", True))
+            merged["companion_receiver_enabled"] = bool(merged["companion_receiver_enabled"])
+            merged["hide_quick_login"] = bool(merged["hide_quick_login"])
+            merged["quick_player_maintain_x"] = bool(merged["quick_player_maintain_x"])
+            merged["over_game_pip"] = merged["over_game_pip"] is True
+            if merged["pip_position"] not in PIP_POSITIONS:
+                merged["pip_position"] = DEFAULT_SETTINGS["pip_position"]
+            try:
+                merged["pip_size"] = max(20, min(50, int(merged["pip_size"])))
+            except (TypeError, ValueError, OverflowError):
+                merged["pip_size"] = DEFAULT_SETTINGS["pip_size"]
+            if not isinstance(merged["video_quality"], str) or merged["video_quality"] not in VIDEO_QUALITY:
+                merged["video_quality"] = DEFAULT_SETTINGS["video_quality"]
+            name = "".join(char for char in str(merged["companion_device_name"] or "") if char.isprintable())
+            merged["companion_device_name"] = name[:48].strip() or DEFAULT_SETTINGS["companion_device_name"]
             merged["allow_signed_out_companion"] = bool(merged.get("allow_signed_out_companion", False))
-            merged["manual_server_url"] = self._normalize_server_url(merged.get("manual_server_url", ""))
+            if "manual_server_url" in settings:
+                merged["manual_server_url"] = self._normalize_server_url(merged["manual_server_url"])
+                merged["manual_server_id"] = merged["selected_server_id"] if merged["manual_server_url"] else ""
             merged["playback_target"] = "remote" if merged.get("playback_target") == "remote" and merged.get("selected_player_id") else "local"
             try:
                 merged["connection_timeout"] = max(4, min(30, int(merged.get("connection_timeout", 8))))
@@ -1270,13 +1611,16 @@ class Plugin:
                 merged["volume"] = 50
             try:
                 columns = int(merged.get("grid_columns", 0))
-                merged["grid_columns"] = columns if columns == 0 else max(3, min(8, columns))
+                merged["grid_columns"] = columns if columns == 0 else max(3, min(9, columns))
             except (TypeError, ValueError):
                 merged["grid_columns"] = 0
             _save_settings(merged)
+            if "over_game_pip" in settings and not merged["over_game_pip"]:
+                await self.stop_game_pip()
             receiver_id = str(merged.get("companion_id") or "").strip()
-            if receiver_id:
-                self._configure_companion_receiver(receiver_id, merged["companion_receiver_enabled"])
+            if receiver_id and ("companion_receiver_enabled" in settings or "companion_device_name" in settings):
+                self._configure_companion_receiver(receiver_id, merged["companion_receiver_enabled"],
+                                                   merged["companion_device_name"])
             return self._public_settings(merged)
         except Exception as e:
             logger.error(f"Failed to save settings: {e}")
@@ -1284,7 +1628,8 @@ class Plugin:
 
     async def logout(self) -> Dict[str, Any]:
         """Clear Plex credentials and selected devices while keeping UI preferences."""
-        global _plex_cache_key, _plex_cache_instance
+        global _plex_cache
+        _cancel_plex_login()
         settings = _load_settings()
         settings.update({
             "plex_token": "", "server_access_token": "", "logged_in_username": "",
@@ -1293,8 +1638,10 @@ class Plugin:
             "playback_target": "local",
         })
         _save_settings(settings)
-        _plex_cache_key = None
-        _plex_cache_instance = None
+        await self.stop_game_pip()
+        _plex_cache = (None, None)
+        self._resource_cache = None
+        self._video_handoff_sources = None
         return self._public_settings(settings)
 
     async def select_server(self, server_id: str) -> Dict[str, Any]:
@@ -1304,20 +1651,18 @@ class Plugin:
         if not token:
             return {"success": False, "error": "Log in to Plex before selecting a server."}
         try:
-            info = self._account_resources(token)
+            info = await asyncio.to_thread(self._account_resources, token)
+            settings = _load_settings()
+            if settings.get("plex_token", "").strip() != token:
+                return {"success": False, "error": "Plex account changed while choosing the server."}
             server = next((item for item in info.get("servers", []) if str(item.get("id")) == str(server_id)), None)
             if not server:
                 return {"success": False, "error": "That Plex server is no longer available. Refresh the list."}
-            settings.update({
-                "selected_server_id": server["id"],
-                "selected_server_name": server.get("name", ""),
-                "selected_server_url": server.get("base_url", ""),
-                "server_access_token": server.get("access_token") or token,
-            })
+            settings.update(_server_settings(server, token))
             _save_settings(settings)
-            global _plex_cache_key, _plex_cache_instance
-            _plex_cache_key = None
-            _plex_cache_instance = None
+            await self.stop_game_pip()
+            global _plex_cache
+            _plex_cache = (None, None)
             return {"success": True, "settings": self._public_settings(settings)}
         except Exception as e:
             logger.error("Failed to select Plex server %s: %s", server_id, e, exc_info=True)
@@ -1344,11 +1689,13 @@ class Plugin:
 
     def _get_plex(self) -> Optional[PlexHTTP]:
         """Connect to the Plex server using saved settings."""
-        global _plex_cache_key, _plex_cache_instance
-        settings = _load_settings()
-        url = self._get_plex_server_url()
+        return self._plex_for_settings(_load_settings())
+
+    def _plex_for_settings(self, settings: Dict[str, Any]) -> Optional[PlexHTTP]:
+        global _plex_cache
+        url = self._get_plex_server_url(settings)
         # Use server-specific access token if available, otherwise fall back to user token
-        token = self._get_server_access_token() or settings.get("plex_token", "").strip()
+        token = settings["server_access_token"] or settings.get("plex_token", "").strip()
         account_token = settings.get("plex_token", "").strip()
         if not url or not token:
             # Only log once at DEBUG level — this is expected when no server is configured
@@ -1357,20 +1704,21 @@ class Plugin:
         timeout = int(settings.get("connection_timeout", 8) or 8)
         verify_tls = bool(settings.get("verify_tls", False))
         cache_key = (url.rstrip("/"), token, account_token, timeout, verify_tls)
-        if _plex_cache_instance is not None and _plex_cache_key == cache_key:
-            return _plex_cache_instance
-        try:
-            plex = PlexHTTP(url, token, timeout=timeout, verify_tls=verify_tls,
-                            account_token=account_token)
-            # PlexServer validates the connection during construction and keeps
-            # the authenticated session for every subsequent SDK request.
-            logger.debug(f"_get_plex: connected to server at {url}")
-            _plex_cache_key = cache_key
-            _plex_cache_instance = plex
-            return plex
-        except Exception as e:
-            logger.debug(f"_get_plex: cannot connect to {url}: {e}")
-            return None
+        previous_key, previous_plex = _plex_cache
+        if previous_key == cache_key:
+            return previous_plex
+        with _plex_connect_lock:
+            previous_key, previous_plex = _plex_cache
+            if previous_key == cache_key:
+                return previous_plex
+            try:
+                # PlexServer validates the connection and retains the authenticated session.
+                plex = PlexHTTP(url, token, timeout=timeout, verify_tls=verify_tls, account_token=account_token)
+                _plex_cache = (cache_key, plex)
+                return plex
+            except Exception as error:
+                logger.debug("Plex connection failed: %s", type(error).__name__)
+                return None
 
     def _find_plexamp_player(self, plex: PlexHTTP) -> Optional[Dict[str, str]]:
         """Find the Plexamp/Caldera player on the Plex server."""
@@ -1395,11 +1743,11 @@ class Plugin:
 
     async def discover_players(self) -> Dict[str, Any]:
         """List all connected Plex clients for player selection."""
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"players": [], "error": "Not connected to Plex server"}
         try:
-            clients = plex.discover_players()
+            clients = await asyncio.to_thread(plex.discover_players)
             players = []
             for client in clients:
                 players.append({
@@ -1492,7 +1840,7 @@ class Plugin:
 
     async def get_companion_status(self) -> Dict[str, Any]:
         receiver = _companion_receiver
-        enabled = bool(_load_settings().get("companion_receiver_enabled", True))
+        enabled = bool(_load_settings()["companion_receiver_enabled"])
         if not enabled:
             return {"active": False, "enabled": False, "error": "Receiver disabled in settings"}
         if not receiver:
@@ -1632,7 +1980,24 @@ class Plugin:
         except Exception as exc:
             logger.warning("Could not add track %s to Companion queue %s: %s",
                            rating_key, play_queue_id, exc)
-            return {"success": False, "error": str(exc)}
+            detail = str(exc)
+            lowered = detail.lower()
+            if "different plex server" in lowered or "server mismatch" in lowered:
+                message = ("Can't update the Plexamp queue because DeckyPlex is connected to a different Plex server. "
+                           "Select the same server in both apps, or enable ‘Accept playback from any Plex account’ "
+                           "in Players settings.")
+            elif "404" in lowered or "not_found" in lowered:
+                message = ("Can't add this track to Plexamp's queue because it isn't available on Plexamp's active "
+                           "Plex server or library. Select the same server in both apps, or choose a track from a "
+                           "library available to Plexamp.")
+            elif any(marker in lowered for marker in ("unauthorized", "not authorized", "forbidden", "401", "403",
+                                                        "access denied", "permission", "different plex account")):
+                message = ("Can't update the Plexamp queue with DeckyPlex's current Plex account. "
+                           "Sign in with the same Plex account as Plexamp, or enable ‘Accept playback from any Plex account’ "
+                           "in Players settings.")
+            else:
+                message = f"Could not update the Plexamp queue: {detail}"
+            return {"success": False, "error": message}
         finally:
             if owns_session and plex:
                 plex.session.close()
@@ -1759,41 +2124,122 @@ class Plugin:
 
     # ---- Library browsing ----
 
-    async def get_library_sections(self) -> Dict[str, Any]:
-        """Get all library sections, filtering for music sections."""
-        plex = self._get_plex()
+    @staticmethod
+    def _visible_libraries(sections, settings, include_other_media):
+        choice = _library_choice(settings)
+        library_types = LIBRARY_TYPES if include_other_media else ("artist",)
+        if isinstance(choice, list):
+            chosen_ids = {entry["id"] for entry in choice}
+            return [section for section in sections if section["id"] in chosen_ids and section["type"] in library_types]
+        if choice != "all":
+            library_types = ("artist",)
+        return [section for section in sections if section["type"] in library_types]
+
+    def _library_catalog(self, settings) -> Dict[str, Any]:
+        plex = self._plex_for_settings(settings)
+        if not plex:
+            return {"error": "Could not connect to the selected Plex server." if settings["selected_server_id"]
+                    else "Select a Plex server first."}
+        try:
+            libraries = [section for section in plex.get_library_sections() if section["type"] in LIBRARY_TYPES]
+            selected_ids = [section["id"] for section in self._visible_libraries(libraries, settings, True)]
+            return {"libraries": libraries, "selected_ids": selected_ids, "server_id": settings["selected_server_id"]}
+        except Exception:
+            logger.warning("Could not load the Plex library catalog", exc_info=True)
+            return {"error": "Could not load libraries from this Plex server."}
+
+    async def get_library_catalog(self) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._library_catalog, _load_settings())
+
+    async def set_library_selection(self, server_id: str, selected_ids: List[str]) -> Dict[str, Any]:
+        if not isinstance(selected_ids, list) or not all(isinstance(section_id, str) for section_id in selected_ids):
+            return {"error": "Invalid Plex library selection."}
+        original = _load_settings()
+        if not server_id or server_id != original["selected_server_id"]:
+            return {"error": "Your Plex server changed. Reload the library list and try again."}
+        catalog = await asyncio.to_thread(self._library_catalog, original)
+        if catalog.get("error"):
+            return catalog
+        settings = _load_settings()
+        if server_id != settings["selected_server_id"] or original["plex_token"] != settings["plex_token"]:
+            return {"error": "Your Plex server changed. Reload the library list and try again."}
+        selected = [section for section in catalog["libraries"] if section["id"] in selected_ids]
+        if not selected:
+            return {"error": "Choose at least one Plex library."}
+        _set_library_choice(settings, server_id, selected)
+        try:
+            _save_settings(settings)
+            return self._public_settings(settings)
+        except OSError:
+            return {"error": "Could not save the selected Plex libraries."}
+
+    async def get_library_sections(self, include_other_media: bool = False) -> Dict[str, Any]:
+        """Return the supported library sections for the requested browser mode."""
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"sections": [], "error": "Not connected to Plex server"}
         try:
-            sections = plex.get_library_sections()
+            sections = await asyncio.to_thread(plex.get_library_sections)
             logger.debug(f"get_library_sections: found {len(sections)} sections")
-            # Filter for music sections only
-            music_sections = [s for s in sections if s.get("type") == "artist"]
-            logger.debug(f"get_library_sections: {len(music_sections)} music sections")
-            return {"sections": music_sections}
+            return {"sections": self._visible_libraries(sections, _load_settings(), include_other_media)}
         except Exception as e:
             logger.error(f"Failed to get library sections: {e}")
             return {"sections": [], "error": str(e)}
 
     async def get_section_contents(self, section_id: str, item_type: str = "", limit: int = 100,
-                                   offset: int = 0) -> Dict[str, Any]:
-        """Get contents of a music library section (artists, albums, etc.)."""
-        plex = self._get_plex()
+                                   offset: int = 0, sort: str = "titleSort:asc") -> Dict[str, Any]:
+        """Load a page of items using the SDK's section-specific media types."""
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return plex.get_section_contents(section_id, item_type, limit, offset)
+            return await asyncio.to_thread(plex.get_section_contents, section_id, item_type, limit, offset, sort)
         except Exception as e:
             logger.error(f"Failed to get section contents: {e}")
             return {"items": [], "error": str(e)}
 
-    async def get_shuffled_tracks(self, section_id: str) -> Dict[str, Any]:
-        """Load and shuffle every track in the selected music library."""
-        plex = self._get_plex()
+    async def get_video_home(self, row: str) -> Dict[str, Any]:
+        if row not in ("continue", "movies", "shows", "watchlist"):
+            return {"items": [], "error": "Unknown video home section."}
+        settings = _load_settings()
+
+        def load():
+            plex = self._plex_for_settings(settings)
+            if not plex:
+                raise ValueError("Not connected to Plex server")
+            visible = self._visible_libraries(plex.get_library_sections(), settings, True)
+            libraries = [library for library in visible if library["type"] in ("movie", "show")]
+            return plex.get_video_home(row, libraries)
+
+        try:
+            return {"items": await asyncio.to_thread(load)}
+        except Exception as error:
+            logger.warning("Could not load Plex video home row=%s error=%s", row, type(error).__name__)
+            return {"items": [], "error": "Could not load this section."}
+
+    async def get_music_artists(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            tracks = plex.get_shuffled_tracks(section_id)
+            settings = _load_settings()
+
+            def load_artists():
+                sections = self._visible_libraries(plex.get_library_sections(), settings, False)
+                return plex.get_music_artists(sections, limit, offset)
+
+            return await asyncio.to_thread(load_artists)
+        except Exception as e:
+            logger.error("Failed to get music artists: %s", e)
+            return {"items": [], "error": str(e)}
+
+    async def get_shuffled_tracks(self, section_id: str) -> Dict[str, Any]:
+        """Load and shuffle every track in the selected music library."""
+        plex = await asyncio.to_thread(self._get_plex)
+        if not plex:
+            return {"items": [], "error": "Not connected to Plex server"}
+        try:
+            tracks = await asyncio.to_thread(plex.get_shuffled_tracks, section_id)
             logger.info("Prepared shuffle-all queue with %d tracks from section %s", len(tracks), section_id)
             return {"items": tracks}
         except Exception as e:
@@ -1802,63 +2248,63 @@ class Plugin:
 
     async def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25,
                              randomize: bool = False) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "total": 0, "error": "Not connected to Plex server"}
         try:
-            return plex.get_track_page(section_id, offset, limit, randomize)
+            return await asyncio.to_thread(plex.get_track_page, section_id, offset, limit, randomize)
         except Exception as e:
             logger.error("Failed to load shuffle page: %s", e, exc_info=True)
             return {"items": [], "total": 0, "error": str(e)}
 
     async def get_metadata_children(self, metadata_id: str) -> Dict[str, Any]:
         """Get children of a metadata item (album tracks, artist albums)."""
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            items = plex.get_metadata_children(metadata_id)
+            items = await asyncio.to_thread(plex.get_metadata_children, metadata_id)
             return {"items": items}
         except Exception as e:
             logger.error(f"Failed to get metadata children: {e}")
             return {"items": [], "error": str(e)}
 
     async def get_artist_tracks(self, artist_id: str) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return {"items": plex.get_artist_tracks(artist_id)}
+            return {"items": await asyncio.to_thread(plex.get_artist_tracks, artist_id)}
         except Exception as e:
             logger.error(f"Failed to get tracks for artist {artist_id}: {e}")
             return {"items": [], "error": str(e)}
 
     async def get_recently_played(self, section_id: str = "", limit: int = 50) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return {"items": plex.get_recently_played(section_id, limit)}
+            return {"items": await asyncio.to_thread(plex.get_recently_played, section_id, limit)}
         except Exception as e:
             logger.error(f"Failed to get recently played tracks: {e}")
             return {"items": [], "error": str(e)}
 
     async def get_recently_added(self, section_id: str, limit: int = 50) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return {"items": plex.get_recently_added(section_id, limit)}
+            return {"items": await asyncio.to_thread(plex.get_recently_added, section_id, limit)}
         except Exception as e:
             logger.error(f"Failed to get recently added albums: {e}")
             return {"items": [], "error": str(e)}
 
     async def get_audio_playlists(self, limit: int = 100) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return {"items": plex.get_audio_playlists(limit)}
+            return {"items": await asyncio.to_thread(plex.get_audio_playlists, limit)}
         except Exception as e:
             logger.error(f"Failed to get audio playlists: {e}")
             return {"items": [], "error": str(e)}
@@ -1904,26 +2350,180 @@ class Plugin:
             return {"success": False, "error": str(e)}
 
     async def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> Dict[str, Any]:
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            return {"items": plex.get_playlist_tracks(playlist_id, limit)}
+            return {"items": await asyncio.to_thread(plex.get_playlist_tracks, playlist_id, limit)}
         except Exception as e:
             logger.error(f"Failed to get tracks from playlist {playlist_id}: {e}")
             return {"items": [], "error": str(e)}
 
-    async def search_library(self, query: str, section_id: str = "", limit: int = 20) -> Dict[str, Any]:
-        """Search the library for tracks, albums, or artists."""
-        plex = self._get_plex()
+    async def search_library(self, query: str, section_id: str = "", limit: int = 20,
+                             include_other_media: bool = False) -> Dict[str, Any]:
+        """Search music or all supported library media."""
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
-            items = plex.search_library(query, section_id, limit)
+            sections = await asyncio.to_thread(plex.get_library_sections)
+            allowed = self._visible_libraries(sections, _load_settings(), include_other_media)
+            allowed_ids = {section["id"] for section in allowed}
+            if section_id and section_id not in allowed_ids:
+                return {"items": []}
+            items = await asyncio.to_thread(plex.search_library, query, section_id, limit,
+                                            allowed_ids if not section_id else None, include_other_media)
             return {"items": items}
         except Exception as e:
             logger.error(f"Failed to search library: {e}")
             return {"items": [], "error": str(e)}
+
+    async def get_media_source(self, rating_key: str, requested_quality: str = "") -> Dict[str, Any]:
+        plex = await asyncio.to_thread(self._get_plex)
+        if not plex:
+            return {"error": "Not connected to Plex server"}
+        try:
+            settings = _load_settings()
+            quality = requested_quality or settings["video_quality"]
+            if not isinstance(quality, str) or quality not in VIDEO_QUALITY:
+                quality = "auto"
+            result = await asyncio.to_thread(plex.get_media_source, rating_key, quality)
+            if any(stream["kind"] == "hls" for stream in result.get("streams", [])):
+                if self._video_handoff_sources is None:
+                    self._video_handoff_sources = {}
+                cache = self._video_handoff_sources
+                if len(cache) >= 8:
+                    cache.pop(next(iter(cache)))
+                key = secrets.token_urlsafe(18)
+                identity = (settings["selected_server_id"], settings["plex_token"],
+                            self._get_plex_server_url(settings), rating_key, quality)
+                cache[key] = (identity, result)
+                result = {**result, "handoff_key": key}
+            return {**result, "server_id": settings["selected_server_id"], "quality": quality}
+        except Exception as error:
+            logger.warning("Could not prepare Plex video item=%s error=%s",
+                           rating_key if str(rating_key).isdigit() else "invalid", type(error).__name__)
+            return {"error": "Plex could not prepare this item for playback."}
+
+    async def log_video_event(self, rating_key: str, quality: str, source: str, event: str, code: str = "") -> None:
+        if event not in ("attempt", "ready", "failed", "quality-restored", "autoplay", "waiting"):
+            return
+        if not all(isinstance(value, str) for value in (rating_key, quality, source, code)):
+            return
+        if not rating_key.isdecimal() or len(rating_key) > 20 or not re.fullmatch(r"[a-zA-Z0-9_.:-]{0,96}", code):
+            return
+        if source not in ("source", "direct", "hls", "hls-audio", "hls-copy", "hls-proxy", "http", "pip"):
+            return
+        logger.log(30 if event in ("failed", "quality-restored") else 20,
+                   "Video %s item=%s quality=%s source=%s code=%s",
+                   event, rating_key, quality if quality in VIDEO_QUALITY else "auto", source, code or "-")
+
+    async def get_episode_queue(self, rating_key: str, server_id: str) -> List[Dict[str, Any]]:
+        if not server_id or _load_settings()["selected_server_id"] != server_id:
+            return []
+        plex = await asyncio.to_thread(self._get_plex)
+        if not plex:
+            return []
+        try:
+            return await asyncio.to_thread(plex.get_episode_queue, rating_key)
+        except Exception as error:
+            logger.debug("Could not read Plex episode queue error=%s", type(error).__name__)
+            return []
+
+    def _find_video_handoff(self, reuse, identity, preferred_source):
+        if not isinstance(reuse, dict) or not isinstance(reuse.get("key"), str):
+            return None, None
+        manifest = reuse.get("manifest")
+        if not isinstance(manifest, str) or len(manifest) > 65536 or not manifest.lstrip("\ufeff").startswith("#EXTM3U"):
+            return None, None
+        saved = (self._video_handoff_sources or {}).get(reuse["key"])
+        if not saved or saved[0] != identity:
+            return None, None
+        source = saved[1]
+        for stream in source["streams"]:
+            if stream["kind"] != "hls":
+                continue
+            name = {"audio-conversion": "hls-audio", "direct-stream": "hls-copy"}.get(stream.get("mode"), "hls")
+            if preferred_source == name:
+                return source, (stream["url"], manifest.encode())
+            if preferred_source == "hls-proxy" and stream.get("fallback_url"):
+                return source, (stream["fallback_url"], manifest.encode())
+        return None, None
+
+    async def start_game_pip(self, rating_key: str, server_id: str, quality: str, position: float,
+                             volume: float, muted: bool, replacing_id: str = "", preferred_source: str = "",
+                             reuse=None) -> Dict[str, Any]:
+        settings = _load_settings()
+        if settings.get("over_game_pip") is not True:
+            return {"error": "Over-game picture-in-picture is turned off."}
+        if not server_id or server_id != settings["selected_server_id"]:
+            return {"error": "Your Plex server changed. Reopen this video to try again."}
+        if self._game_video and self._game_video.closed.is_set():
+            self._game_video = None
+        previous = self._game_video
+        if previous and previous.id != replacing_id:
+            return {"error": "Close the over-game video before opening another one."}
+        if replacing_id and not previous:
+            return {"error": "The over-game video has already closed."}
+        revision = self._game_video_revision
+        plex = await asyncio.to_thread(self._get_plex)
+        if not plex:
+            return {"error": "Not connected to Plex server."}
+        try:
+            from video_pip import GameVideo
+
+            if not isinstance(quality, str) or quality not in VIDEO_QUALITY:
+                quality = "auto"
+            identity = (server_id, settings["plex_token"], self._get_plex_server_url(settings), rating_key, quality)
+            source, manifest = self._find_video_handoff(reuse, identity, preferred_source)
+            if source is None:
+                source = await asyncio.wait_for(asyncio.to_thread(plex.get_media_source, rating_key, quality), 18)
+            if revision != self._game_video_revision or self._game_video is not previous:
+                return {"error": "The over-game video request was canceled."}
+            if not source.get("streams") or source["streams"][0]["kind"] == "image":
+                return {"error": "Over-game picture-in-picture requires a video."}
+            video = GameVideo(plex, source, position, volume, muted, preferred_source, manifest)
+            video.start()
+            self._game_video = video
+            if previous:
+                await asyncio.to_thread(previous.close)
+            return {"id": video.id, "url": video.url,
+                    "pip_position": settings["pip_position"], "pip_size": settings["pip_size"]}
+        except Exception as error:
+            logger.warning("Could not prepare PiP item=%s error=%s",
+                           rating_key if str(rating_key).isdecimal() else "invalid", type(error).__name__)
+            return {"error": "Could not prepare the Plex stream for over-game picture-in-picture."}
+
+    async def get_game_pip_status(self, video_id: str) -> Dict[str, Any]:
+        video = self._game_video
+        if not video or video.id != video_id:
+            return {"status": "closed"}
+        return video.snapshot()
+
+    async def control_game_pip(self, video_id: str, action: str, position: float, playing: bool) -> bool:
+        video = self._game_video
+        return bool(action in ("activate", "commit", "playback", "seek", "volume") and video and video.id == video_id
+                    and video.command(action, position, playing))
+
+    async def stop_game_pip(self, video_id: str = "") -> None:
+        video = self._game_video
+        if video_id and (not video or video.id != video_id):
+            return
+        self._game_video_revision += 1
+        self._game_video = None
+        if video:
+            await asyncio.to_thread(video.close)
+
+    async def report_video_progress(self, rating_key: str, server_id: str, time_ms: int,
+                                    duration_ms: int, state: str) -> None:
+        if not server_id or _load_settings()["selected_server_id"] != server_id:
+            return
+        plex = await asyncio.to_thread(self._get_plex)
+        if plex:
+            try:
+                await asyncio.to_thread(plex.report_video_progress, rating_key, time_ms, duration_ms, state)
+            except Exception:
+                logger.debug("Could not report Plex video progress for %s", rating_key, exc_info=True)
 
     async def get_hubs(self) -> Dict[str, Any]:
         """Get hubs (recently played, on deck, etc.), limited to music sections only."""
@@ -1965,13 +2565,13 @@ class Plugin:
         to get a playable stream URL. The frontend uses an HTML5 <audio> element
         to play the stream — this plugin IS the player, not a remote control.
         """
-        plex = self._get_plex()
+        plex = await asyncio.to_thread(self._get_plex)
         if not plex:
             return {"success": False, "error": "Not connected to Plex server"}
         try:
             # PlexAPI's getStreamURL() is HLS-only; our adapter uses the SDK's
             # authenticated URL builder for the single-file MP3 transcode.
-            streams = plex.get_stream_urls(rating_key)
+            streams = await asyncio.to_thread(plex.get_stream_urls, rating_key)
             logger.info("play_track: using %s for track %s", streams.get("stream_mode"), rating_key)
             play_queue_id = ""
             selected_item_id = ""
@@ -1998,33 +2598,32 @@ class Plugin:
         try:
             result = plex.inspect_stream(rating_key, stream_url)
             logger.info(
-                "Stream diagnostic for track %s: status=%s content_type=%s content_range=%s prefix=%s",
-                rating_key, result.get("status"), result.get("content_type"),
-                result.get("content_range"), result.get("prefix_hex"),
+                "Stream diagnostic for track %s: status=%s range=%s bytes=%s",
+                rating_key, result.get("status"), bool(result.get("content_range")), result.get("bytes"),
             )
-            preview = result.get("body_preview")
-            if preview:
-                logger.info("Stream diagnostic response preview for track %s: %s", rating_key, preview[:256])
             return {"success": True, **result}
         except Exception as e:
-            logger.error(f"Stream diagnostic failed for track {rating_key}: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            logger.warning("Stream diagnostic failed for track %s: %s", rating_key, type(e).__name__)
+            return {"success": False, "error": "Could not inspect the Plex stream."}
 
     async def report_playback(self, rating_key: str, time_ms: int, state: str,
                               duration_ms: int = 0) -> Dict[str, Any]:
         """Report this local player's timeline through PlexAPI for sessions/history."""
-        plex = self._get_plex()
-        if not plex:
-            return {"success": False, "error": "Not connected to Plex server"}
         if state not in ("playing", "paused", "stopped"):
             return {"success": False, "error": "Invalid playback state"}
-        try:
+
+        def send():
+            plex = self._get_plex()
+            if not plex:
+                raise ValueError("Not connected to Plex server")
             track = plex.sdk.fetchItem(int(rating_key))
-            track.updateTimeline(
-                max(0, int(time_ms)),
-                state=state,
-                duration=max(0, int(duration_ms)) or None,
-            )
+            track.updateTimeline(max(0, int(time_ms)), state=state, duration=max(0, int(duration_ms)) or None)
+
+        try:
+            if self._playback_report_lock is None:
+                self._playback_report_lock = asyncio.Lock()
+            async with self._playback_report_lock:
+                await asyncio.to_thread(send)
             logger.debug(f"Reported Plex timeline: track={rating_key}, state={state}, time={time_ms}")
             return {"success": True}
         except Exception as e:
@@ -2032,35 +2631,47 @@ class Plugin:
             return {"success": False, "error": str(e)}
 
     async def plex_login(self) -> Dict[str, Any]:
-        """Start PIN authentication with python-plexapi's login helper."""
-        try:
-            import requests
-            from plexapi.myplex import MyPlexPinLogin
+        """Start PlexAPI link-code authentication."""
+        from plexapi.myplex import MyPlexPinLogin
 
-            client_id = secrets.token_hex(16)
-            session = requests.Session()
-            session.verify = False
+        _cancel_plex_login()
+        login_id = secrets.token_hex(16)
+        _pin_state["id"] = login_id
+        try:
             headers = {
-                "X-Plex-Client-Identifier": client_id,
+                "X-Plex-Client-Identifier": login_id,
                 "X-Plex-Product": "DeckyPlex",
                 "X-Plex-Version": "1.0.0",
                 "X-Plex-Platform": "SteamOS",
                 "X-Plex-Device": "Steam Machine",
                 "X-Plex-Device-Name": "DeckyPlex",
             }
-            pin_login = MyPlexPinLogin(session=session, requestTimeout=15, headers=headers)
-            pin = pin_login.pin
+            pin_login = MyPlexPinLogin(requestTimeout=15, headers=headers)
+            pin = await asyncio.to_thread(lambda: pin_login.pin)
             if not pin:
-                return {"error": "Plex did not return a login PIN."}
-            _pin_state.clear()
-            _pin_state.update({"login": pin_login, "client_id": client_id})
-            logger.info("Started Plex PIN login through PlexAPI")
-            return {"pin": pin, "url": "https://plex.tv/link"}
-        except Exception as e:
-            logger.error(f"Failed to start Plex login through PlexAPI: {e}", exc_info=True)
-            return {"error": f"Plex login failed: {e}"}
+                raise ValueError("Plex did not return a login code.")
+            if _pin_state.get("id") != login_id:
+                return {"error": "This sign-in attempt was replaced."}
+            _pin_state["task"] = asyncio.create_task(self._finish_plex_login(pin_login, login_id))
+            return {"pin": pin, "url": "https://plex.tv/link", "login_id": login_id}
+        except Exception:
+            if _pin_state.get("id") == login_id:
+                _pin_state.clear()
+            logger.warning("Could not start Plex login through PlexAPI", exc_info=True)
+            return {"error": "Could not start Plex sign-in. Try again."}
 
     def _account_resources(self, auth_token: str) -> Dict[str, Any]:
+        # Discovery and server selection can be invoked together by Settings.
+        with self._resource_lock:
+            cached = self._resource_cache
+            if cached and cached[0] == auth_token and cached[1] > time.monotonic():
+                return cached[2]
+            info = self._probe_account_resources(auth_token)
+            if _load_settings().get("plex_token") == auth_token and info["servers"]:
+                self._resource_cache = (auth_token, time.monotonic() + 90, info)
+            return info
+
+    def _probe_account_resources(self, auth_token: str) -> Dict[str, Any]:
         """Read account identity and Plex servers through PlexAPI resource objects."""
         import requests
         from plexapi.myplex import MyPlexAccount
@@ -2079,7 +2690,13 @@ class Plugin:
                 continue
             if "server" in (resource.provides or "").split(","):
                 try:
-                    connected_server = resource.connect(timeout=4, locations=["local", "remote"])
+                    _, saved = _plex_cache
+                    if (saved and saved.account_token == auth_token
+                            and saved.sdk.machineIdentifier == resource.clientIdentifier
+                            and saved.base_url in connections):
+                        connected_server = saved.sdk
+                    else:
+                        connected_server = resource.connect(timeout=4, locations=["local", "remote"])
                     servers.append({
                         "id": connected_server.machineIdentifier or resource.clientIdentifier,
                         "name": connected_server.friendlyName or resource.name or "Plex Media Server",
@@ -2098,44 +2715,133 @@ class Plugin:
             "plexamp_client_id": plexamp_client_id,
         }
 
-    async def plex_login_poll(self) -> Dict[str, Any]:
-        """Poll PIN approval and save the account token before resource discovery."""
-        pin_login = _pin_state.get("login")
-        if pin_login is None:
-            return {"error": "No active Plex login. Start login again."}
-
+    async def _finish_plex_login(self, pin_login, login_id: str) -> None:
+        """Complete PlexAPI polling and discovery independently of the UI."""
         try:
-            if not pin_login.checkLogin():
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                if await asyncio.to_thread(pin_login.checkLogin):
+                    break
                 if pin_login.expired:
-                    _pin_state.clear()
-                    return {"error": "Plex login expired or could not be verified. Start again."}
-                return {}
+                    break
+                await asyncio.sleep(2)
+            if _pin_state.get("id") != login_id:
+                return
+            if not pin_login.token:
+                _pin_state["result"] = {"error": "Plex sign-in expired or could not be verified. Try again."}
+                return
 
-            auth_token = pin_login.token
             settings = _load_settings()
-            settings["plex_token"] = auth_token
-            settings["logged_in_username"] = ""
-            settings["selected_player_id"] = ""
-            settings["selected_player_name"] = ""
-            settings["playback_target"] = "local"
-            settings["selected_server_id"] = ""
-            settings["selected_server_name"] = ""
-            settings["selected_server_url"] = ""
-            settings["server_access_token"] = ""
-            settings["plexamp_url"] = ""
+            settings.update({
+                "plex_token": pin_login.token, "logged_in_username": "",
+                "selected_player_id": "", "selected_player_name": "", "playback_target": "local",
+                "selected_server_id": "", "selected_server_name": "", "selected_server_url": "",
+                "server_access_token": "", "plexamp_url": "",
+            })
             _save_settings(settings)
+            _pin_state["result"] = {"connecting": True}
+            try:
+                resources = await self._discover_server_resources(pin_login.token)
+            except Exception:
+                logger.warning("Could not discover Plex servers during sign-in", exc_info=True)
+                resources = {"servers": []}
+            if _pin_state.get("id") == login_id:
+                _pin_state["setup_token"] = pin_login.token
+                _pin_state["setup_servers"] = {server["id"]: server for server in resources["servers"]}
+                _pin_state["setup_catalogs"] = {}
+                _pin_state["result"] = {"logged_in": True, "servers": self._public_servers(resources["servers"])}
+        except Exception:
+            logger.warning("Could not complete Plex login", exc_info=True)
+            if _pin_state.get("id") == login_id:
+                _pin_state["result"] = {"error": "Could not complete Plex sign-in. Try again."}
+        finally:
+            if _pin_state.get("id") == login_id:
+                _pin_state.pop("task", None)
 
-            _pin_state.clear()
-            logger.info("Plex PIN login approved; account token saved, starting server discovery")
-            return {
-                "logged_in": True,
-                "username": "",
-                "servers": [],
-                "discovery_pending": True,
-            }
-        except Exception as e:
-            logger.error(f"Plex PIN polling failed: {e}", exc_info=True)
-            return {"error": f"Plex login check failed: {e}"}
+    async def plex_login_poll(self, login_id: str) -> Dict[str, Any]:
+        """Return the status of the sign-in attempt shown in Settings."""
+        if not login_id or _pin_state.get("id") != login_id:
+            return {"error": "No active Plex sign-in. Try again."}
+        return _pin_state.get("result", {})
+
+    def _plex_setup_server(self, login_id, server_id, settings):
+        if (isinstance(server_id, str) and login_id and _pin_state.get("id") == login_id
+                and _pin_state.get("setup_token") == settings["plex_token"]):
+            return _pin_state.get("setup_servers", {}).get(server_id)
+        return None
+
+    async def get_plex_setup_catalog(self, login_id: str, server_id: str) -> Dict[str, Any]:
+        settings = _load_settings()
+        server = self._plex_setup_server(login_id, server_id, settings)
+        if not server:
+            return {"error": "This Plex setup has ended. Choose libraries in Settings › Server."}
+        candidate = {**settings, **_server_settings(server, settings["plex_token"])}
+        catalog = await asyncio.to_thread(self._library_catalog, candidate)
+        if not self._plex_setup_server(login_id, server_id, _load_settings()):
+            return {"error": "This Plex setup has ended. Choose libraries in Settings › Server."}
+        if not catalog.get("error"):
+            _pin_state["setup_catalogs"][server_id] = catalog["libraries"]
+        return catalog
+
+    async def complete_plex_setup(self, login_id: str, server_id: str, selected_ids: List[str]) -> Dict[str, Any]:
+        settings = _load_settings()
+        server = self._plex_setup_server(login_id, server_id, settings)
+        if not server:
+            return {"error": "This Plex setup has ended. Choose libraries in Settings › Server."}
+        libraries = _pin_state["setup_catalogs"].get(server_id)
+        if libraries is None:
+            return {"error": "This Plex setup has ended. Choose libraries in Settings › Server."}
+        if not isinstance(selected_ids, list) or not all(isinstance(item, str) for item in selected_ids):
+            return {"error": "Invalid Plex library selection."}
+        selected = [library for library in libraries if library["id"] in selected_ids]
+        if not selected:
+            return {"error": "Choose at least one Plex library."}
+        if {library["id"] for library in selected} != set(selected_ids):
+            return {"error": "Your Plex libraries changed. Try again."}
+
+        changed_server = settings["selected_server_id"] != server_id
+        settings.update(_server_settings(server, settings["plex_token"]))
+        _set_library_choice(settings, server_id, selected)
+        try:
+            _save_settings(settings)
+        except OSError:
+            return {"error": "Could not save your Plex setup."}
+        await self.dismiss_plex_setup(login_id)
+        if changed_server:
+            await self.stop_game_pip()
+        return self._public_settings(settings)
+
+    async def dismiss_plex_setup(self, login_id: str) -> None:
+        if login_id and _pin_state.get("id") == login_id:
+            for key in ("setup_token", "setup_servers", "setup_catalogs"):
+                _pin_state.pop(key, None)
+
+    @staticmethod
+    def _public_servers(servers):
+        return [{key: server.get(key, "") for key in ("id", "name", "base_url")} for server in servers]
+
+    async def _discover_server_resources(self, token):
+        info = await asyncio.to_thread(self._account_resources, token)
+        settings = _load_settings()
+        if settings.get("plex_token", "").strip() != token:
+            raise ValueError("Plex account changed during discovery.")
+        settings["logged_in_username"] = info.get("username", "")
+        if info["plexamp_url"]:
+            settings["plexamp_url"] = info["plexamp_url"]
+        servers = info["servers"]
+        current_id = settings.get("selected_server_id")
+        if current_id and settings.get("selected_server_url") and not any(server["id"] == current_id for server in servers):
+            servers = [*servers, {
+                "id": settings["selected_server_id"],
+                "name": settings.get("selected_server_name") or "Saved Plex server",
+                "base_url": settings["selected_server_url"],
+                "access_token": settings.get("server_access_token") or token,
+            }]
+        if servers:
+            default = next((server for server in servers if server["id"] == settings["selected_server_id"]), servers[0])
+            settings.update(_server_settings(default, token))
+        _save_settings(settings)
+        return {**info, "servers": servers}
 
     async def discover_servers(self) -> Dict[str, Any]:
         """Discover Plex servers with PlexAPI account and resource objects."""
@@ -2144,32 +2850,9 @@ class Plugin:
         if not token:
             return {"servers": [], "error": "Not logged in to Plex"}
         try:
-            info = self._account_resources(token)
-            settings["logged_in_username"] = info.get("username", "")
-            if info["plexamp_url"]:
-                settings["plexamp_url"] = info["plexamp_url"]
-                _save_settings(settings)
-            servers = info["servers"]
-            if not servers and settings.get("selected_server_url") and settings.get("selected_server_id"):
-                servers = [{
-                    "id": settings["selected_server_id"],
-                    "name": settings.get("selected_server_name") or "Saved Plex server",
-                    "base_url": settings["selected_server_url"],
-                    "access_token": settings.get("server_access_token") or token,
-                }]
-            if servers:
-                selected = next((server for server in servers if server["id"] == settings.get("selected_server_id")), servers[0])
-                settings.update({
-                    "selected_server_id": selected["id"],
-                    "selected_server_name": selected["name"],
-                    "selected_server_url": selected["base_url"],
-                    "server_access_token": selected.get("access_token") or token,
-                })
-            _save_settings(settings)
-            public_servers = [{key: server.get(key, "") for key in ("id", "name", "base_url")}
-                              for server in servers]
+            info = await self._discover_server_resources(token)
             return {
-                "servers": public_servers,
+                "servers": self._public_servers(info["servers"]),
                 "plexamp_url": info["plexamp_url"],
             }
         except Exception as e:
@@ -2179,10 +2862,10 @@ class Plugin:
     async def validate_connection(self) -> Dict[str, Any]:
         """Validate the selected connection through PlexServer's SDK session."""
         try:
-            plex = self._get_plex()
+            plex = await asyncio.to_thread(self._get_plex)
             if not plex:
                 return {"valid": False, "error": "Select a Plex server in Settings first."}
-            identity = plex.get_server_identity()
+            identity = await asyncio.to_thread(plex.get_server_identity)
             return {
                 "valid": True,
                 "serverName": identity.get("friendlyName", ""),
@@ -2192,13 +2875,14 @@ class Plugin:
             logger.error(f"PlexAPI connection validation failed: {e}", exc_info=True)
             return {"valid": False, "error": str(e)}
 
-    def _get_plex_server_url(self) -> str:
+    def _get_plex_server_url(self, settings=None) -> str:
         """Get the Plex server URL from saved settings.
 
         Uses the saved server URL directly instead of calling plex.tv every time.
         """
-        settings = _load_settings()
-        manual_url = settings.get("manual_server_url", "").strip()
+        if settings is None:
+            settings = _load_settings()
+        manual_url = _manual_server_url(settings)
         if manual_url:
             return manual_url
         # Prefer the saved server URL
