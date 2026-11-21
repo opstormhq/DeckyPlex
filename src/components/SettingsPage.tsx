@@ -422,7 +422,7 @@ export function SettingsPage() {
       if (result.error) throw new Error(result.error);
       const nextPlayers = result.players || [];
       setPlayers(nextPlayers);
-      setPlayersStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s), including account-registered devices.` : "No Plex players were found through the server or account device list.");
+      setPlayersStatus(nextPlayers.length ? `Found ${nextPlayers.length} Plex player(s) on your network or Plex account.` : "No Plex players found.");
     } catch (e: any) {
       setPlayersStatus(e?.message || "Could not refresh Plex players.");
     } finally {

@@ -789,6 +789,9 @@ class PlexHTTP:
         if connected_server is None:
             self.session.verify = bool(verify_tls)
         self._remote_client_cache = {}
+        self._lan_players = {}
+        self._lan_player_scan_until = 0.0
+        self._lan_player_scan_lock = threading.Lock()
         self._remote_timeline_track = {}
         self._remote_timeline_track_key = None
         self._remote_metadata_servers = {}
@@ -869,7 +872,76 @@ class PlexHTTP:
             result["gridPoster"] = thumbnail(poster_path, 480)
         return result
 
-    def discover_players(self) -> List[Dict[str, str]]:
+    def _discover_lan_deckyplex(self, refresh: bool = False) -> Dict[str, Dict[str, str]]:
+        from plexapi.gdm import GDM
+
+        with self._lan_player_scan_lock:
+            if not refresh and time.monotonic() < self._lan_player_scan_until:
+                return self._lan_players
+            own_id = _load_settings()["companion_id"]
+            players = {}
+            try:
+                entries = GDM().all(scan_for_clients=True)
+            except (OSError, ValueError) as error:
+                logger.debug("Local Plex player discovery failed (%s)", _plex_error_code(error))
+                return self._lan_players
+            finally:
+                self._lan_player_scan_until = time.monotonic() + 15
+            for entry in entries:
+                data = entry["data"]
+                machine_id = data.get("Resource-Identifier", "")
+                if (not machine_id or machine_id == own_id or data.get("Product") != "DeckyPlex"
+                        or data.get("Content-Type") != "plex/media-player"
+                        or "playback" not in data.get("Protocol-Capabilities", "").split(",")):
+                    continue
+                try:
+                    address = ipaddress.IPv4Address(entry["from"][0])
+                    port = int(data.get("Port", ""))
+                except ValueError:
+                    continue
+                if (not address.is_private or address.is_unspecified or address.is_reserved
+                        or not 1 <= port <= 65535):
+                    continue
+                players[machine_id] = {
+                    "title": data.get("Name") or "DeckyPlex",
+                    "product": "DeckyPlex", "platform": "SteamOS",
+                    "machineIdentifier": machine_id, "key": machine_id,
+                    "url": f"http://{address}:{port}",
+                }
+            self._lan_players = players
+            return players
+
+    def _connect_lan_deckyplex(self, machine_id: str, refused_url: str = ""):
+        import requests
+        from plexapi.client import PlexClient
+
+        player = self._lan_players.get(machine_id)
+        url = player["url"] if player else ""
+        if not url or url == refused_url:
+            return None
+
+        class CompanionSession(requests.Session):
+            def prepare_request(self, request):
+                prepared = super().prepare_request(request)
+                # PlexAPI can reuse a token header from another PlexClient.
+                # LAN Companion requests use only the playMedia delegation token.
+                prepared.headers.pop("X-Plex-Token", None)
+                return prepared
+
+        session = CompanionSession()
+        session.trust_env = False
+        session.max_redirects = 0
+        try:
+            client = PlexClient(baseurl=url, identifier=machine_id, session=session, timeout=2)
+            if client.product == "DeckyPlex" and "playback" in client.protocolCapabilities:
+                return client
+        except Exception as error:
+            logger.debug("Could not reach local DeckyPlex receiver (%s)", _plex_error_code(error))
+        session.close()
+        return None
+
+    def discover_players(self) -> List[Dict[str, Any]]:
+        own_id = _load_settings()["companion_id"]
         sessions = {}
         try:
             for session in self.sdk.sessions():
@@ -879,7 +951,12 @@ class PlexHTTP:
         except Exception as e:
             logger.debug("Unable to include active session state in player list: %s", e)
         players = {}
-        for client in self.sdk.clients():
+        try:
+            clients = self.sdk.clients()
+        except Exception as error:
+            logger.debug("Could not discover players through the Plex server (%s)", _plex_error_code(error))
+            clients = []
+        for client in clients:
             session = sessions.get(client.machineIdentifier)
             players[client.machineIdentifier] = {
                 "title": client.title or "", "product": client.product or "",
@@ -930,6 +1007,11 @@ class PlexHTTP:
                 }
         except Exception as e:
             logger.debug("Could not discover registered Plex devices: %s", e)
+        for machine_id, peer in self._discover_lan_deckyplex(refresh=True).items():
+            session = sessions.get(machine_id)
+            players[machine_id] = {key: value for key, value in peer.items() if key != "url"}
+            players[machine_id].update(state=getattr(session, "state", "idle") or "idle", available=True)
+        players.pop(own_id, None)
         return list(players.values())
 
     def get_track_page(self, section_id: str, offset: int = 0, limit: int = 25,
@@ -958,7 +1040,13 @@ class PlexHTTP:
         client = self._remote_client_cache.get(machine_id)
         if usable(client):
             return client
-        client = next((c for c in self.sdk.clients() if c.machineIdentifier == machine_id and usable(c)), None)
+        lan_url = self._lan_players.get(machine_id, {}).get("url")
+        client = self._connect_lan_deckyplex(machine_id, refused_url)
+        if client is None:
+            try:
+                client = next((c for c in self.sdk.clients() if c.machineIdentifier == machine_id and usable(c)), None)
+            except Exception as error:
+                logger.debug("Could not look up the Plex server's clients (%s)", _plex_error_code(error))
         if client is None:
             try:
                 account = self.account
@@ -974,6 +1062,10 @@ class PlexHTTP:
                         client = device.connect(timeout=5)
             except Exception as e:
                 logger.debug("Could not connect to Plex player resource %s: %s", machine_id, _plex_error_code(e))
+        if not usable(client):
+            players = self._discover_lan_deckyplex(refresh=bool(refused_url))
+            if players.get(machine_id, {}).get("url") != lan_url:
+                client = self._connect_lan_deckyplex(machine_id, refused_url)
         if not usable(client):
             raise RemotePlaybackError("Could not connect to the selected player. Open it and try again.")
         self._remote_client_cache[machine_id] = client
@@ -1011,14 +1103,21 @@ class PlexHTTP:
             raise RemotePlaybackError("The selected queue contains no playable tracks.")
         start_item = next((track for track in tracks if str(track.ratingKey) == str(start_rating_key)), tracks[0])
 
+        def create_queue():
+            return self.sdk.createPlayQueue(tracks, startItem=start_item, shuffle=False, repeat=False,
+                                            includeChapters=False, includeRelated=False)
+
         def send_direct(client):
+            logger.info("Sending queue to %s (%s) via direct Companion connection", client.title, machine_id)
+            client.proxyThroughServer(False)
+            if client.product == "DeckyPlex":
+                client.playMedia(create_queue())
+                return
             host = urllib.parse.urlparse(client._baseurl or "").hostname or ""
             echo = None
             if receiver:
                 receiver.disconnect_controllers(machine_id, host)
                 echo = receiver.expect_outgoing_play(machine_id, host, start_item.ratingKey)
-            logger.info("Sending queue to %s (%s) via direct Companion connection", client.title, machine_id)
-            client.proxyThroughServer(False)
             try:
                 client.createPlayQueue(self.sdk, tracks, startItem=start_item, shuffle=False, repeat=False)
             except (ConnectionError, ReadTimeout):
@@ -1027,8 +1126,7 @@ class PlexHTTP:
             except Exception as error:
                 logger.warning("Direct createPlayQueue failed for %s (%s); trying SDK playMedia",
                                machine_id, _plex_error_code(error))
-                queue = self.sdk.createPlayQueue(tracks, startItem=start_item, shuffle=False, repeat=False,
-                                                 includeChapters=False, includeRelated=False)
+                queue = create_queue()
                 try:
                     client.playMedia(queue)
                 except (ConnectionError, ReadTimeout):
@@ -1270,6 +1368,8 @@ class PlexHTTP:
             send()
         except Exception as direct_error:
             self._remote_client_cache.pop(machine_id, None)
+            if client.product == "DeckyPlex":
+                raise RemotePlaybackError("Could not reach the DeckyPlex receiver. Refresh players and try again.") from direct_error
             logger.warning("Direct playback command failed for %s (%s); retrying via Plex server",
                            machine_id, _plex_error_code(direct_error))
             client.proxyThroughServer(True, server=self.sdk)
