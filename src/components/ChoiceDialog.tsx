@@ -1,6 +1,7 @@
 import type { ReactNode, Ref } from 'react';
 import { DialogBodyText, DialogHeader, Focusable } from '@decky/ui';
 import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
+import { selectWithSound } from './GamepadSounds';
 
 export function ChoiceDialogBody({ title, subtitle, bodyRef, children }: {
   title: string;
@@ -63,7 +64,7 @@ export function ChoiceDialogRow({ title, detail, icon, badge, actionDescription 
   const activate = (event: { preventDefault(): void; stopPropagation(): void }, isRepeat = false) => {
     event.preventDefault();
     event.stopPropagation();
-    if (!disabled && !isRepeat) onChoose();
+    if (!disabled && !isRepeat) selectWithSound(event, onChoose);
   };
   return (
     <Focusable ref={rowRef} role="button" tabIndex={disabled ? -1 : 0} aria-disabled={disabled} aria-pressed={selected}

@@ -41,6 +41,7 @@ interface PlayerState {
 interface PlayerContextType extends PlayerState {
   playbackPending: boolean;
   remoteQueueEditable: boolean;
+  canLoadMoreQueue: boolean;
   loadMusicArtwork: (trackId: string, sourceServerId?: string) => Promise<string>;
   localVolume: number;
   volumeSliderRevision: number;
@@ -1481,6 +1482,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         volumeSliderRevision,
         playbackPending,
         remoteQueueEditable: state.remoteMode && !!engine.remoteQueueEditable,
+        canLoadMoreQueue: !!engine.queueLoader,
         loadMusicArtwork,
         beginPlaybackRequest,
         readMusicPlaybackTarget,

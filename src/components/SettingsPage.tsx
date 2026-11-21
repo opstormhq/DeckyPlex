@@ -8,7 +8,7 @@ import {
   Button,
   TextField,
   SliderField,
-  DialogCheckbox,
+  ToggleField,
   SidebarNavigation,
   showModal,
 } from '@decky/ui';
@@ -17,6 +17,10 @@ import { FaUser, FaServer, FaMusic, FaCog, FaSlidersH } from 'react-icons/fa';
 import { InlineSpinner } from './InlineSpinner';
 import { stopGamePip } from './GamePip';
 import { LibraryRow, PlexSetupDialog, type LibraryCatalog, type PlexServerOption } from './PlexSetupDialog';
+import { musicCategories, videoCategories, type BrowserLayouts, type CategoryLayout } from './BrowserCategories';
+import { BrowserCategoriesDialog } from './BrowserCategoriesDialog';
+import { defaultPipPosition, pipPositions, type PipPosition } from './PipPosition';
+import { PipPositionDialog } from './PipPositionDialog';
 
 interface Settings {
   plexamp_url: string;
@@ -35,13 +39,16 @@ interface Settings {
   connection_timeout: number;
   verify_tls: boolean;
   grid_columns: number;
+  browser_layouts: BrowserLayouts;
   companion_receiver_enabled: boolean;
   companion_device_name: string;
   allow_signed_out_companion: boolean;
   hide_quick_login: boolean;
   quick_player_maintain_x: boolean;
+  quick_player_show_idle: boolean;
   over_game_pip: boolean;
-  pip_position: string;
+  video_autoplay: boolean;
+  pip_position: PipPosition;
   pip_size: number;
 }
 
@@ -70,22 +77,18 @@ const DEFAULT_SETTINGS: Settings = {
   connection_timeout: 8,
   verify_tls: false,
   grid_columns: 0,
+  browser_layouts: {},
   companion_receiver_enabled: false,
   companion_device_name: 'DeckyPlex',
   allow_signed_out_companion: false,
   hide_quick_login: false,
   quick_player_maintain_x: false,
+  quick_player_show_idle: true,
   over_game_pip: false,
-  pip_position: 'bottom-left',
+  video_autoplay: true,
+  pip_position: defaultPipPosition,
   pip_size: 29,
 };
-
-const pipPositions = [
-  { label: 'Bottom left', data: 'bottom-left' },
-  { label: 'Bottom right', data: 'bottom-right' },
-  { label: 'Top left', data: 'top-left' },
-  { label: 'Top right', data: 'top-right' },
-];
 
 function StatusLine({ text, busy, light }: { text: string; busy?: boolean; light?: string }) {
   return (
@@ -100,7 +103,7 @@ function StatusLine({ text, busy, light }: { text: string; busy?: boolean; light
   );
 }
 
-export function SettingsPage() {
+export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
   const [players, setPlayers] = useState<Player[]>([]);
   const [servers, setServers] = useState<PlexServerOption[]>([]);
@@ -133,6 +136,8 @@ export function SettingsPage() {
 
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const pendingQuickLogin = useRef(startLogin);
+  const requestingLoginCode = useRef(false);
   const autoSaveTimer = useRef<number | null>(null);
   const autoSaveRevision = useRef(0);
   const pendingPreferences = useRef<Partial<Settings>>({});
@@ -141,6 +146,8 @@ export function SettingsPage() {
   const librarySaveQueue = useRef(Promise.resolve());
   const libraryRevision = useRef(0);
   const setupDialog = useRef<ReturnType<typeof showModal> | null>(null);
+  const categoriesDialog = useRef<ReturnType<typeof showModal> | null>(null);
+  const pipPositionDialog = useRef<ReturnType<typeof showModal> | null>(null);
   const settingsMounted = useRef(false);
 
   const saveSettings = useCallback((s: Partial<Settings>) => {
@@ -170,10 +177,11 @@ export function SettingsPage() {
     settingsMounted.current = true;
     callWithTimeout("get_settings", 10000)
       .then(async (result: any) => {
+        if (!result || result.error) throw new Error(result?.error ?? 'Could not load settings.');
         settingsRef.current = result;
         setSettings(result);
-        setLoadingSettings(false);
         setSettingsAvailable(true);
+        setLoadingSettings(false);
         try {
           // Read this local status before starting Plex discovery below. Discovery
           // uses synchronous PlexAPI requests and can block Decky's Python event
@@ -216,6 +224,7 @@ export function SettingsPage() {
     return () => {
       settingsMounted.current = false;
       setupDialog.current?.Close();
+      categoriesDialog.current?.Close();
     };
   }, []);
 
@@ -249,6 +258,8 @@ export function SettingsPage() {
   }, [settingUpPlex, settings.has_plex_token, settings.selected_server_id]);
 
   const handlePlexLogin = useCallback(async () => {
+    if (requestingLoginCode.current || settingsRef.current.has_plex_token) return;
+    requestingLoginCode.current = true;
     setLoggingIn(true);
     setLoginAttempt(null);
     setStatus('Requesting a login code…');
@@ -261,9 +272,16 @@ export function SettingsPage() {
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not start Plex sign-in.');
     } finally {
+      requestingLoginCode.current = false;
       setLoggingIn(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (!pendingQuickLogin.current || loadingSettings) return;
+    pendingQuickLogin.current = false;
+    if (settingsAvailable && !settings.has_plex_token) void handlePlexLogin();
+  }, [loadingSettings, settingsAvailable, settings.has_plex_token, handlePlexLogin]);
 
   // The backend completes sign-in even if Steam closes the Settings route.
   useEffect(() => {
@@ -436,7 +454,7 @@ export function SettingsPage() {
     setSettings(updated);
     if (key === 'grid_columns') setBrowserStatus('Saving…');
     else if (key === 'companion_device_name') setReceiverNameStatus('Saving…');
-    else if (key === 'pip_size') setInterfaceStatus('Saving…');
+    else if (key === 'pip_size' || key === 'pip_position') setInterfaceStatus('Saving…');
     else setAdvancedStatus('Saving…');
     pendingPreferences.current = { ...pendingPreferences.current, [key]: value };
     if (autoSaveTimer.current !== null) window.clearTimeout(autoSaveTimer.current);
@@ -450,8 +468,8 @@ export function SettingsPage() {
         const message = result?.error || 'Saved automatically.';
         if ('grid_columns' in changes) setBrowserStatus(message);
         if ('companion_device_name' in changes) setReceiverNameStatus(message);
-        if ('pip_size' in changes) setInterfaceStatus(result?.error || '');
-        if (Object.keys(changes).some(key => !['grid_columns', 'companion_device_name', 'pip_size'].includes(key))) setAdvancedStatus(message);
+        if ('pip_size' in changes || 'pip_position' in changes) setInterfaceStatus(result?.error || '');
+        if (Object.keys(changes).some(key => !['grid_columns', 'companion_device_name', 'pip_size', 'pip_position'].includes(key))) setAdvancedStatus(message);
       }
     }, 350);
     return updated;
@@ -464,7 +482,8 @@ export function SettingsPage() {
     }
   }, [saveSettings]);
 
-  const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'over_game_pip' | 'pip_position'>(key: K, value: Settings[K]) => {
+  const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
+    | 'over_game_pip' | 'video_autoplay'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
     try {
@@ -479,6 +498,43 @@ export function SettingsPage() {
     } finally {
       setSavingInterface(false);
     }
+  };
+
+  const openPipPosition = () => {
+    if (pipPositionDialog.current) return;
+    const clear = () => { if (pipPositionDialog.current === dialog) pipPositionDialog.current = null; };
+    const close = () => { clear(); dialog.Close(); };
+    const position = settingsRef.current.pip_position;
+    const dialog = showModal(
+      <PipPositionDialog selected={position} close={close} choose={next => {
+        if (pipPositionDialog.current !== dialog) return;
+        if (next !== position) updateSetting('pip_position', next);
+        close();
+      }} />, window, { strTitle: 'Picture-in-picture position', bNeverPopOut: true, fnOnClose: clear },
+    );
+    pipPositionDialog.current = dialog;
+    void dialog.ClosedPromise?.then(clear, clear);
+  };
+
+  const editBrowserCategories = (title: string, scope: string, categories: readonly { key: string; title: string }[]) => {
+    if (categoriesDialog.current) return;
+    const close = () => {
+      categoriesDialog.current = null;
+    };
+    const dialog = showModal(
+      <BrowserCategoriesDialog title={title} categories={categories} initialLayout={settingsRef.current.browser_layouts?.[scope]}
+        close={() => dialog.Close()} save={async (layout: CategoryLayout) => {
+          const result = await saveSettings({ browser_layouts: { [scope]: layout } });
+          if (result?.error) throw new Error(result.error);
+          if (!settingsMounted.current) return;
+          const updated = { ...settingsRef.current, browser_layouts: result.browser_layouts };
+          settingsRef.current = updated;
+          setSettings(updated);
+        }} />,
+      window, { strTitle: title, bNeverPopOut: true, fnOnClose: close },
+    );
+    categoriesDialog.current = dialog;
+    void dialog.ClosedPromise?.then(close, close);
   };
 
   const testServerConnection = useCallback(async () => {
@@ -535,7 +591,7 @@ export function SettingsPage() {
   const renderLibraryPicker = () => (
     <PanelSection title="Libraries">
       {loadingLibraries && <StatusLine busy text="Loading Plex libraries…" />}
-      {libraryCatalog?.server_id === settings.selected_server_id && libraryCatalog.libraries?.map(library => (
+      {!loadingLibraries && libraryCatalog?.server_id === settings.selected_server_id && libraryCatalog.libraries?.map(library => (
         <LibraryRow key={library.id} library={library}
           checked={librarySelection.includes(library.id)}
           disabled={selectingServer || (librarySelection.length === 1 && librarySelection[0] === library.id)}
@@ -563,7 +619,6 @@ export function SettingsPage() {
           </ButtonItem>
         </PanelSectionRow>
       )}
-      {loadingSettings && <StatusLine busy text="Loading settings…" />}
       {status && <StatusLine busy={loggingIn || loggingOut || connectingToPlex} text={status} />}
       {loginAttempt?.pin && !connectingToPlex && (
         <PanelSectionRow>
@@ -586,16 +641,21 @@ export function SettingsPage() {
     <>
     <PanelSection title="Quick Player">
       <PanelSectionRow>
-        <DialogCheckbox
-          label="Preserve horizontal focus on media controls"
-          description="Enter the transport row near the previous control’s horizontal position. Turn this off to prefer Play/Pause."
+        <ToggleField label="Show idle player" description="Keep the playback controls visible when nothing is playing."
+          checked={settings.quick_player_show_idle !== false} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('quick_player_show_idle', enabled)} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
+          label="Remember media control position"
+          description="Return to the previous control when entering the row. When off, focus starts on Play/Pause."
           checked={settings.quick_player_maintain_x}
           disabled={!settingsAvailable || savingInterface}
           onChange={(enabled: boolean) => saveInterfaceSetting('quick_player_maintain_x', enabled)}
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <DialogCheckbox
+        <ToggleField
           label="Hide Quick Player login button"
           checked={settings.hide_quick_login}
           disabled={!settingsAvailable || savingInterface}
@@ -605,7 +665,12 @@ export function SettingsPage() {
     </PanelSection>
     <PanelSection title="Video">
       <PanelSectionRow>
-        <DialogCheckbox
+        <ToggleField label="Autoplay next episode" checked={settings.video_autoplay !== false}
+          disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('video_autoplay', enabled)} />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ToggleField
           label="Allow picture-in-picture over games"
           description="Keep video visible while playing a game in Steam Gaming Mode."
           checked={settings.over_game_pip}
@@ -615,12 +680,10 @@ export function SettingsPage() {
       </PanelSectionRow>
       {settings.over_game_pip && <>
         <PanelSectionRow>
-          <div style={{ width: '100%' }}>
-            <DialogBodyText style={{ marginBottom: '0.25rem' }}>Picture-in-picture position</DialogBodyText>
-            <Dropdown rgOptions={pipPositions} selectedOption={settings.pip_position}
-              disabled={!settingsAvailable || savingInterface}
-              onChange={(option: { data: string }) => saveInterfaceSetting('pip_position', option.data)} />
-          </div>
+          <ButtonItem label="Picture-in-picture position" layout="below" bottomSeparator="none"
+            disabled={!settingsAvailable || savingInterface} onClick={openPipPosition}>
+            {pipPositions.find(({ id }) => id === settings.pip_position)?.label ?? 'Bottom left'}
+          </ButtonItem>
         </PanelSectionRow>
         <PanelSectionRow>
           <SliderField label="Picture-in-picture width" value={settings.pip_size} min={20} max={50}
@@ -671,10 +734,10 @@ export function SettingsPage() {
 
   // Players page content
   const renderPlayersPage = () => (
-    <PanelSection>
-      <PanelSectionRow><div style={{ fontWeight: 600, marginBlock: '0.3rem' }}>Receive playback</div></PanelSectionRow>
+    <>
+    <PanelSection title="Receive playback">
       <PanelSectionRow>
-        <DialogCheckbox
+        <ToggleField
           label="Plexamp receiver"
           description="Let Plexamp and other Plex apps send music to this device over your local network."
           checked={settings.companion_receiver_enabled}
@@ -683,7 +746,7 @@ export function SettingsPage() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <DialogCheckbox
+        <ToggleField
           label="Accept playback from any Plex account"
           description="Receive music over your local network using Plexamp’s access token. Works while signed out of DeckyPlex."
           checked={settings.allow_signed_out_companion}
@@ -704,9 +767,8 @@ export function SettingsPage() {
       <StatusLine busy={checkingCompanionStatus}
         light={!settings.companion_receiver_enabled ? '#8b8b8b' : companionStatus.active ? '#77d98b' : '#e7a64a'}
         text={checkingCompanionStatus ? 'Updating receiver status…' : !settings.companion_receiver_enabled ? 'Receiver is off.' : companionStatus.active ? `Receiver ready on port ${companionStatus.port}.` : companionStatus.error || 'Receiver is unavailable.'} />
-      <PanelSectionRow>
-        <div style={{ width: '100%', marginBlock: '0.9rem 0.4rem', paddingTop: '0.9rem', borderTop: '1px solid rgba(255,255,255,0.16)', fontWeight: 600 }}>Send playback</div>
-      </PanelSectionRow>
+    </PanelSection>
+    <PanelSection title="Send playback">
       <PanelSectionRow>
         <div style={{ width: '100%' }}>
           <DialogBodyText style={{ marginBottom: '0.25rem' }}>Playback target</DialogBodyText>
@@ -746,24 +808,46 @@ export function SettingsPage() {
       {(refreshingPlayers || savingPlayerSettings || playersStatus) && <StatusLine busy={refreshingPlayers || savingPlayerSettings}
         text={savingPlayerSettings ? 'Saving player settings…' : refreshingPlayers ? 'Finding Plex players…' : playersStatus} />}
     </PanelSection>
+    </>
   );
 
-  const renderBrowserSettings = () => (
+  const renderBrowserSettings = () => {
+    const selectedVideoCategories = videoCategories(
+      libraryCatalog?.server_id === settings.selected_server_id
+        ? (libraryCatalog.libraries || []).filter(library => librarySelection.includes(library.id))
+        : [],
+    );
+    return (
     <PanelSection title="Library browser">
       <PanelSectionRow>
         <SliderField
-          label={`Grid columns: ${settings.grid_columns || 6}`}
+          label="Grid columns"
           min={3}
           max={9}
           step={1}
           value={settings.grid_columns || 6}
+          showValue
           disabled={!settingsAvailable}
           onChange={(value: number) => updateSetting('grid_columns', Math.round(value))}
         />
       </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem label="Music categories" description="Choose what to show and in which order."
+          disabled={!settingsAvailable}
+          onClick={() => editBrowserCategories('Music categories', 'music', musicCategories)}>Customize</ButtonItem>
+      </PanelSectionRow>
+      {loadingLibraries && <StatusLine busy text="Loading video categories…" />}
+      {selectedVideoCategories.length > 0 && <PanelSectionRow>
+        <ButtonItem label="Video categories" description={settings.selected_server_name}
+          disabled={!settingsAvailable || savingLibraries}
+          onClick={() => editBrowserCategories(
+            'Video categories', `video:${settings.selected_server_id}`, selectedVideoCategories,
+          )}>Customize</ButtonItem>
+      </PanelSectionRow>}
       {browserStatus && <StatusLine busy={browserStatus === 'Saving…'} text={browserStatus} />}
     </PanelSection>
-  );
+    );
+  };
 
   const renderAdvancedPage = () => (
     <PanelSection>
@@ -791,7 +875,7 @@ export function SettingsPage() {
         />
       </PanelSectionRow>
       <PanelSectionRow>
-        <DialogCheckbox
+        <ToggleField
           label="Verify HTTPS certificates"
           description="Turn off only for a server with an invalid or self-signed certificate."
           checked={settings.verify_tls}
@@ -843,7 +927,9 @@ export function SettingsPage() {
 
   return (
     <div style={{ marginTop: '40px', height: 'calc(100% - 40px)' }}>
-      <SidebarNavigation title="DeckyPlex Settings" showTitle pages={pages} />
+      {loadingSettings
+        ? <PanelSection title="DeckyPlex Settings"><StatusLine busy text="Loading settings…" /></PanelSection>
+        : <SidebarNavigation title="DeckyPlex Settings" showTitle pages={pages} />}
     </div>
   );
 }

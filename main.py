@@ -55,8 +55,10 @@ DEFAULT_SETTINGS = {
     "selected_player_id": "",
     "selected_player_name": "",
     "grid_columns": 0,
+    "browser_layouts": {},
     "library_selections": {},
     "video_quality": "auto",
+    "video_autoplay": True,
     "over_game_pip": False,
     "pip_position": "bottom-left",
     "pip_size": 29,
@@ -74,11 +76,13 @@ DEFAULT_SETTINGS = {
     "allow_signed_out_companion": False,
     "hide_quick_login": False,
     "quick_player_maintain_x": False,
+    "quick_player_show_idle": True,
 }
 
 LIBRARY_TYPES = ("artist", "movie", "show", "photo")
 VIDEO_TYPES = ("movie", "episode", "clip")
-PIP_POSITIONS = ("bottom-left", "bottom-right", "top-left", "top-right")
+PIP_POSITIONS = ("top-left", "top-center", "top-right", "center-left", "center",
+                 "center-right", "bottom-left", "bottom-center", "bottom-right")
 VIDEO_SORTS = {
     "titleSort:asc", "titleSort:desc", "addedAt:desc", "originallyAvailableAt:desc",
 }
@@ -89,6 +93,31 @@ VIDEO_QUALITY = {
     "480p": ("854x480", 1500),
 }
 VIDEO_DIRECT_AUDIO = {"mp4": {"aac", "mp3"}, "m4v": {"aac", "mp3"}, "webm": {"opus", "vorbis"}}
+MUSIC_BROWSER_TABS = {"artists", "albums", "tracks", "recent", "recentlyAdded", "playlists"}
+
+
+def _browser_layouts(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    layouts = {}
+    for scope, layout in value.items():
+        if not isinstance(scope, str) or not isinstance(layout, dict):
+            continue
+        music = scope == "music"
+        if not music and not (scope.startswith("video:") and 6 < len(scope) <= 134):
+            continue
+        cleaned = {}
+        for field in ("order", "hidden"):
+            keys = layout.get(field)
+            if not isinstance(keys, list):
+                keys = []
+            cleaned[field] = list(dict.fromkeys(
+                key for key in keys if isinstance(key, str) and
+                (key in MUSIC_BROWSER_TABS if music else
+                 key in ("videoHome", "videoWatchlist") or (key.startswith("library:") and 8 < len(key) <= 136))
+            ))
+        layouts[scope] = cleaned
+    return layouts
 
 
 # Settings file path — Decky provides this directory
@@ -858,6 +887,14 @@ class PlexHTTP:
             "viewOffset": attr("viewOffset", 0),
             "duration": attr("duration", 0), "sectionId": str(attr("librarySectionID", "") or ""),
         }
+        if item_type in ("show", "season"):
+            result["viewedLeafCount"] = attr("viewedLeafCount", None)
+        if item_type in ("movie", "show", "season", "episode"):
+            result["userRating"] = attr("userRating", None)
+        if item_type == "episode":
+            # The SDK can fetch the season if its ID is absent. Use IDs already in the listing.
+            result["parentId"] = str(vars(item).get("_parentRatingKey") or "")
+            result["grandparentId"] = str(attr("grandparentRatingKey") or "")
         if from_listing and hasattr(item, "_server") and hasattr(item._server, "transcodeImage"):
             # Request appropriately sized artwork using Plex's cacheable image endpoint.
             def thumbnail(path, height):
@@ -1399,7 +1436,7 @@ class PlexHTTP:
         items = [self._item_dict(item, from_listing=True) for item in results[:limit]]
         return {"items": items, "has_more": len(results) > limit, "next_offset": offset + len(items)}
 
-    def get_video_home(self, row: str, libraries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def get_video_home(self, row: str, libraries: List[Dict[str, Any]], full_watchlist: bool = False) -> List[Dict[str, Any]]:
         limit = 8
         if not libraries:
             return []
@@ -1409,8 +1446,8 @@ class PlexHTTP:
                      if item.type in ("movie", "episode") and str(vars(item).get("librarySectionID")) in library_ids]
             # Plex's hub contains resumed titles as well as the next available episodes.
             watch_next = [item for item in items if item.type == "episode" and not vars(item).get("viewOffset")]
-            resumes = [item for item in items if item.type != "episode" or vars(item).get("viewOffset")]
-            items = [*resumes[:limit], *watch_next[:limit]]
+            resumes = [item for item in items if vars(item).get("viewOffset")]
+            items = [*resumes, *watch_next]
         elif row in ("movies", "shows"):
             kind = "movie" if row == "movies" else "show"
             items = [item for library in libraries if library["type"] == kind
@@ -1418,7 +1455,7 @@ class PlexHTTP:
                          maxresults=limit, libtype=kind)]
             items.sort(key=lambda item: item.addedAt.timestamp() if item.addedAt else 0, reverse=True)
         else:
-            watchlist = self.account.watchlist(maxresults=limit)
+            watchlist = self.account.watchlist(sort="watchlistedAt:desc", maxresults=None if full_watchlist else limit)
             matches = {}
             guids_by_type = {kind: [item.guid for item in watchlist if item.type == kind and item.guid]
                              for kind in ("movie", "show")}
@@ -1426,12 +1463,14 @@ class PlexHTTP:
                 guids = guids_by_type[library["type"]]
                 if guids:
                     section = self.sdk.library.sectionByID(int(library["id"]))
-                    for item in section.search(guid=guids, maxresults=limit):
-                        matches.setdefault(item.guid, item)
+                    for start in range(0, len(guids), 50):
+                        batch = guids[start:start + 50]
+                        for item in section.search(guid=batch):
+                            matches.setdefault(item.guid, item)
             items = [matches[item.guid] for item in watchlist if item.guid in matches]
         cards = []
         show_art = {}
-        for item in (items if row == "continue" else items[:limit]):
+        for item in (items if row == "continue" or full_watchlist else items[:limit]):
             card = self._item_dict(item, from_listing=True)
             show_key = vars(item).get("grandparentKey")
             if item.type == "episode" and not card["poster"] and show_key:
@@ -1445,6 +1484,40 @@ class PlexHTTP:
                 card["gridPoster"] = show.get("gridThumb", "")
             cards.append(card)
         return cards
+
+    def get_recent_video_page(self, row: str, libraries: List[Dict[str, Any]], offsets: Dict[str, Any]) -> Dict[str, Any]:
+        limit = 18
+        kind = "movie" if row == "movies" else "show"
+        candidates = []
+        next_offsets = {}
+        remaining = {}
+        for library in libraries:
+            if library["type"] != kind:
+                continue
+            section_id = library["id"]
+            offset = offsets.get(section_id, 0)
+            if offset is None:
+                next_offsets[section_id] = None
+                continue
+            if type(offset) is not int or offset < 0:
+                raise ValueError("Invalid video shelf offset.")
+            section = self.sdk.library.sectionByID(int(section_id))
+            entries = section.search(sort="addedAt:desc", libtype=kind, container_start=offset,
+                                     container_size=limit + 1, maxresults=limit + 1)
+            next_offsets[section_id] = offset
+            remaining[section_id] = len(entries)
+            candidates.extend((entry, section_id) for entry in entries)
+
+        candidates.sort(key=lambda pair: pair[0].addedAt.timestamp() if pair[0].addedAt else 0, reverse=True)
+        cards = []
+        for item, section_id in candidates[:limit]:
+            cards.append(self._item_dict(item, from_listing=True))
+            next_offsets[section_id] += 1
+            remaining[section_id] -= 1
+        for section_id, count in remaining.items():
+            if not count:
+                next_offsets[section_id] = None
+        return {"items": cards, "recent_offsets": next_offsets}
 
     def get_music_artists(self, sections: List[Dict[str, Any]], limit: int, offset: int) -> Dict[str, Any]:
         """Page through the selected music sections in Plex library order."""
@@ -1607,11 +1680,27 @@ class PlexHTTP:
                     and str(getattr(item, "librarySectionID", "")) in library_ids]
         return [self._item_dict(item, from_listing=True) for item in results if getattr(item, "type", "") in supported]
 
-    def get_media_source(self, rating_key: str, quality: str = "auto") -> Dict[str, Any]:
-        item = self.sdk.fetchItem(int(rating_key))
+    @staticmethod
+    def _video_track_options(tracks, label: str):
+        options = []
+        for track in tracks:
+            if not track.id:
+                continue
+            title = track.extendedDisplayTitle or track.displayTitle or track.language or label
+            for attribute, badge in (("forced", "Forced"), ("hearingImpaired", "SDH")):
+                if getattr(track, attribute, False) and badge.lower() not in title.lower():
+                    title += f" · {badge}"
+            options.append({"data": track.id, "label": title})
+        return options
+
+    def get_media_source(self, rating_key: str, quality: str = "auto", media_index: int = 0) -> Dict[str, Any]:
+        item = self.sdk.fetchItem(int(rating_key), params={"includeChapters": 1})
         if item.type not in (*VIDEO_TYPES, "photo"):
             raise ValueError("This Plex item cannot be played directly")
-        primary_media = next(iter(item.media or []), None)
+        versions = item.media or []
+        if versions and not 0 <= media_index < len(versions):
+            raise ValueError("That video version is unavailable.")
+        primary_media = versions[media_index] if versions else None
         parts = [part for part in getattr(primary_media, "parts", []) if part.key]
         part = parts[0] if parts else None
         direct_url = self.sdk.url(part.key, includeToken=True) if part else ""
@@ -1627,7 +1716,11 @@ class PlexHTTP:
                 resolution = f"{width}x{height}"
             bitrate = getattr(primary_media, "bitrate", None) or None
         audio_tracks = part.audioStreams() if part else []
-        audio = next((track for track in audio_tracks if track.selected), audio_tracks[0] if audio_tracks else None)
+        default_audio = next((track for track in audio_tracks if getattr(track, "default", False)),
+                             audio_tracks[0] if audio_tracks else None)
+        audio = next((track for track in audio_tracks if track.selected), default_audio)
+        subtitle_tracks = part.subtitleStreams() if part else []
+        subtitle = next((track for track in subtitle_tracks if track.selected), None)
         codec = str(getattr(audio, "codec", None) or getattr(primary_media, "audioCodec", "") or "").lower()
         video_codec = str(getattr(primary_media, "videoCodec", "") or "").lower()
         channels = getattr(audio, "channels", None) or getattr(primary_media, "audioChannels", None)
@@ -1635,7 +1728,9 @@ class PlexHTTP:
         compatible_audio = not codec or (codec in VIDEO_DIRECT_AUDIO.get(container, ()) and (channels or 2) <= 2)
 
         def transcode(protocol, container, session_id, copy_video=False, copy_audio=False):
-            return item.getStreamURL(protocol=protocol, directPlay=0, directStream=int(copy_video), directStreamAudio=int(copy_audio),
+            return item.getStreamURL(protocol=protocol, mediaIndex=media_index, directPlay=0,
+                                     directStream=int(copy_video), directStreamAudio=int(copy_audio),
+                                     subtitles="burn" if subtitle else "none",
                                      audioChannelCount=2, partIndex=0 if len(parts) == 1 else -1,
                                      videoResolution=(resolution or "") if not copy_video else "",
                                      maxVideoBitrate=bitrate if not copy_video else None,
@@ -1655,8 +1750,8 @@ class PlexHTTP:
         mp4_url = urllib.parse.urlunsplit(url._replace(path=url.path.removesuffix(".m3u8") + ".mp4"))
         streams = [{"kind": "hls", "url": hls_url, "fallback_url": transcode("hls", "mpegts", str(uuid.uuid4()))},
                    {"kind": "http", "url": mp4_url}]
-        if quality == "auto" and len(parts) == 1:
-            if container in VIDEO_DIRECT_AUDIO and compatible_audio:
+        if quality == "auto" and len(parts) == 1 and not subtitle:
+            if container in VIDEO_DIRECT_AUDIO and compatible_audio and audio is default_audio:
                 streams.insert(0, {"kind": "direct", "url": direct_url})
             elif video_codec == "h264":
                 # Preserve H.264 in the compatibility stream where Plex can copy it. Convert incompatible audio to AAC.
@@ -1668,13 +1763,111 @@ class PlexHTTP:
                     re.sub(r"[^a-z0-9_-]", "", video_codec)[:32] or "unknown",
                     re.sub(r"[^a-z0-9_-]", "", codec)[:32] or "unknown", channels,
                     ",".join(stream.get("mode", stream["kind"]) for stream in streams))
+        chapters = [{"title": chapter.title or "", "start": chapter.start / 1000}
+                    for chapter in getattr(item, "chapters", []) if chapter.start is not None and chapter.start >= 0]
+        version_options = []
+        for index, version in enumerate(versions):
+            label = " · ".join(str(value).upper() for value in
+                               (getattr(version, "videoResolution", None), getattr(version, "videoCodec", None),
+                                getattr(version, "container", None)) if value)
+            version_options.append({"data": index, "label": f"{index + 1}. {label}" if label else f"Version {index + 1}"})
+        preview_path = f"/library/parts/{part.id}/indexes/sd" if part and getattr(part, "hasPreviewThumbnails", False) else ""
         return {"streams": streams, "resume_ms": getattr(item, "viewOffset", 0) or 0,
-                "duration_ms": getattr(item, "duration", 0) or 0, "has_audio": bool(codec)}
+                "duration_ms": getattr(primary_media, "duration", None) or getattr(item, "duration", 0) or 0,
+                "has_audio": bool(codec), "media_index": media_index, "versions": version_options,
+                "audio_tracks": self._video_track_options(audio_tracks, "Audio"),
+                "subtitle_tracks": self._video_track_options(subtitle_tracks, "Subtitles"),
+                "audio_track": getattr(audio, "id", None), "subtitle_track": getattr(subtitle, "id", 0),
+                "video_codec": video_codec, "audio_codec": codec, "channels": channels, "container": container,
+                "bitrate": getattr(primary_media, "bitrate", None), "chapters": chapters,
+                "preview_url": self.sdk.url(preview_path, includeToken=True) if preview_path else ""}
 
-    def report_video_progress(self, rating_key: str, time_ms: int, duration_ms: int, state: str) -> None:
+    def set_video_stream(self, rating_key: str, media_index: int, kind: str, stream_id: int):
+        item = self.sdk.fetchItem(int(rating_key))
+        if item.type not in VIDEO_TYPES or not 0 <= media_index < len(item.media or []):
+            raise ValueError("Video version unavailable.")
+        part = next((part for part in item.media[media_index].parts if part.key), None)
+        if not part:
+            raise ValueError("Video part unavailable.")
+        if kind == "subtitle" and stream_id == 0:
+            part.resetSelectedSubtitleStream()
+            return
+        tracks = part.audioStreams() if kind == "audio" else part.subtitleStreams()
+        track = next((track for track in tracks if track.id == stream_id), None)
+        if not track:
+            raise ValueError("Track unavailable for this video version.")
+        if kind == "audio":
+            part.setSelectedAudioStream(track)
+        else:
+            part.setSelectedSubtitleStream(track)
+
+    def video_skip_markers(self, rating_key: str):
+        item = self.sdk.fetchItem(int(rating_key), params={"includeMarkers": 1})
+        if item.type not in ("movie", "episode"):
+            return []
+        markers = [{"type": marker.type, "start": marker.start / 1000, "end": marker.end / 1000}
+                   for marker in item.markers if marker.type in ("intro", "credits")
+                   and marker.start is not None and marker.end is not None and marker.end > marker.start >= 0]
+        return markers if markers and self.account.subscriptionActive else []
+
+    def video_library_action(self, rating_key: str, action: str, rating: Optional[int] = None) -> Dict[str, Any]:
+        item = self.sdk.fetchItem(int(rating_key))
+        if action == "rate" and item.type in ("movie", "show", "season", "episode"):
+            from plexapi.mixins import RatingMixin
+            RatingMixin.rate(item, rating)
+            return {"user_rating": rating}
+        watchlist = action in ("add_watchlist", "remove_watchlist")
+        supported = ("movie", "show") if watchlist else ("movie", "episode")
+        if item.type not in supported:
+            raise ValueError("This Plex title does not support the requested action.")
+        if watchlist:
+            from plexapi.exceptions import BadRequest
+            added = action == "add_watchlist"
+            try:
+                change = item.addToWatchlist if added else item.removeFromWatchlist
+                change(account=self.account)
+            except BadRequest:
+                if item.onWatchlist(account=self.account) != added:
+                    raise
+            return {"on_watchlist": added}
+        if action == "remove_continue":
+            item.removeFromContinueWatching()
+            return {}
+        if action == "mark_watched":
+            item.markWatched()
+        elif action == "mark_unwatched":
+            item.markUnwatched()
+        else:
+            raise ValueError("Unknown video action.")
+        return self._video_watch_state(item)
+
+    def _video_watch_state(self, item) -> Dict[str, Any]:
+        item.reload()
+        state = {"view_count": int(getattr(item, "viewCount", None) or 0),
+                 "view_offset": int(getattr(item, "viewOffset", None) or 0)}
+        if item.type == "episode":
+            metadata = vars(item)
+            ids = list(dict.fromkeys(key for key in
+                       (metadata.get("_parentRatingKey"), metadata.get("grandparentRatingKey")) if key))
+            if ids:
+                try:
+                    state["collections"] = {
+                        str(collection.ratingKey): viewed
+                        for collection in self.sdk.fetchItems(ids)
+                        if collection.type in ("show", "season")
+                        and (viewed := vars(collection).get("viewedLeafCount")) is not None
+                    }
+                except Exception:
+                    logger.debug("Could not refresh Plex collection watch counts", exc_info=True)
+        return state
+
+    def report_video_progress(self, rating_key: str, time_ms: int, duration_ms: int, state: str) -> Optional[Dict[str, Any]]:
         item = self.sdk.fetchItem(int(rating_key))
         if item.type in VIDEO_TYPES and state in ("playing", "paused", "stopped"):
             item.updateTimeline(max(0, int(time_ms)), state=state, duration=max(0, int(duration_ms)))
+            if state == "stopped" and item.type in ("movie", "episode"):
+                return self._video_watch_state(item)
+        return None
 
     def get_episode_queue(self, rating_key: str) -> List[Dict[str, Any]]:
         item = self.sdk.fetchItem(int(rating_key))
@@ -2230,6 +2423,7 @@ class Plugin:
         result.pop("companion_id", None)
         result.pop("library_selections", None)
         result.pop("manual_server_id", None)
+        result["browser_layouts"] = _browser_layouts(settings.get("browser_layouts"))
         result["manual_server_url"] = _manual_server_url(settings)
         choice = _library_choice(settings)
         result["library_selection_configured"] = isinstance(choice, list)
@@ -2248,13 +2442,21 @@ class Plugin:
             for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns", "volume",
                         "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
-                        "quick_player_maintain_x", "video_quality", "over_game_pip", "pip_position", "pip_size"):
+                        "quick_player_maintain_x", "quick_player_show_idle", "video_quality", "video_autoplay",
+                        "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
                     merged[key] = settings[key]
+            if "browser_layouts" in settings:
+                merged["browser_layouts"] = {
+                    **_browser_layouts(merged.get("browser_layouts")),
+                    **_browser_layouts(settings["browser_layouts"]),
+                }
             merged["companion_receiver_enabled"] = bool(merged["companion_receiver_enabled"])
             merged["hide_quick_login"] = bool(merged["hide_quick_login"])
             merged["quick_player_maintain_x"] = bool(merged["quick_player_maintain_x"])
+            merged["quick_player_show_idle"] = merged["quick_player_show_idle"] is not False
             merged["over_game_pip"] = merged["over_game_pip"] is True
+            merged["video_autoplay"] = merged["video_autoplay"] is not False
             if merged["pip_position"] not in PIP_POSITIONS:
                 merged["pip_position"] = DEFAULT_SETTINGS["pip_position"]
             try:
@@ -3055,7 +3257,8 @@ class Plugin:
             logger.error(f"Failed to get section contents: {e}")
             return {"items": [], "error": str(e)}
 
-    async def get_video_home(self, row: str) -> Dict[str, Any]:
+    async def get_video_home(self, row: str, full_watchlist: bool = False,
+                             recent_offsets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if row not in ("continue", "movies", "shows", "watchlist"):
             return {"items": [], "error": "Unknown video home section."}
         settings = _load_settings()
@@ -3066,13 +3269,36 @@ class Plugin:
                 raise ValueError("Not connected to Plex server")
             visible = self._visible_libraries(plex.get_library_sections(), settings, True)
             libraries = [library for library in visible if library["type"] in ("movie", "show")]
-            return plex.get_video_home(row, libraries)
+            if row in ("movies", "shows") and isinstance(recent_offsets, dict):
+                return plex.get_recent_video_page(row, libraries, recent_offsets)
+            return {"items": plex.get_video_home(row, libraries, full_watchlist is True and row == "watchlist")}
 
         try:
-            return {"items": await asyncio.to_thread(load)}
+            return await asyncio.to_thread(load)
         except Exception as error:
             logger.warning("Could not load Plex video home row=%s error=%s", row, type(error).__name__)
             return {"items": [], "error": "Could not load this section."}
+
+    async def video_library_action(self, rating_key: str, server_id: str, action: str, rating: Optional[int] = None) -> Dict[str, Any]:
+        if (not isinstance(rating_key, str) or not rating_key.isdecimal() or len(rating_key) > 20
+                or action not in ("add_watchlist", "remove_watchlist", "mark_watched", "mark_unwatched", "remove_continue", "rate")
+                or (action == "rate" and rating is not None and (type(rating) is not int or not 0 <= rating <= 10))):
+            return {"error": "Unknown Plex video action."}
+        settings = _load_settings()
+        if not server_id or server_id != settings["selected_server_id"] or not settings["plex_token"]:
+            return {"error": "Connect to the item's Plex server first."}
+
+        def update():
+            plex = self._plex_for_settings(settings)
+            if not plex:
+                raise ValueError("Plex server unavailable.")
+            return plex.video_library_action(rating_key, action, rating)
+
+        try:
+            return await asyncio.to_thread(update)
+        except Exception as error:
+            logger.warning("Plex video action %s failed for %s: %s", action, rating_key, type(error).__name__)
+            return {"error": "Plex could not complete this video action."}
 
     async def get_music_artists(self, limit: int = 100, offset: int = 0) -> Dict[str, Any]:
         plex = await asyncio.to_thread(self._get_plex)
@@ -3235,16 +3461,18 @@ class Plugin:
             logger.error(f"Failed to search library: {e}")
             return {"items": [], "error": str(e)}
 
-    async def get_media_source(self, rating_key: str, requested_quality: str = "") -> Dict[str, Any]:
-        plex = await asyncio.to_thread(self._get_plex)
+    async def get_media_source(self, rating_key: str, requested_quality: str = "", media_index: int = 0) -> Dict[str, Any]:
+        settings = _load_settings()
+        plex = await asyncio.to_thread(self._plex_for_settings, settings)
         if not plex:
             return {"error": "Not connected to Plex server"}
         try:
-            settings = _load_settings()
             quality = requested_quality or settings["video_quality"]
             if not isinstance(quality, str) or quality not in VIDEO_QUALITY:
                 quality = "auto"
-            result = await asyncio.to_thread(plex.get_media_source, rating_key, quality)
+            if type(media_index) is not int or media_index < 0:
+                raise ValueError("Invalid video version.")
+            result = await asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index)
             if any(stream["kind"] == "hls" for stream in result.get("streams", [])):
                 if self._video_handoff_sources is None:
                     self._video_handoff_sources = {}
@@ -3253,7 +3481,7 @@ class Plugin:
                     cache.pop(next(iter(cache)))
                 key = secrets.token_urlsafe(18)
                 identity = (settings["selected_server_id"], settings["plex_token"],
-                            self._get_plex_server_url(settings), rating_key, quality)
+                            self._get_plex_server_url(settings), rating_key, quality, media_index)
                 cache[key] = (identity, result)
                 result = {**result, "handoff_key": key}
             return {**result, "server_id": settings["selected_server_id"], "quality": quality}
@@ -3261,6 +3489,33 @@ class Plugin:
             logger.warning("Could not prepare Plex video item=%s error=%s",
                            rating_key if str(rating_key).isdigit() else "invalid", type(error).__name__)
             return {"error": "Plex could not prepare this item for playback."}
+
+    async def set_video_stream(self, rating_key: str, server_id: str, index: int, kind: str, stream_id: int) -> Dict[str, Any]:
+        settings = _load_settings()
+        if (not server_id or server_id != settings["selected_server_id"] or kind not in ("audio", "subtitle")
+                or not isinstance(rating_key, str) or not rating_key.isdecimal() or len(rating_key) > 20
+                or type(index) is not int or index < 0 or type(stream_id) is not int or stream_id < 0):
+            return {"error": "The Plex video track is unavailable."}
+        try:
+            plex = await asyncio.to_thread(self._plex_for_settings, settings)
+            if not plex:
+                return {"error": "Not connected to Plex server."}
+            await asyncio.to_thread(plex.set_video_stream, rating_key, index, kind, stream_id)
+            return {"success": True}
+        except Exception as error:
+            logger.warning("Could not select Plex %s track: %s", kind, type(error).__name__)
+            return {"error": "Plex could not change this track."}
+
+    async def get_video_skip_markers(self, rating_key: str, server_id: str):
+        settings = _load_settings()
+        if not server_id or server_id != settings["selected_server_id"]:
+            return []
+        try:
+            plex = await asyncio.to_thread(self._plex_for_settings, settings)
+            return await asyncio.to_thread(plex.video_skip_markers, rating_key) if plex else []
+        except Exception as error:
+            logger.debug("Could not read Plex skip markers: %s", type(error).__name__)
+            return []
 
     async def log_video_event(self, rating_key: str, quality: str, source: str, event: str, code: str = "") -> None:
         if event not in ("attempt", "ready", "failed", "quality-restored", "autoplay", "waiting"):
@@ -3309,7 +3564,7 @@ class Plugin:
 
     async def start_game_pip(self, rating_key: str, server_id: str, quality: str, position: float,
                              volume: float, muted: bool, replacing_id: str = "", preferred_source: str = "",
-                             reuse=None) -> Dict[str, Any]:
+                             reuse=None, media_index: int = 0) -> Dict[str, Any]:
         settings = _load_settings()
         if settings.get("over_game_pip") is not True:
             return {"error": "Over-game picture-in-picture is turned off."}
@@ -3331,10 +3586,12 @@ class Plugin:
 
             if not isinstance(quality, str) or quality not in VIDEO_QUALITY:
                 quality = "auto"
-            identity = (server_id, settings["plex_token"], self._get_plex_server_url(settings), rating_key, quality)
+            if type(media_index) is not int or media_index < 0:
+                raise ValueError("Invalid video version.")
+            identity = (server_id, settings["plex_token"], self._get_plex_server_url(settings), rating_key, quality, media_index)
             source, manifest = self._find_video_handoff(reuse, identity, preferred_source)
             if source is None:
-                source = await asyncio.wait_for(asyncio.to_thread(plex.get_media_source, rating_key, quality), 18)
+                source = await asyncio.wait_for(asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index), 18)
             if revision != self._game_video_revision or self._game_video is not previous:
                 return {"error": "The over-game video request was canceled."}
             if not source.get("streams") or source["streams"][0]["kind"] == "image":
@@ -3345,6 +3602,7 @@ class Plugin:
             if previous:
                 await asyncio.to_thread(previous.close)
             return {"id": video.id, "url": video.url,
+                    "video_autoplay": settings["video_autoplay"],
                     "pip_position": settings["pip_position"], "pip_size": settings["pip_size"]}
         except Exception as error:
             logger.warning("Could not prepare PiP item=%s error=%s",
@@ -3372,15 +3630,16 @@ class Plugin:
             await asyncio.to_thread(video.close)
 
     async def report_video_progress(self, rating_key: str, server_id: str, time_ms: int,
-                                    duration_ms: int, state: str) -> None:
+                                    duration_ms: int, state: str) -> Optional[Dict[str, Any]]:
         if not server_id or _load_settings()["selected_server_id"] != server_id:
-            return
+            return None
         plex = await asyncio.to_thread(self._get_plex)
         if plex:
             try:
-                await asyncio.to_thread(plex.report_video_progress, rating_key, time_ms, duration_ms, state)
+                return await asyncio.to_thread(plex.report_video_progress, rating_key, time_ms, duration_ms, state)
             except Exception:
                 logger.debug("Could not report Plex video progress for %s", rating_key, exc_info=True)
+        return None
 
     async def get_hubs(self) -> Dict[str, Any]:
         """Get hubs (recently played, on deck, etc.), limited to music sections only."""

@@ -1,4 +1,4 @@
-import { Fragment, memo, useState, useEffect, useCallback, useRef, type CSSProperties } from 'react';
+import { Fragment, memo, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties } from 'react';
 import {
   PanelSection,
   PanelSectionRow,
@@ -17,18 +17,22 @@ import {
 import { call, toaster } from '@decky/api';
 import {
   FaSearch, FaMusic, FaCompactDisc, FaUser, FaHistory, FaListUl, FaPlay, FaFilm, FaImage, FaHome, FaBars,
-  FaStepForward, FaListOl, FaPlus, FaMinus,
-  FaSortAlphaDown, FaSortAlphaUp, FaClock, FaCalendarAlt, FaTrash, FaArrowLeft,
+  FaStepForward, FaListOl, FaPlus, FaMinus, FaBookmark,
+  FaSortAlphaDown, FaSortAlphaUp, FaClock, FaCalendarAlt, FaTrash, FaArrowLeft, FaRegClone,
 } from 'react-icons/fa';
 import { usePlayer } from '../context/PlayerContext';
 import { InlineSpinner } from './InlineSpinner';
 import { gamePipFullscreenEvent, getEpisodeQueue, queueGamePipEpisodeNext, stopGamePip, takeGamePipFullscreen,
-  useGamePipEpisodeQueue, videoProgressEvent, type VideoItem, type VideoResume } from './GamePip';
+  useGamePipEpisodeQueue, videoProgressEvent, type VideoItem, type VideoProgressUpdate, type VideoResume } from './GamePip';
 import { MediaViewer, type VideoPresentation } from './MediaViewer';
 import { showPlaybackStartDialog } from './PlaybackStartDialog';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
 import { collectionResumes, episodeLabel, insertNextEpisode, queueFromEpisode, resumeEpisode, resumePosition } from './VideoQueue';
+import { musicCategories, videoCategories, visibleCategories, type BrowserLayouts, type MusicTab, type VideoTab } from './BrowserCategories';
+import { VideoOptionsDialog, type VideoAction, type VideoActionResult } from './VideoOptionsDialog';
+import { VideoWatchIndicator } from './VideoWatchIndicator';
+import { playNavigationSound, selectWithSound } from './GamepadSounds';
 
 interface LibraryItem {
   id: string;
@@ -49,17 +53,25 @@ interface LibraryItem {
   parentTitle?: string;
   grandparentTitle?: string;
   leafCount?: number;
+  viewedLeafCount?: number | null;
   viewCount?: number;
   viewOffset?: number;
+  userRating?: number | null;
+  parentId?: string;
+  grandparentId?: string;
   duration?: number;
   sectionId?: string;
 }
 
-type LibraryTab = `library:${string}`;
-type BrowserTab = 'artists' | 'albums' | 'tracks' | 'recent' | 'recentlyAdded' | 'playlists' | 'search' | 'videoHome' | LibraryTab;
+type BrowserTab = MusicTab | VideoTab | 'search';
 type BrowserSubView = { type: 'albums' | 'tracks' | 'search' | 'media'; title: string; id?: string; queueLabel?: string; mediaType?: string } | null;
 interface LibrarySection { id: string; name: string; type: string; }
-interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; hasMore?: boolean; nextOffset?: number; }
+interface ItemCacheEntry { expiresAt: number; items: LibraryItem[]; hasMore?: boolean; nextOffset?: number; recentOffsets?: HomeRecentOffsets; }
+
+const musicCategoryIcons = {
+  artists: <FaUser />, albums: <FaCompactDisc />, tracks: <FaMusic />, recent: <FaHistory />,
+  recentlyAdded: <FaCompactDisc />, playlists: <FaListUl />,
+};
 
 function sectionForTab(tab: BrowserTab) {
   return tab.startsWith('library:') ? tab.slice('library:'.length) : '';
@@ -69,10 +81,11 @@ interface BrowserHistoryEntry {
   items: LibraryItem[];
   subView: BrowserSubView;
   focusedItemId?: string;
+  homeRow?: VideoHomeRow;
   scrollTop: number;
   hasMore: boolean;
 }
-interface TabFocusPosition { itemId: string; scrollTop: number; }
+interface TabFocusPosition { itemId: string; scrollTop: number; homeRow?: VideoHomeRow; }
 
 const browserHeaderStyle: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: '0.5rem', height: '2.65rem',
@@ -84,6 +97,8 @@ const BROWSER_FOOTER_CLEARANCE = 150;
 const ALPHABET_HOLD_DELAY = 450;
 const PAGE_SIZE = 36;
 const LIBRARY_CACHE_TTL = 600000;
+const videoWatchlistEvent = 'deckyplex-video-watchlist-change';
+const watchlistTabCache = 'video-watchlist';
 const VIDEO_HOME_ROWS = [
   { id: 'continue', title: 'Continue Watching', ttl: 15000 },
   { id: 'next', title: 'Watch Next', ttl: 15000 },
@@ -103,7 +118,29 @@ function alphabetGroup(title: string) {
   return /^[A-Z]$/.test(initial) ? initial : '#';
 }
 type VideoHomeRow = typeof VIDEO_HOME_ROWS[number]['id'];
-type VideoHomeData = Partial<Record<VideoHomeRow, { items: LibraryItem[]; error?: string }>>;
+type HomeRecentOffsets = Record<string, number | null>;
+type VideoHomeShelf = { items: LibraryItem[]; error?: string; recentOffsets?: HomeRecentOffsets; paging?: boolean; pageError?: boolean };
+type VideoHomeData = Partial<Record<VideoHomeRow, VideoHomeShelf>>;
+
+const recentShelfHasMore = (shelf?: VideoHomeShelf) =>
+  shelf?.recentOffsets && Object.values(shelf.recentOffsets).some(offset => offset !== null);
+
+function keepHomeCardVisible(card: HTMLElement) {
+  const shelf = card.closest<HTMLElement>('[data-home-shelf]');
+  if (!shelf?.offsetWidth) return;
+  const viewport = shelf.getBoundingClientRect();
+  const bounds = card.getBoundingClientRect();
+  const scale = viewport.width / shelf.offsetWidth;
+  if (!scale) return;
+  if (bounds.left < viewport.left) shelf.scrollLeft += (bounds.left - viewport.left) / scale;
+  else if (bounds.right > viewport.right) shelf.scrollLeft += (bounds.right - viewport.right) / scale;
+}
+
+function focusForDirection(target: HTMLElement, event: Event) {
+  target.focus({ preventScroll: true });
+  // Manually handled moves don't pass through Steam's gamepad focus sound.
+  playNavigationSound(event);
+}
 
 export function BrowserPage() {
   const { playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteMode, remoteTargetSelected, remotePlayerName,
@@ -133,15 +170,37 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const [selectedSection, setSelectedSection] = useState<string>('');
   const [libraries, setLibraries] = useState<LibrarySection[]>([]);
   const [homeData, setHomeData] = useState<VideoHomeData>({});
+  const loadMoreHome = useRef<(row: VideoHomeRow, retry?: boolean) => void>(() => {});
+  const homeShelfFocus = useRef(new Map<VideoHomeRow, string>());
+  const [pendingContinueRemovals, setPendingContinueRemovals] = useState<ReadonlySet<string>>(() => new Set());
   const [videoSorts, setVideoSorts] = useState<Record<string, string>>({});
   const [loadingLibraries, setLoadingLibraries] = useState(false);
   const [showAllMedia, setShowAllMedia] = useState(false);
   const [overGamePip, setOverGamePip] = useState(false);
+  const [videoAutoplay, setVideoAutoplay] = useState(true);
   const [librarySelectionKey, setLibrarySelectionKey] = useState('');
   const [serverId, setServerId] = useState('');
+  const [browserLayouts, setBrowserLayouts] = useState<BrowserLayouts>({});
+  const browserLayoutsRef = useRef(browserLayouts);
+  const layoutSnapshot = useRef('{}');
+  const visibleMusic = useMemo(() => visibleCategories(
+    selectedSection || !libraries.length ? musicCategories : [], browserLayouts.music,
+  ), [selectedSection, libraries.length, browserLayouts.music]);
+  const visibleVideo = useMemo(() => visibleCategories(
+    videoCategories(libraries), browserLayouts[`video:${serverId}`],
+  ), [libraries, serverId, browserLayouts]);
+  const tabs = useMemo((): { key: BrowserTab; title: string; icon: React.ReactNode }[] => [
+    ...visibleMusic.map(category => ({ ...category, icon: musicCategoryIcons[category.key] })),
+    ...visibleVideo.map(category => ({ ...category,
+      icon: category.type === 'home' ? <FaHome /> : category.type === 'watchlist' ? <FaBookmark />
+        : category.type === 'photo' ? <FaImage /> : <FaFilm /> })),
+    { key: 'search', title: 'Search', icon: <FaSearch /> },
+  ], [visibleMusic, visibleVideo]);
   const [checkingConnection, setCheckingConnection] = useState(true);
   const connected = !!serverId;
   const [subView, setSubView] = useState<BrowserSubView>(null);
+  const subViewRef = useRef(subView);
+  subViewRef.current = subView;
   const collectionRequest = useRef<{ key: string; episodes: Promise<VideoItem[]> } | null>(null);
   const [viewerItem, setViewerItem] = useState<LibraryItem | null>(null);
   const [viewerResume, setViewerResume] = useState<VideoResume | null>(null);
@@ -162,6 +221,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const [restoreFocusTick, setRestoreFocusTick] = useState(0);
   const itemCache = useRef(new Map<string, ItemCacheEntry>());
   const pendingItems = useRef(new Map<string, Promise<any>>());
+  const pendingVideoActions = useRef(new Set<string>());
+  const watchlistMembership = useRef(new Map<string, boolean>());
   const firstItemRef = useRef<HTMLDivElement | null>(null);
   const sortButtonRef = useRef<HTMLDivElement | null>(null);
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
@@ -175,13 +236,16 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const contentRef = useRef<HTMLDivElement | null>(null);
   const moreItemsRef = useRef<HTMLDivElement | null>(null);
   const focusScrollFrame = useRef(0);
+  const scrollHomeCard = useRef<(target: HTMLElement, previous: HTMLElement) => void>(() => {});
   const fastVerticalNavigation = useRef(false);
   const contentScrollAnimation = useRef<{ top: number; frame: number } | null>(null);
   const alphabetOverlayRef = useRef<HTMLDivElement | null>(null);
   const alphabetHold = useRef<{ button: GamepadButton; item: HTMLElement; timer: number | null } | null>(null);
   const searchFormRef = useRef<HTMLDivElement | null>(null);
   const focusedItemId = useRef<string | undefined>(undefined);
+  const focusedHomeRow = useRef<VideoHomeRow | undefined>(undefined);
   const pendingFocusId = useRef<string | undefined>(undefined);
+  const pendingHomeRow = useRef<VideoHomeRow | undefined>(undefined);
   const pendingSortFocus = useRef<{ tab: BrowserTab; sort: string; ready: boolean } | null>(null);
   const pendingScrollTop = useRef<number | undefined>(undefined);
   const tabFocusPositions = useRef(new Map<BrowserTab, TabFocusPosition>());
@@ -191,7 +255,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const tabLoadRequestId = useRef(0);
   const restoringHistoryRef = useRef(false);
   const enterContentPending = useRef(false);
-  const viewerOrigin = useRef<{ itemId?: string; scrollTop: number }>({ scrollTop: 0 });
+  const viewerOrigin = useRef<{ itemId?: string; scrollTop: number; homeRow?: VideoHomeRow }>({ scrollTop: 0 });
 
   const cancelContentScroll = useCallback(() => {
     if (contentScrollAnimation.current) window.cancelAnimationFrame(contentScrollAnimation.current.frame);
@@ -239,6 +303,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
     // focus moves between categories. The effect below then loads only the new tab.
     invalidateTabLoad();
     pendingSortFocus.current = null;
+    pendingFocusId.current = undefined;
+    pendingHomeRow.current = undefined;
+    pendingScrollTop.current = undefined;
     enterContentPending.current = false;
     pendingSearchFocus.current = false;
     pendingSearchInputFocus.current = false;
@@ -297,14 +364,15 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const cachedItems = useCallback(async (key: string, ttlMs: number, request: () => Promise<any>) => {
     const cache = itemCache.current;
     const cached = cache.get(key);
-    if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore, next_offset: cached.nextOffset };
+    if (cached && cached.expiresAt > Date.now()) return { items: cached.items, has_more: cached.hasMore,
+      next_offset: cached.nextOffset, recent_offsets: cached.recentOffsets };
     const pending = pendingItems.current;
     const existing = pending.get(key);
     if (existing) return existing;
     const load = request().then(result => {
       if (cache === itemCache.current && Array.isArray(result?.items) && !result?.error) {
         cache.set(key, { items: result.items, hasMore: result.has_more,
-          nextOffset: result.next_offset, expiresAt: Date.now() + ttlMs });
+          nextOffset: result.next_offset, recentOffsets: result.recent_offsets, expiresAt: Date.now() + ttlMs });
       }
       return result;
     }).finally(() => pending.delete(key));
@@ -351,6 +419,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       // restoration otherwise leaves focus nowhere and the next B exits.
       pendingSearchInputFocus.current = activeTab === 'search' && previous.subView === null;
       pendingFocusId.current = pendingSearchInputFocus.current ? undefined : previous.focusedItemId;
+      pendingHomeRow.current = previous.homeRow;
       pendingScrollTop.current = previous.scrollTop;
       setRestoreFocusTick(value => value + 1);
     } else {
@@ -366,8 +435,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
   };
 
   const restoreBrowserFocus = () => {
-    const { itemId, scrollTop } = viewerOrigin.current;
+    const { itemId, scrollTop, homeRow } = viewerOrigin.current;
     pendingFocusId.current = itemId;
+    pendingHomeRow.current = homeRow;
     pendingScrollTop.current = itemId ? scrollTop : undefined;
     if (itemId) setRestoreFocusTick(value => value + 1);
     else focusBrowserTab(scrollTop);
@@ -431,6 +501,14 @@ const LibraryBrowser = memo(function LibraryBrowser({
         }
         setShowAllMedia(Boolean(result.browse_all_media));
         setOverGamePip(result.over_game_pip === true);
+        setVideoAutoplay(result.video_autoplay !== false);
+        const layouts: BrowserLayouts = result.browser_layouts ?? {};
+        const snapshot = JSON.stringify(layouts);
+        if (snapshot !== layoutSnapshot.current) {
+          layoutSnapshot.current = snapshot;
+          browserLayoutsRef.current = layouts;
+          setBrowserLayouts(layouts);
+        }
         setLibrarySelectionKey((result.library_selection_ids || []).join(','));
         setServerId(result.has_plex_token ? result.selected_server_id || '' : '');
       } catch (e) {
@@ -484,18 +562,25 @@ const LibraryBrowser = memo(function LibraryBrowser({
           return;
         }
         if (pendingFocusId.current) {
-          const target = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
-            .find(element => element.dataset.browserItemId === pendingFocusId.current);
+          const cards = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-browser-item-id]') || [])
+            .filter(element => element.dataset.browserItemId === pendingFocusId.current);
+          const wantedRow = pendingHomeRow.current;
+          const target = cards.find(card => card.dataset.browserHomeRow === wantedRow)
+            ?? (wantedRow && !homeData[wantedRow] ? null : cards[0]);
           if (target) {
             if (pendingScrollTop.current != null && contentRef.current) {
               contentRef.current.scrollTop = pendingScrollTop.current;
               pendingScrollTop.current = undefined;
             }
+            keepHomeCardVisible(target);
             target.focus({ preventScroll: true });
             pendingFocusId.current = undefined;
+            pendingHomeRow.current = undefined;
             return;
           }
+          if (wantedRow && !subView && activeTab === 'videoHome' && !homeData[wantedRow]) return;
           pendingFocusId.current = undefined;
+          pendingHomeRow.current = undefined;
           pendingScrollTop.current = undefined;
           enterContentPending.current = true;
         }
@@ -520,7 +605,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (secondFrame) window.cancelAnimationFrame(secondFrame);
     };
   }, [loading, loadingLibraries, items, subView, activeTab, restoreFocusTick, viewerExpanded, shelf, sorting, error,
-    checkingConnection, connected]);
+    checkingConnection, connected, homeData]);
 
   const saveGridColumns = useCallback(async (columns: number) => {
     const result: any = await call('set_settings', { grid_columns: columns });
@@ -598,15 +683,21 @@ const LibraryBrowser = memo(function LibraryBrowser({
     setSelectedSection('');
     setLibraries([]);
     setHomeData({});
+    setPendingContinueRemovals(new Set());
     setVideoSorts({});
     setItems([]);
     setSubView(null);
     setHistory([]);
     itemCache.current = new Map();
     pendingItems.current = new Map();
+    pendingVideoActions.current = new Set();
+    watchlistMembership.current = new Map();
     tabFocusPositions.current.clear();
+    homeShelfFocus.current.clear();
+    pendingHomeRow.current = undefined;
     restoringHistoryRef.current = false;
-    selectTab('artists');
+    const initialTab = visibleCategories(musicCategories, browserLayoutsRef.current.music)[0]?.key ?? 'search';
+    selectTab(initialTab);
     setLoadingLibraries(true);
     setError(null);
     void call<[boolean], { sections?: LibrarySection[]; error?: string }>('get_library_sections', showAllMedia)
@@ -616,13 +707,14 @@ const LibraryBrowser = memo(function LibraryBrowser({
         if (!result?.sections?.length) throw new Error('No selected Plex libraries were found. Check Settings › Server.');
         setSelectedSection(result.sections.find(section => section.type === 'artist')?.id || '');
         setLibraries(result.sections);
-        const firstMediaLibrary = result.sections.find(section => section.type !== 'artist');
-        if (firstMediaLibrary && !result.sections.some(section => section.type === 'artist') && activeTabRef.current === 'artists') {
-          const tab: BrowserTab = result.sections.some(section => section.type === 'movie' || section.type === 'show')
-            ? 'videoHome' : `library:${firstMediaLibrary.id}`;
+        if (activeTabRef.current === initialTab && focusZone.current === 'sidebar' && !pendingSearchInputFocus.current) {
+          const layouts = browserLayoutsRef.current;
+          const music = result.sections.some(section => section.type === 'artist') ? musicCategories : [];
+          const tab: BrowserTab = visibleCategories(music, layouts.music)[0]?.key
+            ?? visibleCategories(videoCategories(result.sections), layouts[`video:${serverId}`])[0]?.key ?? 'search';
           selectTab(tab);
           window.requestAnimationFrame(() => {
-            if (active && focusZone.current === 'sidebar' && activeTabRef.current === tab) {
+            if (active && focusZone.current === 'sidebar' && activeTabRef.current === tab && !pendingSearchInputFocus.current) {
               sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${tab}"]`)?.focus();
             }
           });
@@ -635,7 +727,25 @@ const LibraryBrowser = memo(function LibraryBrowser({
       })
       .finally(() => { if (active) setLoadingLibraries(false); });
     return () => { active = false; };
-  }, [serverId, showAllMedia, librarySelectionKey, invalidateTabLoad]);
+  }, [serverId, showAllMedia, librarySelectionKey, invalidateTabLoad, selectTab]);
+
+  useEffect(() => {
+    if (!connected || loadingLibraries || !libraries.length || viewerExpanded || activeTab !== activeTabRef.current
+        || tabs.some(tab => tab.key === activeTab)) return;
+    const nextTab = tabs[0].key;
+    setHistory([]);
+    setSubView(null);
+    restoringHistoryRef.current = false;
+    pendingFocusId.current = undefined;
+    pendingScrollTop.current = undefined;
+    selectTab(nextTab);
+    focusZone.current = 'sidebar';
+    window.requestAnimationFrame(() => {
+      if (activeTabRef.current === nextTab && focusZone.current === 'sidebar') {
+        sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${nextTab}"]`)?.focus();
+      }
+    });
+  }, [activeTab, connected, libraries.length, loadingLibraries, selectTab, tabs, viewerExpanded]);
 
   useEffect(() => {
     if (!serverId) return;
@@ -668,10 +778,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     return () => { active = false; };
   }, [viewerItem, viewerQueue, serverId]);
 
-  const openSortMenu = (event?: GamepadEvent) => {
-    event?.preventDefault();
-    event?.stopPropagation();
-    if (!sortable || actionDialogRef.current) return;
+  const openSortMenu = useCallback(() => {
+    if (!sortable || gridDialogRef.current || actionDialogRef.current) return;
     const clearDialog = () => {
       if (actionDialogRef.current === dialog) actionDialogRef.current = null;
     };
@@ -705,7 +813,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     );
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  };
+  }, [activeTab, invalidateTabLoad, shelf, sortable, sorting]);
 
   useEffect(() => {
     if (!connected || loadingLibraries || subView || activeTab !== 'videoHome') return;
@@ -718,20 +826,23 @@ const LibraryBrowser = memo(function LibraryBrowser({
     setLoading(false);
     const loadRow = (row: typeof VIDEO_HOME_ROWS[number]) => {
       void cachedItems(`video-home:${row.id}`, row.ttl,
-        () => call('get_video_home', row.id)).then(result => {
+        () => row.id === 'movies' || row.id === 'shows' ? call('get_video_home', row.id, false, {})
+          : call('get_video_home', row.id, row.id === 'watchlist')).then(result => {
         if (!active) return;
         const items: LibraryItem[] = result?.items || [];
         if (row.id === 'continue') {
           const next = (item: LibraryItem) => item.type === 'episode' && !item.viewOffset;
           rows.next = { items: items.filter(next) };
           rows.continue = { items: items.filter(item => !next(item)), error: result?.error };
-        } else rows[row.id] = { items, error: result?.error };
+        } else rows[row.id] = { items, error: result?.error, recentOffsets: result?.recent_offsets };
       }).catch(() => {
         if (active) rows[row.id] = { items: [], error: 'Could not load this section.' };
         if (active && row.id === 'continue') rows.next = { items: [] };
       }).finally(() => {
         if (!active) return;
-        setHomeData({ ...rows });
+        setHomeData(current => row.id === 'continue'
+          ? { ...current, continue: rows.continue, next: rows.next }
+          : { ...current, [row.id]: rows[row.id] });
         setItems(VIDEO_HOME_ROWS.flatMap(entry => rows[entry.id]?.items || []));
       });
     };
@@ -739,20 +850,49 @@ const LibraryBrowser = memo(function LibraryBrowser({
     for (const row of VIDEO_HOME_ROWS) {
       if (row.id !== 'next' && !rows[row.id]) loadRow(row);
     }
-    const refreshContinueWatching = () => {
+    loadMoreHome.current = (id, retry) => {
+      const current = rows[id];
+      if (!current || !recentShelfHasMore(current) || current.paging || (current.pageError && !retry)) return;
+      const updatePage = (page: VideoHomeShelf) => {
+        rows[id] = page;
+        setHomeData(data => ({ ...data, [id]: page }));
+      };
+      updatePage({ ...current, paging: true, pageError: false });
+      void call<[VideoHomeRow, boolean, HomeRecentOffsets], {
+        items?: LibraryItem[]; recent_offsets?: HomeRecentOffsets; error?: string;
+      }>('get_video_home', id, false, current.recentOffsets!).then(result => {
+        if (!active) return;
+        if (result.error || !result.items || !result.recent_offsets) throw new Error('Could not load this section.');
+        const existing = new Set(current.items.map(item => item.id));
+        const items = [...current.items, ...result.items.filter(item => !existing.has(item.id))];
+        const row = VIDEO_HOME_ROWS.find(row => row.id === id)!;
+        itemCache.current.set(`video-home:${id}`, { items, recentOffsets: result.recent_offsets, expiresAt: Date.now() + row.ttl });
+        updatePage({ items, recentOffsets: result.recent_offsets });
+        setItems(VIDEO_HOME_ROWS.flatMap(entry => rows[entry.id]?.items || []));
+      }).catch(() => {
+        if (active) updatePage({ ...current, pageError: true });
+      });
+    };
+    const refreshHomeRow = (row: typeof VIDEO_HOME_ROWS[number]) => {
+      const key = `video-home:${row.id}`;
       const refresh = () => {
         if (!active) return;
-        itemCache.current.delete('video-home:continue');
-        loadRow(VIDEO_HOME_ROWS[0]);
+        itemCache.current.delete(key);
+        loadRow(row);
       };
-      const pending = pendingItems.current.get('video-home:continue');
+      const pending = pendingItems.current.get(key);
       if (pending) void pending.then(refresh, refresh);
       else refresh();
     };
+    const refreshContinueWatching = () => refreshHomeRow(VIDEO_HOME_ROWS[0]);
+    const refreshWatchlist = () => refreshHomeRow(VIDEO_HOME_ROWS[4]);
     window.addEventListener(videoProgressEvent, refreshContinueWatching);
+    window.addEventListener(videoWatchlistEvent, refreshWatchlist);
     return () => {
       active = false;
+      loadMoreHome.current = () => {};
       window.removeEventListener(videoProgressEvent, refreshContinueWatching);
+      window.removeEventListener(videoWatchlistEvent, refreshWatchlist);
     };
   }, [activeTab, connected, libraries, loadingLibraries, subView, cachedItems]);
 
@@ -772,14 +912,16 @@ const LibraryBrowser = memo(function LibraryBrowser({
       return;
     }
     const libraryId = sectionForTab(activeTab);
-    if (libraryId ? libraries.some(library => library.id === libraryId) : selectedSection) loadTabData(activeTab);
+    if (activeTab === 'videoWatchlist'
+        || (libraryId ? libraries.some(library => library.id === libraryId) : selectedSection)) loadTabData(activeTab);
   }, [activeTab, connected, selectedSection, libraries, loadingLibraries, subView, sorting, invalidateTabLoad]);
 
   const loadTabData = useCallback(async (tab: BrowserTab) => {
     const requestId = invalidateTabLoad();
     setError(null);
     const libraryId = sectionForTab(tab);
-    const cacheKey = `tab:${libraryId || selectedSection}:${tab}${libraryId ? `:${sorting}` : ''}`;
+    const cacheKey = tab === 'videoWatchlist' ? watchlistTabCache
+      : `tab:${libraryId || selectedSection}:${tab}${libraryId ? `:${sorting}` : ''}`;
     const finishSortFocus = () => {
       const focus = pendingSortFocus.current;
       if (focus?.tab === tab && focus.sort === sorting && !focus.ready) {
@@ -790,13 +932,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const cached = itemCache.current.get(cacheKey);
     const expectedTypes: Partial<Record<BrowserTab, string[]>> = {
       artists: ['artist'], albums: ['album'], tracks: ['track'], recent: ['track'],
-      recentlyAdded: ['album'], playlists: ['playlist'],
+      recentlyAdded: ['album'], playlists: ['playlist'], videoWatchlist: ['movie', 'show'],
     };
     const cachedTabItems = cached && expectedTypes[tab]
       ? cached.items.filter(item => expectedTypes[tab]?.includes(item.type))
       : cached?.items;
     const cacheIsFresh = !!cached && cached.expiresAt > Date.now();
-    const ttl = tab === 'recent' ? 15000 : tab === 'playlists' ? 60000 : LIBRARY_CACHE_TTL;
+    const ttl = tab === 'recent' ? 15000 : tab === 'playlists' || tab === 'videoWatchlist' ? 60000 : LIBRARY_CACHE_TTL;
     if (cached) {
       setItems(cachedTabItems || []);
       setTabHasMore(Boolean(cached.hasMore));
@@ -813,6 +955,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       let result: any;
       if (libraryId) {
         result = await cachedItems(cacheKey, ttl, () => call('get_section_contents', libraryId, '', PAGE_SIZE, 0, sorting));
+      } else if (tab === 'videoWatchlist') {
+        result = await cachedItems(cacheKey, ttl, () => call('get_video_home', 'watchlist', true));
       } else if (tab === 'artists' && combinedArtists) {
         result = await cachedItems(cacheKey, ttl, () => call('get_music_artists', PAGE_SIZE, 0));
       } else if (tab === 'recent') {
@@ -1155,6 +1299,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const loadMediaCollection = useCallback(async (item: LibraryItem) => {
     const requestId = invalidateTabLoad();
     setHistory(previous => [...previous, { items, subView, focusedItemId: item.id,
+      homeRow: !subView && activeTabRef.current === 'videoHome' ? focusedHomeRow.current : undefined,
       hasMore: tabHasMore, scrollTop: contentRef.current?.scrollTop || 0 }]);
     enterContentPending.current = true;
     setSubView({ type: 'media', id: item.id, title: item.title, mediaType: item.type });
@@ -1184,9 +1329,176 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const queue = collectionQueue ?? (item.type === 'episode' && subView?.mediaType === 'season'
       ? queueFromEpisode(items.filter(entry => entry.type === 'episode'), item.id) : undefined);
     setViewerQueue(queue?.length ? queue : null);
-    viewerOrigin.current = { itemId: collectionQueue ? focusedItemId.current : item.id, scrollTop: contentRef.current?.scrollTop || 0 };
+    viewerOrigin.current = { itemId: collectionQueue ? focusedItemId.current : item.id, scrollTop: contentRef.current?.scrollTop || 0,
+      homeRow: !subView && activeTabRef.current === 'videoHome' ? focusedHomeRow.current : undefined };
     setViewerItem(item);
   }, [items, subView?.mediaType]);
+
+  const patchVideoCards = useCallback((patch: (card: LibraryItem) => LibraryItem) => {
+    const update = (cards: LibraryItem[]) => {
+      const next = cards.map(patch);
+      return next.some((card, index) => card !== cards[index]) ? next : cards;
+    };
+    setItems(update);
+    setHistory(current => current.map(entry => ({ ...entry, items: update(entry.items) })));
+    setHomeData(current => {
+      const next = { ...current };
+      for (const { id } of VIDEO_HOME_ROWS) {
+        const row = current[id];
+        if (row) next[id] = { ...row, items: update(row.items) };
+      }
+      return next;
+    });
+    for (const [key, page] of itemCache.current) {
+      const cards = update(page.items);
+      if (cards !== page.items) itemCache.current.set(key, { ...page, items: cards });
+    }
+  }, []);
+
+  useEffect(() => {
+    const applyProgress = (event: Event) => {
+      const update = (event as CustomEvent<VideoProgressUpdate>).detail;
+      if (!update || update.serverId !== serverId || update.view_count === undefined
+          || pendingVideoActions.current.has(update.itemId)) return;
+      patchVideoCards(card => {
+        if (card.id === update.itemId && (card.type === 'movie' || card.type === 'episode')) {
+          return { ...card, viewCount: update.view_count, viewOffset: update.view_offset };
+        }
+        const count = update.collections?.[card.id];
+        return count != null && (card.type === 'show' || card.type === 'season')
+          ? { ...card, viewedLeafCount: count } : card;
+      });
+    };
+    window.addEventListener(videoProgressEvent, applyProgress);
+    return () => window.removeEventListener(videoProgressEvent, applyProgress);
+  }, [patchVideoCards, serverId]);
+
+  const openVideoOptions = (item: LibraryItem, index: number, homeRow?: VideoHomeRow, queueNext?: () => void) => {
+    const pending = pendingVideoActions.current;
+    if (actionDialogRef.current || !serverId || pending.has(item.id)) return;
+    const fromWatchlist = homeRow === 'watchlist' || (!subView && activeTab === 'videoWatchlist');
+    const onWatchlist = fromWatchlist || !!(watchlistMembership.current.get(item.id)
+      ?? (homeData.watchlist?.items.some(card => card.id === item.id)
+        || itemCache.current.get(watchlistTabCache)?.items.some(card => card.id === item.id)));
+    const clearDialog = () => {
+      if (actionDialogRef.current === dialog) actionDialogRef.current = null;
+    };
+    const close = () => { clearDialog(); dialog.Close(); };
+    const restoreAfterRemoval = () => {
+      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+        const content = contentRef.current;
+        if (!content || activeTabRef.current !== activeTab || content.contains(content.ownerDocument.activeElement)
+            || focusZone.current !== 'content' || actionDialogRef.current || subViewRef.current) return;
+        const cards = content.querySelectorAll<HTMLElement>('[data-browser-item-id]');
+        (cards[Math.min(index, cards.length - 1)] ?? sidebarRef.current?.querySelector<HTMLElement>(`[data-browser-tab="${activeTab}"]`))
+          ?.focus({ preventScroll: true });
+      }));
+    };
+    const apply = async (action: VideoAction, rating?: number | null) => {
+      if (pending.has(item.id)) return;
+      pending.add(item.id);
+      close();
+      const updateCard = (fields: Partial<LibraryItem>, parentDelta = 0, collections?: Record<string, number>) => patchVideoCards(card => {
+        if (card.id === item.id && card.type === item.type) return { ...card, ...fields };
+        if (card.type !== 'season' && card.type !== 'show') return card;
+        const count = collections?.[card.id];
+        if (count != null) return { ...card, viewedLeafCount: count };
+        const parent = (card.type === 'season' && card.id === item.parentId) || (card.type === 'show' && card.id === item.grandparentId);
+        if (parent && parentDelta && card.leafCount && card.viewedLeafCount != null)
+          return { ...card, viewedLeafCount: Math.max(0, Math.min(card.leafCount, card.viewedLeafCount + parentDelta)) };
+        return card;
+      });
+      const watched = action === 'mark_watched' || action === 'mark_unwatched';
+      const dismissContinue = action === 'remove_continue';
+      if (watched) {
+        updateCard({ viewCount: action === 'mark_watched' ? Math.max(1, item.viewCount || 0) : 0, viewOffset: 0 });
+        if (homeRow === 'continue' || (homeRow === 'next' && action === 'mark_watched')) restoreAfterRemoval();
+      } else if (dismissContinue) {
+        setPendingContinueRemovals(current => new Set([...current, item.id]));
+        restoreAfterRemoval();
+      } else if (action === 'rate') updateCard({ userRating: rating });
+      try {
+        const result = await call<[string, string, VideoAction, number | null], VideoActionResult>(
+          'video_library_action', item.id, serverId, action, rating ?? null,
+        );
+        if (result?.error) throw new Error(result.error);
+        if (pending !== pendingVideoActions.current) return;
+        if (watched || dismissContinue) {
+          if (watched) {
+            const delta = Number(!!result.view_count) - Number(!!item.viewCount);
+            updateCard({ viewCount: result.view_count, viewOffset: result.view_offset }, delta, result.collections);
+          } else {
+            setHomeData(current => {
+              const updated = { ...current };
+              for (const key of ['continue', 'next'] as const) {
+                const row = updated[key];
+                if (row) updated[key] = { ...row, items: row.items.filter(card => card.id !== item.id) };
+              }
+              return updated;
+            });
+          }
+          itemCache.current.delete('video-home:continue');
+          window.dispatchEvent(new Event(videoProgressEvent));
+        } else if (action !== 'rate') {
+          const added = result.on_watchlist === true;
+          watchlistMembership.current.set(item.id, added);
+          setHomeData(current => {
+            const row = current.watchlist;
+            if (!row) return current;
+            const rest = row.items.filter(card => card.id !== item.id);
+            return { ...current, watchlist: { items: added ? [item, ...rest] : rest } };
+          });
+          const watchingList = () => activeTabRef.current === 'videoWatchlist' && !subViewRef.current;
+          if (!added && activeTabRef.current === 'videoWatchlist') {
+            const remove = (cards: LibraryItem[]) => cards.filter(card => card.id !== item.id);
+            if (watchingList()) setItems(remove);
+            setHistory(current => current.map(entry => entry.subView ? entry : { ...entry, items: remove(entry.items) }));
+          }
+          if (!added && fromWatchlist) restoreAfterRemoval();
+          const pendingWatchlist = pendingItems.current.get(watchlistTabCache);
+          const invalidateWatchlist = () => {
+            if (pending !== pendingVideoActions.current) return;
+            itemCache.current.delete(watchlistTabCache);
+            if (watchingList() && (!fromWatchlist || pendingWatchlist)) {
+              void cachedItems(watchlistTabCache, 60000, () => call('get_video_home', 'watchlist', true)).then(result => {
+                if (pending === pendingVideoActions.current && watchingList() && !result?.error && Array.isArray(result?.items)) {
+                  setItems(result.items);
+                  if (!added) restoreAfterRemoval();
+                }
+              }).catch(() => {});
+            }
+          };
+          if (pendingWatchlist) void pendingWatchlist.then(invalidateWatchlist, invalidateWatchlist);
+          else invalidateWatchlist();
+          itemCache.current.delete('video-home:watchlist');
+          window.dispatchEvent(new Event(videoWatchlistEvent));
+        }
+      } catch (error) {
+        if (pending !== pendingVideoActions.current) return;
+        if (watched) updateCard({ viewCount: item.viewCount, viewOffset: item.viewOffset });
+        else if (action === 'rate') updateCard({ userRating: item.userRating });
+        void toaster.toast({ title: 'DeckyPlex', body: error instanceof Error ? error.message : 'Could not update this Plex title.' });
+      } finally {
+        pending.delete(item.id);
+        if (dismissContinue && pending === pendingVideoActions.current) {
+          setPendingContinueRemovals(current => {
+            const next = new Set(current);
+            next.delete(item.id);
+            return next;
+          });
+        }
+      }
+    };
+    const dialog = showModal(
+      <VideoOptionsDialog item={item} userRating={item.userRating} onWatchlist={onWatchlist}
+        canRemoveContinue={homeRow === 'continue' || homeRow === 'next'}
+        playFromBeginning={() => { close(); openMedia(item, undefined, 0); }}
+        queueNext={queueNext ? () => { close(); queueNext(); } : undefined} apply={(action, rating) => void apply(action, rating)} close={close} />,
+      window, { strTitle: 'Video options', bNeverPopOut: true, fnOnClose: clearDialog },
+    );
+    actionDialogRef.current = dialog;
+    void dialog.ClosedPromise?.then(clearDialog, clearDialog);
+  };
 
   const collectionId = subView?.mediaType === 'show' || subView?.mediaType === 'season' ? subView.id : undefined;
   const collectionKey = collectionId && serverId ? `${serverId}:${collectionId}` : '';
@@ -1284,7 +1596,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   };
 
   const homeView = !subView && activeTab === 'videoHome';
-  const gridView = homeView || subView?.type === 'albums' || subView?.type === 'media'
+  const gridView = homeView || (!subView && activeTab === 'videoWatchlist') || subView?.type === 'albums' || subView?.type === 'media'
     || (!subView && (!!sectionForTab(activeTab) || ['artists', 'albums', 'recentlyAdded', 'playlists'].includes(activeTab)));
   const videoCollection = subView?.mediaType === 'show' || subView?.mediaType === 'season';
   const hasCollectionAction = videoCollection || subView?.type === 'albums' || subView?.type === 'tracks';
@@ -1301,8 +1613,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (!item || !viewport?.contains(item) || !viewport.offsetHeight) return false;
       window.cancelAnimationFrame(focusScrollFrame.current);
 
-      const firstRow = Number(item.dataset.browserItemIndex) < (gridView ? gridColumns : 1)
-        && (!homeView || item.hasAttribute('data-browser-home-start'));
+      const firstRow = homeView ? item.hasAttribute('data-browser-home-start')
+        : Number(item.dataset.browserItemIndex) < (gridView ? gridColumns : 1);
+      if (homeView) keepHomeCardVisible(item);
       const viewportRect = viewport.getBoundingClientRect();
       const itemRect = item.getBoundingClientRect();
       const scale = viewportRect.height / viewport.offsetHeight;
@@ -1337,9 +1650,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
       updateAlphabetOverlay(item);
 
       const itemId = item.dataset.browserItemId;
-      if (!subView && itemId) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: top });
+      if (!subView && itemId) tabFocusPositions.current.set(activeTab, { itemId, scrollTop: top,
+        homeRow: item.dataset.browserHomeRow as VideoHomeRow | undefined });
       return true;
     },
+  };
+  scrollHomeCard.current = (target, previous) => {
+    itemScroll.fnScrollIntoViewHandler({ Element: target }, { Element: previous });
   };
 
   const scrollContentToTop = useCallback(() => {
@@ -1359,7 +1676,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    target.focus({ preventScroll: true });
+    focusForDirection(target, event);
   };
 
   const jumpToListTop = (event: import('@decky/ui').GamepadEvent) => {
@@ -1370,7 +1687,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     firstItemRef.current?.focus({ preventScroll: true });
   };
 
-  const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false) => {
+  const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false, homeRow?: VideoHomeRow) => {
     const sortTitle = alphabeticallySorted ? item.titleSort || item.title : undefined;
     const kind = item.type;
     const showPoster = homeView && kind === 'episode';
@@ -1378,12 +1695,20 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const imageUrl = (showPoster ? item.gridPoster : item.gridThumb) || originalImage;
     const portrait = showPoster || ['movie', 'show', 'season'].includes(kind);
     const canQueueNext = kind === 'episode' && (pipEpisodeQueue || !!viewerQueue && viewerItem?.type === 'episode');
-    const queueNext = (event: GamepadEvent) => {
-      event.preventDefault();
-      event.stopPropagation();
+    const queueNext = () => {
       if (pipEpisodeQueue) queueGamePipEpisodeNext(item);
       else if (viewerItem) setViewerQueue(queue => insertNextEpisode(queue ?? [viewerItem], viewerItem.id, item));
     };
+    const videoOptions = kind === 'movie' || kind === 'episode' || kind === 'show' || kind === 'season';
+    const options = (event: GamepadEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.detail?.is_repeat) return;
+      if (videoOptions) openVideoOptions(item, idx, homeRow, canQueueNext ? queueNext : undefined);
+      else openPlaylistOptions(item);
+    };
+    const secondaryAction = videoOptions || kind === 'playlist' ? options : undefined;
+    const secondaryLabel = secondaryAction ? 'Options' : undefined;
     const title = episodeLabel(item);
     const subtitle = showPoster && item.grandparentTitle
       ? title
@@ -1402,11 +1727,14 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const focusItem = () => {
       focusZone.current = 'content';
       focusedItemId.current = item.id;
+      focusedHomeRow.current = homeRow;
+      if (homeRow) homeShelfFocus.current.set(homeRow, item.id);
       if (subView) return;
-      if (tabFocusPositions.current.get(activeTab)?.itemId !== item.id) {
-        tabFocusPositions.current.set(activeTab, { itemId: item.id, scrollTop: contentRef.current?.scrollTop || 0 });
+      const previous = tabFocusPositions.current.get(activeTab);
+      if (previous?.itemId !== item.id || previous.homeRow !== homeRow) {
+        tabFocusPositions.current.set(activeTab, { itemId: item.id, homeRow, scrollTop: contentRef.current?.scrollTop || 0 });
       }
-      if (!paginationError && idx >= items.length - (gridView ? gridColumns * 2 : 6)) void loadMoreTabPage();
+      if (!homeRow && !paginationError && idx >= items.length - (gridView ? gridColumns * 2 : 6)) void loadMoreTabPage();
     };
     if (gridView) {
       return (
@@ -1418,27 +1746,25 @@ const LibraryBrowser = memo(function LibraryBrowser({
           data-browser-sort-title={sortTitle}
           data-browser-card=""
           data-browser-home-start={firstHomeRow || undefined}
+          data-browser-home-row={homeRow}
           onFocus={focusItem}
           onGamepadFocus={focusItem}
           {...itemScroll}
-          onActivate={onClick}
+          onActivate={event => selectWithSound(event, onClick)}
           onClick={onClick}
           onCancel={handleCancel}
-          onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : canQueueNext ? 'Play next' : sortable ? 'Sort by' : undefined}
-          onSecondaryButton={item.type === 'playlist' ? (event) => {
-            event.preventDefault();
-            event.stopPropagation();
-            openPlaylistOptions(item);
-          } : canQueueNext ? queueNext : sortable ? openSortMenu : undefined}
+          onSecondaryActionDescription={secondaryLabel}
+          onSecondaryButton={secondaryAction}
           style={{ display: 'flex', flexDirection: 'column', minWidth: 0, padding: '0 0.35rem 0.35rem', gap: '0.3rem',
             scrollMarginTop: idx < gridColumns && (!homeView || firstHomeRow) ? browserHeaderScrollMargin : undefined }}
         >
           <div style={{ width: '100%', aspectRatio: portrait ? '2 / 3'
               : ['episode', 'clip'].includes(kind) ? '16 / 9' : '1 / 1',
-            contain: 'paint', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)',
+            position: 'relative', contain: 'paint', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)',
             display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {imageUrl ? <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
               style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
+            {videoOptions && <VideoWatchIndicator item={item} />}
           </div>
           <div style={{ fontWeight: 500, lineHeight: '1.2', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', margin: 0 }}>
             {(showPoster ? item.grandparentTitle || title : title) || '(unknown)'}
@@ -1459,17 +1785,20 @@ const LibraryBrowser = memo(function LibraryBrowser({
     }
     const rowDetails = (
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
-            {imageUrl ? (
+            {imageUrl || videoOptions ? (
               <div style={{
                 width: '40px',
                 height: '40px',
                 borderRadius: '4px',
                 overflow: 'hidden',
+                position: 'relative',
                 flexShrink: 0,
                 backgroundColor: 'rgba(255,255,255,0.1)',
               }}>
-                <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
+                {imageUrl ? <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
                   style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                  : <span style={{ display: 'grid', placeItems: 'center', height: '100%', opacity: 0.6 }}>{fallbackIcon}</span>}
+                {videoOptions && <VideoWatchIndicator item={item} compact />}
               </div>
             ) : (
               <div style={{ minWidth: '1.5rem', textAlign: 'center' }}>
@@ -1522,7 +1851,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
             onFocus={focusItem}
             onGamepadFocus={focusItem}
             {...itemScroll}
-            onActivate={onClick}
+            onActivate={event => selectWithSound(event, onClick)}
             onClick={onClick}
             onCancel={handleCancel}
             onGamepadDirection={(event) => moveBetweenItems(event, idx)}
@@ -1543,14 +1872,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
       <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id} data-browser-item-index={idx}
         data-browser-sort-title={sortTitle}
         onFocus={focusItem} onGamepadFocus={focusItem} {...itemScroll}
-        onActivate={onClick} onClick={onClick}
+        onActivate={event => selectWithSound(event, onClick)} onClick={onClick}
         onCancel={handleCancel} onGamepadDirection={(event) => moveBetweenItems(event, idx)}
-        onSecondaryActionDescription={item.type === 'playlist' ? 'Options' : canQueueNext ? 'Play next' : sortable ? 'Sort by' : undefined}
-        onSecondaryButton={item.type === 'playlist' ? (event) => {
-          event.preventDefault();
-          event.stopPropagation();
-          openPlaylistOptions(item);
-        } : canQueueNext ? queueNext : sortable ? openSortMenu : undefined}
+        onSecondaryActionDescription={secondaryLabel}
+        onSecondaryButton={secondaryAction}
         style={rowStyle}>
         {rowDetails}
       </Focusable>
@@ -1558,6 +1883,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
   };
 
   const renderContent = () => {
+    const visibleHomeRows = homeView ? VIDEO_HOME_ROWS.map(row => {
+      const result = homeData[row.id];
+      if (!result || (row.id !== 'continue' && row.id !== 'next')) return { ...row, result };
+      return { ...row, result: { ...result, items: result.items.filter(item =>
+        !pendingContinueRemovals.has(item.id) && (row.id === 'continue' ? !!item.viewOffset : !item.viewCount)) } };
+    }) : [];
     const title = subView?.title || tabs.find(tab => tab.key === activeTab)?.title || 'Library';
     const initialLoading = (
       <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minHeight: '2.5rem', paddingInline: '0.35rem' }}>
@@ -1590,8 +1921,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
             {title}
           </DialogLabel>
           {playbackRequests > 0 && <InlineSpinner />}
-          {sortable && <Button ref={sortButtonRef} onClick={() => openSortMenu()} onCancelButton={handleCancel}>
-            {VIDEO_SORTS.find(sort => sort.id === sorting)?.title || 'Sort by'}
+          {sortable && <Button ref={sortButtonRef} onClick={openSortMenu} onCancelButton={handleCancel}
+            onOKActionDescription="Sort by">
+            <span title="Press View to sort" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
+              <FaRegClone aria-hidden="true" />{VIDEO_SORTS.find(sort => sort.id === sorting)?.title || 'Sort by'}
+            </span>
           </Button>}
           {remoteTargetSelected && (
             <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem', margin: 0 }}>
@@ -1640,13 +1974,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
         {(loading || loadingLibraries) && initialLoading}
         {homeView && !loadingLibraries && !error && (
-          <Focusable flow-children="geometric" onCancel={handleCancel}
+          <Focusable flow-children="column" onCancel={handleCancel}
             onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
-            {VIDEO_HOME_ROWS.map((row, rowIndex) => {
-              const result = homeData[row.id];
+            {visibleHomeRows.map((row, rowIndex) => {
+              const { result } = row;
               if (result && !result.error && !result.items.length) return null;
-              const startIndex = VIDEO_HOME_ROWS.slice(0, rowIndex)
-                .reduce((count, previous) => count + (homeData[previous.id]?.items.length || 0), 0);
+              const startIndex = visibleHomeRows.slice(0, rowIndex)
+                .reduce((count, previous) => count + (previous.result?.items.length || 0), 0);
               return <section key={row.id} style={{ marginBottom: '1rem' }}>
                 <div style={{ padding: '0.25rem 0.35rem 0.5rem' }}>
                   <DialogLabel style={{ margin: 0 }}>{row.title}</DialogLabel>
@@ -1656,9 +1990,20 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 </div> : result.error ? <DialogBodyText style={{ margin: '0 0.35rem', opacity: 0.7 }}>
                   {result.error}
                 </DialogBodyText> :
-                  <div style={{ display: 'grid', gridTemplateColumns: `repeat(${gridColumns}, minmax(0, 1fr))`, gap: '0.5rem' }}>
-                    {result.items.map((item, index) => renderItemRow(item, startIndex + index, () => handleItemClick(item), startIndex === 0))}
-                  </div>}
+                  <Focusable flow-children="horizontal" data-home-shelf={row.id} onScroll={event => {
+                    const shelf = event.currentTarget;
+                    if (shelf.scrollLeft + shelf.clientWidth * 1.35 >= shelf.scrollWidth) loadMoreHome.current(row.id);
+                  }} style={{ display: 'grid', gridAutoFlow: 'column',
+                    gridAutoColumns: `calc((100% - ${(gridColumns - 1) * 0.5}rem) / ${gridColumns})`,
+                    alignItems: 'start', gap: '0.5rem', boxSizing: 'border-box', width: '100%',
+                    paddingBlock: '4px', overflowX: 'auto', overflowY: 'hidden', scrollbarWidth: 'none',
+                    overscrollBehaviorX: 'contain', overflowAnchor: 'none' }}>
+                    {result.items.map((item, index) => renderItemRow(item, startIndex + index, () => handleItemClick(item), startIndex === 0, row.id))}
+                    {(result.paging || result.pageError) && <div role="status"
+                      style={{ display: 'grid', placeItems: 'center', minHeight: '4rem', opacity: 0.75 }}>
+                      {result.paging ? <InlineSpinner /> : 'Press right to retry'}
+                    </div>}
+                  </Focusable>}
               </section>;
             })}
           </Focusable>
@@ -1701,11 +2046,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
           </PanelSectionRow>
         )}
 
-        {!loading && !loadingLibraries && !error && items.length === 0 && !subView && activeTab !== 'search'
-          && (!homeView || VIDEO_HOME_ROWS.every(row => homeData[row.id] && !homeData[row.id]?.error)) && (
+        {!loading && !loadingLibraries && !error && !subView && activeTab !== 'search'
+          && (homeView ? visibleHomeRows.every(row => row.result && !row.result.error && !row.result.items.length) : !items.length) && (
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.5 }}>
-              No items found.
+              {activeTab === 'videoWatchlist' ? 'No Watchlist titles in the selected libraries yet. Add one from its X menu.' : 'No items found.'}
             </DialogBodyText>
           </PanelSectionRow>
         )}
@@ -1731,30 +2076,39 @@ const LibraryBrowser = memo(function LibraryBrowser({
     );
   };
 
-  const musicTabs = [
-    { key: 'artists', title: 'Artists', icon: <FaUser /> },
-    { key: 'albums', title: 'Albums', icon: <FaCompactDisc /> },
-    { key: 'tracks', title: 'Songs', icon: <FaMusic /> },
-    { key: 'recent', title: 'Recently Played', icon: <FaHistory /> },
-    { key: 'recentlyAdded', title: 'Recently Added', icon: <FaCompactDisc /> },
-    { key: 'playlists', title: 'Playlists', icon: <FaListUl /> },
-  ] as const;
-  const videoLibraries = libraries.filter(library => library.type !== 'artist');
-  const hasVideoHome = videoLibraries.some(library => library.type === 'movie' || library.type === 'show');
-  const tabs: { key: BrowserTab; title: string; icon: React.ReactNode }[] = [
-    ...(selectedSection || !libraries.length ? musicTabs : []),
-    ...(hasVideoHome ? [{ key: 'videoHome' as const, title: 'Home', icon: <FaHome /> }] : []),
-    ...videoLibraries.map((library): { key: LibraryTab; title: string; icon: React.ReactNode } => ({
-      key: `library:${library.id}`,
-      title: library.name,
-      icon: library.type === 'photo' ? <FaImage /> : <FaFilm />,
-    })),
-    { key: 'search', title: 'Search', icon: <FaSearch /> },
-  ];
-
   useEffect(() => {
     const browser = browserRef.current;
     if (viewerExpanded || !browser) return;
+    const moveInHome = (event: Event, button?: GamepadButton) => {
+      const active = (event.target as Element | null)?.closest?.<HTMLElement>('[data-browser-home-row]');
+      const shelf = active?.closest<HTMLElement>('[data-home-shelf]');
+      if (!active || !shelf) return false;
+      let target: HTMLElement | undefined;
+      if (button === GamepadButton.DIR_LEFT || button === GamepadButton.DIR_RIGHT) {
+        const cards = Array.from(shelf.querySelectorAll<HTMLElement>('[data-browser-home-row]'));
+        const index = cards.indexOf(active);
+        const next = button === GamepadButton.DIR_RIGHT ? index + 1 : index - 1;
+        target = cards[next];
+        if (button === GamepadButton.DIR_RIGHT && next >= cards.length - 3) {
+          loadMoreHome.current(active.dataset.browserHomeRow as VideoHomeRow, next === cards.length);
+        }
+      } else if (button === GamepadButton.DIR_UP || button === GamepadButton.DIR_DOWN) {
+        const shelves = Array.from(contentRef.current?.querySelectorAll<HTMLElement>('[data-home-shelf]') || []);
+        const destination = shelves[shelves.indexOf(shelf) + (button === GamepadButton.DIR_DOWN ? 1 : -1)];
+        if (destination) {
+          const wanted = homeShelfFocus.current.get(destination.dataset.homeShelf as VideoHomeRow);
+          const cards = Array.from(destination.querySelectorAll<HTMLElement>('[data-browser-home-row]'));
+          target = cards.find(card => card.dataset.browserItemId === wanted) ?? cards[0];
+        }
+      } else return false;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (target && target !== active) {
+        if (target.dataset.browserHomeRow) scrollHomeCard.current(target, active);
+        focusForDirection(target, event);
+      }
+      return true;
+    };
     const moveAtBoundary = (event: Event, button: GamepadButton, repeat: boolean) => {
       if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
       // Steam sends controller input to the focused navigation node, which can
@@ -1800,10 +2154,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       } else return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      if (target?.isConnected) target.focus({ preventScroll: true });
-      else if (button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active)) {
-        firstItemRef.current?.focus({ preventScroll: true });
-      }
+      const destination = target?.isConnected ? target
+        : button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active) ? firstItemRef.current : null;
+      if (destination && destination !== active) focusForDirection(destination, event);
     };
     let lastVerticalPress = -Infinity;
     const recordVerticalPress = (button: GamepadButton | undefined, repeat: boolean, target: EventTarget | null) => {
@@ -1839,13 +2192,20 @@ const LibraryBrowser = memo(function LibraryBrowser({
         if (!detail.is_repeat) openSearch();
         return;
       }
-      moveAtBoundary(event, detail?.button, repeat);
+      if (detail?.button === GamepadButton.SELECT && sortable && !gridDialogRef.current && !actionDialogRef.current) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (!repeat) openSortMenu();
+        return;
+      }
+      if (!homeView || !moveInHome(event, detail?.button)) moveAtBoundary(event, detail?.button, repeat);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
-      const button = event.key === 'ArrowUp' ? GamepadButton.DIR_UP : GamepadButton.DIR_DOWN;
+      const button = { ArrowUp: GamepadButton.DIR_UP, ArrowDown: GamepadButton.DIR_DOWN,
+        ArrowLeft: GamepadButton.DIR_LEFT, ArrowRight: GamepadButton.DIR_RIGHT }[event.key];
+      if (button === undefined || (!homeView && button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN)) return;
       recordVerticalPress(button, event.repeat, event.target);
-      moveAtBoundary(event, button, event.repeat);
+      if (!homeView || !moveInHome(event, button)) moveAtBoundary(event, button, event.repeat);
     };
     const endRepeat = () => {
       fastVerticalNavigation.current = false;
@@ -1875,7 +2235,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       ownerWindow?.removeEventListener('blur', endRepeat);
       endRepeat();
     };
-  }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, activeTab, sorting, hideAlphabetOverlay, updateAlphabetOverlay]);
+  }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, openSortMenu, sortable, activeTab, sorting,
+    hideAlphabetOverlay, updateAlphabetOverlay]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -1883,6 +2244,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     enterContentPending.current = !savedPosition;
     if (savedPosition) {
       pendingFocusId.current = savedPosition.itemId;
+      pendingHomeRow.current = savedPosition.homeRow;
       pendingScrollTop.current = savedPosition.scrollTop;
       setRestoreFocusTick(value => value + 1);
     }
@@ -1934,7 +2296,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
           {tabs.map(({ key: tab, title, icon }) => (
             <Fragment key={tab}>
-            {(hasVideoHome ? tab === 'videoHome' : tab === `library:${videoLibraries[0]?.id}`) &&
+            {tab === visibleVideo[0]?.key &&
               <div style={{ margin: '0.45rem 0.65rem 0.35rem', fontSize: '0.73rem', color: '#aeb9c5' }}>Video</div>}
             <Focusable
               data-browser-tab={tab}
@@ -1943,10 +2305,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 focusZone.current = 'sidebar';
                 selectTab(tab);
               }}
-              onActivate={enterContent}
+              onActivate={event => selectWithSound(event, enterContent)}
               onClick={enterContent}
-              onSecondaryActionDescription={sortable && tab === activeTab ? 'Sort by' : undefined}
-              onSecondaryButton={sortable && tab === activeTab ? openSortMenu : undefined}
               style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px', whiteSpace: 'nowrap' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
@@ -1987,7 +2347,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         photo={viewerItem.type === 'photo'} initialVolume={localVolume} initialPlayback={viewerResume}
         initialPosition={viewerStartPosition}
         initialPresentation={viewerPresentation} close={closeMedia}
-        overGamePip={overGamePip}
+        overGamePip={overGamePip} autoplay={videoAutoplay}
         episodes={episodes} episodeQueueReady={!!viewerQueue} playEpisode={playEpisode}
         removeEpisode={id => {
           if (id !== viewerItem.id) setViewerQueue(queue => queue?.filter(episode => episode.id !== id) ?? null);
@@ -2051,7 +2411,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
             {...focusOutlineProps}
             flow-children="horizontal"
             onGamepadDirection={handleDirection}
-            onActivate={confirm}
+            onActivate={event => selectWithSound(event, confirm)}
             onClick={confirm}
             onOKActionDescription="Confirm"
             role="slider"

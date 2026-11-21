@@ -1,8 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button, GamepadButton } from '@decky/ui';
 import { videoSeekStep } from './VideoQueue';
 
-function formatTime(seconds: number) {
+export function formatVideoTime(seconds: number) {
   const value = Math.floor(seconds);
   const hours = Math.floor(value / 3600);
   const minutes = Math.floor(value / 60) % 60;
@@ -10,10 +10,12 @@ function formatTime(seconds: number) {
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
 }
 
-export function VideoScrubber({ position, duration, disabled, seek }: {
-  position: number; duration: number; disabled?: boolean; seek: (position: number) => void;
+export function VideoScrubber({ position, duration, disabled, seek, previewUrl }: {
+  position: number; duration: number; disabled?: boolean; seek: (position: number) => void; previewUrl?: string;
 }) {
   const [preview, setPreview] = useState<number | null>(null);
+  const [thumbnail, setThumbnail] = useState('');
+  const [failedThumbnail, setFailedThumbnail] = useState('');
   const draft = useRef<number | null>(null);
   const start = useRef(0);
   const update = (value: number | null) => {
@@ -34,7 +36,21 @@ export function VideoScrubber({ position, duration, disabled, seek }: {
   };
   const editing = preview !== null;
   const displayed = Math.max(0, Math.min(duration, preview ?? position));
-  return <div data-video-scrubbing={editing || undefined} style={{ marginBottom: '0.45rem' }}
+  const thumbnailTime = preview === null ? null : Math.floor(preview / 5) * 5000;
+  useEffect(() => {
+    if (!previewUrl || thumbnailTime === null) {
+      setThumbnail('');
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      const url = new URL(previewUrl);
+      url.pathname += `/${thumbnailTime}`;
+      setThumbnail(url.href);
+    }, 140);
+    return () => window.clearTimeout(timer);
+  }, [previewUrl, thumbnailTime]);
+  const percent = duration > 0 ? 100 * displayed / duration : 0;
+  return <div data-deckyplex-video-scrubber="" data-video-scrubbing={editing || undefined} style={{ width: '100%', position: 'relative' }}
     onBlur={() => { if (draft.current !== null) update(null); }}
     onKeyDown={editing ? event => {
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -46,8 +62,23 @@ export function VideoScrubber({ position, duration, disabled, seek }: {
         update(null);
       }
     } : undefined}>
-    <Button onClick={activate} disabled={disabled}
-      aria-label={`Playback position ${formatTime(displayed)} of ${formatTime(duration)}`}
+    <style>{`
+      [data-deckyplex-video-scrubber] .deckyplex-video-position {
+        background: #283441 !important;
+        color: #f3f6fa !important;
+        --deckyplex-seek-rail: #5c6b7a;
+        --deckyplex-seek-fill: #89d3ff;
+      }
+      [data-deckyplex-video-scrubber] .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
+      [data-video-scrubbing="true"] .deckyplex-video-position {
+        background: #e5edf5 !important;
+        color: #172433 !important;
+        --deckyplex-seek-rail: #a0aebc;
+        --deckyplex-seek-fill: #20577b;
+      }
+    `}</style>
+    <Button className="deckyplex-video-position" onClick={activate} disabled={disabled}
+      aria-label={`Playback position ${formatVideoTime(displayed)} of ${formatVideoTime(duration)}`}
       onOKActionDescription={editing ? 'Seek' : 'Choose position'}
       onCancelActionDescription={editing ? 'Cancel scrub' : undefined}
       onGamepadDirection={editing ? event => {
@@ -63,10 +94,11 @@ export function VideoScrubber({ position, duration, disabled, seek }: {
         event.stopImmediatePropagation();
         update(null);
       } : undefined}
-      style={{ display: 'block', width: '100%', padding: '0.4rem 0.55rem', background: 'rgba(255,255,255,0.055)' }}>
-      <span style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.8rem', marginBottom: '0.35rem' }}>
-        <span>{formatTime(displayed)}</span>
-        <span style={{ opacity: 0.65 }}>{formatTime(duration)}</span>
+      style={{ display: 'block', width: '100%', padding: '0.4rem 0.65rem', boxSizing: 'border-box', borderRadius: 5 }}>
+      <span style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.8rem',
+        fontVariantNumeric: 'tabular-nums', marginBottom: '0.15rem' }}>
+        <span>{formatVideoTime(displayed)}</span>
+        <span>{formatVideoTime(duration)}</span>
       </span>
       <span onClick={editing ? event => {
         // A physical pointer can set the preview anywhere along the track.
@@ -75,14 +107,19 @@ export function VideoScrubber({ position, duration, disabled, seek }: {
         const bounds = event.currentTarget.getBoundingClientRect();
         if (bounds.width) update(duration * (event.clientX - bounds.left) / bounds.width);
       } : undefined} style={{ display: 'block', paddingBlock: '0.3rem' }}>
-        <span style={{ display: 'block', height: 4, background: '#ffffff30', borderRadius: 3 }}>
-          <span style={{ display: 'block', position: 'relative', height: '100%', width: `${100 * displayed / duration}%`,
-            background: editing ? '#fff' : '#66c0f4', borderRadius: 3 }}>
-            <span style={{ position: 'absolute', right: -3, top: -2, width: 8, height: 8,
-              borderRadius: '50%', background: 'inherit' }} />
+        <span style={{ display: 'block', height: 4, background: 'var(--deckyplex-seek-rail)', borderRadius: 3 }}>
+          <span style={{ display: 'block', position: 'relative', height: '100%', width: `${percent}%`,
+            background: 'var(--deckyplex-seek-fill)', borderRadius: 3 }}>
+            <span style={{ position: 'absolute', right: -4, top: -2, width: 8, height: 8,
+              borderRadius: '50%', background: 'inherit', boxShadow: editing ? '0 0 0 2px currentColor' : undefined }} />
           </span>
         </span>
       </span>
     </Button>
+    {editing && thumbnail && thumbnail !== failedThumbnail && <img key={thumbnail} src={thumbnail} alt=""
+      onError={() => setFailedThumbnail(thumbnail)}
+      style={{ position: 'absolute', bottom: 'calc(100% + 0.45rem)', left: `clamp(80px, ${percent}%, 100% - 80px)`,
+        transform: 'translateX(-50%)', width: 'min(160px, 100%)', aspectRatio: '16 / 9', objectFit: 'contain',
+        background: '#0b0f15', border: '1px solid #556574', borderRadius: 5, pointerEvents: 'none' }} />}
   </div>;
 }

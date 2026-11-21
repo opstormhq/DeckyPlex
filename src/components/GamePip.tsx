@@ -1,7 +1,8 @@
 import { Component, useEffect, useSyncExternalStore, type ReactNode } from 'react';
 import { call, toaster } from '@decky/api';
-import { Router, findModuleExport } from '@decky/ui';
+import { Router, findModuleExport, getGamepadNavigationTrees, quickAccessMenuClasses } from '@decky/ui';
 import { insertNextEpisode, queueFromEpisode, resumePosition } from './VideoQueue';
+import { defaultPipPosition, getPipBounds, type PipPosition } from './PipPosition';
 
 type SteamWindow = NonNullable<typeof Router.WindowStore.GamepadUIMainWindowInstance>;
 type SteamView = ReturnType<SteamWindow['CreateBrowserView']>;
@@ -39,6 +40,7 @@ export interface VideoResume {
   quality: string;
   volume: number;
   muted: boolean;
+  mediaIndex?: number;
   episodes?: VideoItem[];
 }
 
@@ -50,12 +52,15 @@ interface Overlay {
   quality: string;
   volume: number;
   muted: boolean;
+  mediaIndex: number;
+  autoplay: boolean;
+  nextEpisodeAt?: number;
   steam: SteamWindow;
   view: SteamView;
   useComposition: CompositionHook;
   composed: boolean;
   bounds: string;
-  corner: string;
+  position: PipPosition;
   size: number;
   playback?: Playback;
   clock: number;
@@ -72,6 +77,7 @@ interface PipRequest {
   position: number;
   volume: number;
   muted: boolean;
+  mediaIndex?: number;
   episodes?: VideoItem[];
   preferredSource?: string;
   reuse?: { key: string; manifest: string };
@@ -85,6 +91,18 @@ let fullscreenRequest: VideoResume | null = null;
 const listeners = new Set<() => void>();
 export const gamePipFullscreenEvent = 'deckyplex-game-pip-fullscreen';
 export const videoProgressEvent = 'deckyplex-video-progress-change';
+export type VideoWatchState = { view_count?: number; view_offset?: number; collections?: Record<string, number> };
+export type VideoProgressUpdate = VideoWatchState & { itemId: string; serverId: string };
+
+export async function reportVideoProgress(itemId: string, serverId: string, position: number, duration: number,
+  state: 'playing' | 'paused' | 'stopped') {
+  const result = await call<[string, string, number, number, string], VideoWatchState | null>(
+    'report_video_progress', itemId, serverId, position, duration, state,
+  );
+  if (state === 'stopped') {
+    window.dispatchEvent(new CustomEvent<VideoProgressUpdate>(videoProgressEvent, { detail: { ...result, itemId, serverId } }));
+  }
+}
 
 function publish() {
   version++;
@@ -134,11 +152,7 @@ function report(current: Overlay, state: 'playing' | 'paused' | 'stopped') {
   const position = Math.round(playback.position * 1000);
   const duration = Math.round(playback.duration * 1000);
   const { item, serverId } = current;
-  current.timeline = current.timeline.then(() =>
-    call('report_video_progress', item.id, serverId, position, duration, state),
-  ).then(() => {
-    if (state === 'stopped') window.dispatchEvent(new Event(videoProgressEvent));
-  }).catch(() => {});
+  current.timeline = current.timeline.then(() => reportVideoProgress(item.id, serverId, position, duration, state)).catch(() => {});
 }
 
 export function stopGamePip() {
@@ -157,23 +171,64 @@ export function stopGamePip() {
   publish();
 }
 
+function quickAccessLeft(view: Window | undefined, screenWidth: number) {
+  if (!view) return undefined;
+  try {
+    const doc = view.document;
+    if (doc.hidden) return undefined;
+    const menuClass = quickAccessMenuClasses?.Menu;
+    const menus = [doc.getElementById('QuickAccess-Menu'), menuClass ? doc.getElementsByClassName(menuClass)[0] : undefined];
+    const displayWidth = view.screen?.width || screenWidth;
+    const viewportWidth = view.innerWidth || displayWidth;
+    for (const menu of menus) {
+      if (!menu) continue;
+      const { left, right, width } = menu.getBoundingClientRect();
+      if (!(width > 0)) continue;
+      if (left >= viewportWidth) return screenWidth;
+      const visibleWidth = Math.min(right, viewportWidth) - Math.max(0, left);
+      if (visibleWidth <= 0) continue;
+      // Separate tray windows have a local origin but still dock to the display's right edge.
+      const edge = viewportWidth >= displayWidth - 2 && left > 0
+        ? left * screenWidth / viewportWidth
+        : screenWidth - visibleWidth * screenWidth / displayWidth;
+      if (edge >= screenWidth * 0.1) return Math.floor(edge);
+    }
+  } catch {
+    // The focused Steam window can belong to a different browser view.
+  }
+  return undefined;
+}
+
 function updateBounds(current: Overlay, steam: SteamWindow) {
   const main = steam.BrowserWindow ?? window;
-  const width = main.screen.width || main.innerWidth;
-  const height = main.screen.height || main.innerHeight;
-  const size = Math.round(Math.min(width * current.size / 100, height * 0.96));
-  const videoHeight = Math.round(size * 9 / 16);
-  const margin = Math.round(width * 0.018);
-  if (!(size > 0)) throw new Error('Steam did not report the overlay display size.');
-  // Steam's Quick Access menu occupies the right edge. Return to the chosen corner when it closes.
+  const screenWidth = main.screen.width || main.innerWidth;
+  const screenHeight = main.screen.height || main.innerHeight;
   const focused = window.SteamUIStore?.GetFocusedWindowInstance?.();
+  // Decky locates Quick Access through this tree, including when the tray has its own window.
+  const tray = getGamepadNavigationTrees?.()?.find((tree: { id?: string }) => tree?.id === 'QuickAccess-NA');
+  const trayView: Window | undefined = tray?.m_Root?.m_element?.ownerDocument?.defaultView;
+  const trayWindow = trayView && Router.WindowStore?.GetWindowInstanceFromWindow?.(trayView);
   const quickAccessOpen = steam.MenuStore?.IsSideMenuVisible?.(steamQuickAccessMenu)
-    || focused?.MenuStore?.IsSideMenuVisible?.(steamQuickAccessMenu);
-  const x = current.corner.endsWith('right') && !quickAccessOpen ? width - size - margin : margin;
-  const y = current.corner.startsWith('top') ? margin : height - videoHeight - margin;
-  const bounds = `${x},${y},${size},${videoHeight}`;
+    || focused?.MenuStore?.IsSideMenuVisible?.(steamQuickAccessMenu)
+    || trayWindow?.MenuStore?.IsSideMenuVisible?.(steamQuickAccessMenu)
+    || (tray?.BIsActive?.() && !!trayView && !trayView.document.hidden);
+  let trayLeft: number | undefined;
+  if (quickAccessOpen) {
+    for (const view of new Set([trayView, focused?.BrowserWindow, main])) {
+      const edge = quickAccessLeft(view, screenWidth);
+      if (edge === undefined) continue;
+      trayLeft = edge;
+      if (edge < screenWidth) break;
+    }
+  }
+  // If the tray is visible but has no measurable panel, use the opposite side for right placements.
+  const position = quickAccessOpen && trayLeft === undefined && current.position.endsWith('right')
+    ? current.position.replace(/right$/, 'left') as PipPosition : current.position;
+  const { x, y, width, height } = getPipBounds(screenWidth, screenHeight, current.size, position, trayLeft);
+  if (!(width > 0 && height > 0)) throw new Error('Steam did not report the overlay display size.');
+  const bounds = `${x},${y},${width},${height}`;
   if (bounds !== current.bounds) {
-    current.view.GetBrowser().SetBounds(x, y, size, videoHeight);
+    current.view.GetBrowser().SetBounds(x, y, width, height);
     current.bounds = bounds;
   }
 }
@@ -194,8 +249,15 @@ function poll(current: Overlay) {
       if (next.status === 'ended') {
         const index = current.episodes.findIndex(episode => episode.id === current.item.id);
         const upcoming = index >= 0 ? current.episodes[index + 1] : undefined;
-        if (upcoming) void playGamePipEpisode(upcoming.id);
-        else stopGamePip();
+        if (!upcoming || !current.autoplay) stopGamePip();
+        else {
+          current.nextEpisodeAt ??= Date.now() + 5000;
+          if (current.nextEpisodeAt <= Date.now()) void playGamePipEpisode(upcoming.id);
+          else {
+            publish();
+            poll(current);
+          }
+        }
         return;
       }
       if (next.status === 'error') {
@@ -315,9 +377,9 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
   };
   try {
     checkActive();
-    const result = await call<unknown[], { id?: string; url?: string; error?: string; pip_position?: string; pip_size?: number }>(
+    const result = await call<unknown[], { id?: string; url?: string; error?: string; pip_position?: PipPosition; pip_size?: number; video_autoplay?: boolean }>(
       'start_game_pip', request.item.id, request.serverId, request.quality, request.position, request.volume, request.muted,
-      '', request.preferredSource || '', request.reuse ?? null,
+      '', request.preferredSource || '', request.reuse ?? null, request.mediaIndex ?? 0,
     );
     id = result?.id;
     checkActive();
@@ -331,7 +393,8 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
     const current: Overlay = {
       id, viewKey: id, steam, view, useComposition, item: request.item, serverId: request.serverId,
       quality: request.quality, volume: request.volume, muted: request.muted, episodes: request.episodes || [],
-      corner: result.pip_position ?? 'bottom-left', size: result.pip_size ?? 29,
+      mediaIndex: request.mediaIndex ?? 0, autoplay: result.video_autoplay !== false,
+      position: result.pip_position ?? defaultPipPosition, size: result.pip_size ?? 29,
       composed: false, bounds: '', busy: false, clock: 0, lastReport: 0, timeline: Promise.resolve(),
     };
     overlay = current;
@@ -416,6 +479,8 @@ export async function playGamePipEpisode(itemId: string) {
     report(current, 'stopped');
     current.id = result.id;
     current.item = item;
+    current.mediaIndex = 0;
+    current.nextEpisodeAt = undefined;
     current.playback = { status: 'waiting', position: initialPosition, duration };
     current.lastReport = 0;
     replaced = true;
@@ -447,7 +512,7 @@ export async function prepareGamePipFullscreen() {
   const playback = latest?.status === 'playing' || latest?.status === 'paused' ? latest : current.playback;
   fullscreenRequest = {
     item: current.item, serverId: current.serverId, position: playback.position, playing: playback.status === 'playing',
-    quality: current.quality, volume: current.volume, muted: current.muted, episodes: current.episodes,
+    quality: current.quality, volume: current.volume, muted: current.muted, episodes: current.episodes, mediaIndex: current.mediaIndex,
   };
   current.playback = playback;
   stopGamePip();
@@ -492,14 +557,14 @@ export function GamePipHost() {
   }, []);
   useEffect(() => {
     if (!current) return;
-    const refreshBounds = () => void call<[], { pip_position: string; pip_size: number }>('get_settings').then(settings => {
+    const refreshBounds = () => void call<[], { pip_position: PipPosition; pip_size: number; video_autoplay?: boolean }>('get_settings').then(settings => {
       if (overlay !== current) return;
-      current.corner = settings.pip_position;
+      current.position = settings.pip_position;
       current.size = settings.pip_size;
+      current.autoplay = settings.video_autoplay !== false;
       updateBounds(current, current.steam);
     }).catch(() => {});
     const timer = window.setInterval(() => {
-      if (!current.corner.endsWith('right')) return;
       try { updateBounds(current, current.steam); } catch { /* The next playback poll handles a closed Steam view. */ }
     }, 150);
     window.addEventListener('deckyplex-settings-change', refreshBounds);

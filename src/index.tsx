@@ -1,5 +1,5 @@
 import { definePlugin, routerHook } from '@decky/api';
-import { staticClasses, PanelSection, PanelSectionRow, ButtonItem, Navigation } from '@decky/ui';
+import { Navigation, Router } from '@decky/ui';
 import { FaMusic } from 'react-icons/fa';
 import { QuickPlayer } from './components/QuickPlayer';
 import { PlayerProvider, startLocalVolumeSession } from './context/PlayerContext';
@@ -10,7 +10,26 @@ import { preservePreferencesDuringUpdates } from './packagePreferences';
 
 const BROWSER_ROUTE = "/deckyplex-browser";
 const SETTINGS_ROUTE = "/deckyplex-settings";
+const LOGIN_ROUTE = "/deckyplex-settings/login";
 const GAME_PIP_HOST = "DeckyPlexGamePip";
+const pluginRoutes = [BROWSER_ROUTE, SETTINGS_ROUTE, LOGIN_ROUTE] as const;
+
+function openPluginPage(route: typeof pluginRoutes[number]) {
+  const steamWindow = window.SteamUIStore?.GetFocusedWindowInstance?.()
+    ?? Router?.WindowStore?.GamepadUIMainWindowInstance
+    ?? Router?.WindowStore?.SteamUIWindows?.[0];
+  const current = steamWindow?.m_locationPathname;
+  if (current !== route) {
+    if (typeof steamWindow?.Navigate === 'function') {
+      // Keep the Steam page underneath the plugin as the Back destination.
+      const replace = pluginRoutes.some(path => path === current);
+      steamWindow.Navigate(route, replace, false);
+    } else {
+      Navigation.Navigate(route);
+    }
+  }
+  Navigation.CloseSideMenus();
+}
 
 // Wrap fullscreen routes with PlayerProvider so usePlayer() works
 function BrowserPageWithProvider() {
@@ -21,12 +40,17 @@ function BrowserPageWithProvider() {
   );
 }
 
+function LoginPage() {
+  return <SettingsPage startLogin />;
+}
+
 export default definePlugin(() => {
   try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
   const stopPreservingPreferences = preservePreferencesDuringUpdates();
   const endLocalVolumeSession = startLocalVolumeSession();
   routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: true });
   routerHook.addRoute(SETTINGS_ROUTE, SettingsPage, { exact: true });
+  routerHook.addRoute(LOGIN_ROUTE, LoginPage, { exact: true });
   routerHook.addGlobalComponent(GAME_PIP_HOST, GamePipHost);
 
   return {
@@ -34,38 +58,17 @@ export default definePlugin(() => {
     // The playback engine receives Plex Companion commands even when the QAM is hidden.
     // Keep Decky's content tree alive so its frontend bridge remains available.
     alwaysRender: true,
-    titleView: <div className={staticClasses.Title}>DeckyPlex</div>,
     icon: <FaMusic />,
     content: (
       <PlayerProvider>
-        <QuickPlayer onLogin={() => {
-          Navigation.Navigate(SETTINGS_ROUTE);
-          Navigation.CloseSideMenus();
-        }} onBrowse={() => {
-          Navigation.Navigate(BROWSER_ROUTE);
-          Navigation.CloseSideMenus();
-        }} onExpandPip={() => {
+        <QuickPlayer onLogin={() => openPluginPage(LOGIN_ROUTE)} onBrowse={() => openPluginPage(BROWSER_ROUTE)}
+          onSettings={() => openPluginPage(SETTINGS_ROUTE)} onExpandPip={() => {
           void prepareGamePipFullscreen().then(prepared => {
             if (!prepared) return;
-            Navigation.Navigate(BROWSER_ROUTE);
-            Navigation.CloseSideMenus();
+            openPluginPage(BROWSER_ROUTE);
             window.requestAnimationFrame(() => window.dispatchEvent(new Event(gamePipFullscreenEvent)));
           });
-        }}>
-          <PanelSection>
-            <PanelSectionRow>
-              <ButtonItem
-                layout="below"
-                onClick={() => {
-                  Navigation.Navigate(SETTINGS_ROUTE);
-                  Navigation.CloseSideMenus();
-                }}
-              >
-                Settings
-              </ButtonItem>
-            </PanelSectionRow>
-          </PanelSection>
-        </QuickPlayer>
+        }} />
       </PlayerProvider>
     ),
     onDismount() {
@@ -75,6 +78,7 @@ export default definePlugin(() => {
       routerHook.removeGlobalComponent(GAME_PIP_HOST);
       routerHook.removeRoute(BROWSER_ROUTE);
       routerHook.removeRoute(SETTINGS_ROUTE);
+      routerHook.removeRoute(LOGIN_ROUTE);
     },
   };
 });
