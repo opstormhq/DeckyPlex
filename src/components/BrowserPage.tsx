@@ -34,7 +34,7 @@ import { musicBrowserCategories, videoCategories, visibleCategories,
   type BrowserLayouts, type MusicTab, type VideoTab } from './BrowserCategories';
 import { VideoOptionsDialog, type VideoAction, type VideoActionResult } from './VideoOptionsDialog';
 import { VideoWatchIndicator } from './VideoWatchIndicator';
-import { clearPausedVideo, resumePausedVideoEvent, takePausedVideo } from './VideoPlayback';
+import { clearPausedVideo, requestPausedVideo, resumePausedVideoEvent, takePausedVideo, updatePausedVideo, usePausedVideo } from './VideoPlayback';
 import { playNavigationSound, selectWithSound } from './GamepadSounds';
 import { retryPlexRead } from './PlexRead';
 
@@ -211,6 +211,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
   subViewRef.current = subView;
   const collectionRequest = useRef<{ key: string; episodes: Promise<VideoItem[]> } | null>(null);
   const [viewerItem, setViewerItem] = useState<LibraryItem | null>(null);
+  const pausedVideo = usePausedVideo();
+  const [viewerMinimized, setViewerMinimized] = useState(false);
+  const [viewerSession, setViewerSession] = useState(0);
   const [viewerResume, setViewerResume] = useState<VideoResume | null>(null);
   const [viewerPresentation, setViewerPresentation] = useState<VideoPresentation | null>(null);
   const [viewerStartPosition, setViewerStartPosition] = useState<number | undefined>();
@@ -221,11 +224,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
     latestViewerQueue.current = queue;
     setViewerQueueState(queue);
   }, []);
-  const viewerExpanded = !!viewerItem;
+  const viewerExpanded = !!viewerItem && !viewerMinimized;
   const combinedArtists = libraries.filter(library => library.type === 'artist').length > 1;
   const [history, setHistory] = useState<BrowserHistoryEntry[]>([]);
   const [gridColumns, setGridColumns] = useState(DEFAULT_GRID_COLUMNS);
   const [gridPreferenceSet, setGridPreferenceSet] = useState(false);
+  const [neverWrapCategories, setNeverWrapCategories] = useState(false);
   const [restoreFocusTick, setRestoreFocusTick] = useState(0);
   const itemCache = useRef(new Map<string, ItemCacheEntry>());
   const pendingItems = useRef(new Map<string, Promise<any>>());
@@ -453,6 +457,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
   const closeMedia = () => {
     setViewerItem(null);
+    setViewerMinimized(false);
     setViewerQueue(null);
     setViewerResume(null);
     setViewerPresentation(null);
@@ -501,6 +506,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       try {
         const result: any = await call("get_settings");
         if (!active || id !== requestId) return;
+        setNeverWrapCategories(result.browser_never_wrap_categories === true);
         const savedColumns = Number(result.grid_columns);
         const validColumns = Number.isInteger(savedColumns) && savedColumns >= 3 && savedColumns <= 9;
         setGridPreferenceSet(validColumns);
@@ -521,8 +527,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
         setHasPlexAccount(result.has_plex_token === true);
         setServerAddress(result.selected_server_url || '');
         setServerId(result.has_plex_token || result.local_server_enabled ? result.selected_server_id || '' : '');
-      } catch (e) {
-        if (active && id === requestId) setServerId('');
+      } catch {
+        // Keep the current server while a settings read is temporarily unavailable.
       } finally {
         if (active && id === requestId) setCheckingConnection(false);
       }
@@ -678,6 +684,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
   useEffect(() => {
     setViewerItem(null);
+    setViewerMinimized(false);
     setViewerQueue(null);
     setViewerResume(null);
     setViewerPresentation(null);
@@ -762,6 +769,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const restoreVideo = () => {
       const resume = takeGamePipFullscreen(serverId) ?? takePausedVideo(serverId);
       if (!resume) return;
+      setViewerMinimized(false);
+      setViewerSession(session => session + 1);
       viewerOrigin.current = { scrollTop: contentRef.current?.scrollTop || 0 };
       setViewerQueue(resume.episodes?.length ? resume.episodes : null);
       setViewerResume(resume);
@@ -1343,10 +1352,33 @@ const LibraryBrowser = memo(function LibraryBrowser({
   }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
 
   const openMedia = useCallback((item: LibraryItem, collectionQueue?: VideoItem[], startPosition?: number) => {
+    if (item.type === 'movie' && pausedVideo?.resume.serverId === serverId && pausedVideo.resume.item.id === item.id) {
+      const openPausedMovie = (position: number) => {
+        updatePausedVideo(resume => ({ ...resume, position }));
+        if (requestPausedVideo(true)) window.dispatchEvent(new Event(resumePausedVideoEvent));
+      };
+      const position = resumePosition(pausedVideo.resume.position * 1000, pausedVideo.duration * 1000, 1);
+      if (startPosition !== undefined || !position) {
+        openPausedMovie(startPosition ?? 0);
+      } else if (!actionDialogRef.current) {
+        actionDialogRef.current = showPlaybackStartDialog({
+          title: item.title,
+          actionTitle: 'Play movie',
+          position,
+          onClose: choice => {
+            actionDialogRef.current = null;
+            if (choice) openPausedMovie(choice === 'resume' ? position : 0);
+          },
+        });
+      }
+      return;
+    }
     if (item.type !== 'photo') {
       clearPausedVideo();
       stopGamePip();
     }
+    setViewerMinimized(false);
+    setViewerSession(session => session + 1);
     setViewerResume(null);
     setViewerPresentation(null);
     setViewerStartPosition(startPosition);
@@ -1356,7 +1388,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     viewerOrigin.current = { itemId: collectionQueue ? focusedItemId.current : item.id, scrollTop: contentRef.current?.scrollTop || 0,
       homeRow: !subView && activeTabRef.current === 'videoHome' ? focusedHomeRow.current : undefined };
     setViewerItem(item);
-  }, [items, subView?.mediaType]);
+  }, [items, pausedVideo, serverId, subView?.mediaType]);
 
   const patchVideoCards = useCallback((patch: (card: LibraryItem) => LibraryItem) => {
     const update = (cards: LibraryItem[]) => {
@@ -1701,6 +1733,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
+    if (target === playCollectionRef.current) {
+      hideAlphabetOverlay();
+      scrollContentToTop();
+    }
     focusForDirection(target, event);
   };
 
@@ -1961,6 +1997,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           )}
           {hasCollectionAction && subView && !loading && (
             <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef}
+              className="deckyplex-play-collection" noFocusRing
               onClick={videoCollection ? playVideoCollection : handlePlayCollection} onCancelButton={handleCancel}
               onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
               <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{videoCollection
@@ -2183,7 +2220,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
       event.stopImmediatePropagation();
       const destination = target?.isConnected ? target
         : button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active) ? firstItemRef.current : null;
-      if (destination && destination !== active) focusForDirection(destination, event);
+      if (destination && destination !== active) {
+        if (destination === playCollectionRef.current) {
+          hideAlphabetOverlay();
+          scrollContentToTop();
+        }
+        focusForDirection(destination, event);
+      }
     };
     let lastVerticalPress = -Infinity;
     const recordVerticalPress = (button: GamepadButton | undefined, repeat: boolean, target: EventTarget | null) => {
@@ -2263,7 +2306,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       endRepeat();
     };
   }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, openSortMenu, sortable, activeTab, sorting,
-    hideAlphabetOverlay, updateAlphabetOverlay]);
+    hideAlphabetOverlay, scrollContentToTop, updateAlphabetOverlay]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -2301,8 +2344,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
       <FocusOutlineStyles />
       <style>{`
         [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
+        .deckyplex-play-collection:is(.gpfocus, :focus) {
+          outline: 2px solid rgba(255, 255, 255, 0.6) !important;
+          outline-offset: -3px;
+        }
         [data-browser-zone="sidebar"] {
-          width: max-content; min-width: min(12rem, 24vw); max-width: min(17rem, 30vw);
+          width: max-content; max-width: min(17rem, 30vw);
         }
         [data-browser-alphabet]:not([hidden]) { display: grid; place-items: center; }
       `}</style>
@@ -2338,10 +2385,13 @@ const LibraryBrowser = memo(function LibraryBrowser({
               }}
               onActivate={event => selectWithSound(event, enterContent)}
               onClick={enterContent}
-              style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0.35rem 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px' }}
+              style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0.35rem 0.65rem', paddingInlineEnd: '1.825rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
-              <span style={{ fontWeight: 400, fontSize: '0.85rem', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{title}</span>
+              <span title={neverWrapCategories ? title : undefined} style={{ minWidth: 0, fontWeight: 400, fontSize: '0.85rem',
+                ...(neverWrapCategories
+                  ? { whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }
+                  : { whiteSpace: 'normal', overflowWrap: 'anywhere' }) }}>{title}</span>
               {tab === 'search' && connected && (
                 <span role="img" aria-label="Start button shortcut" title="Start button shortcut"
                   style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginLeft: 'auto',
@@ -2373,11 +2423,16 @@ const LibraryBrowser = memo(function LibraryBrowser({
   return (
     <>
       {browser}
-      {viewerItem && <MediaViewer key={viewerResume ? `${viewerItem.id}-resumed` : viewerItem.id} item={viewerItem}
+      {viewerItem && <MediaViewer key={`${viewerItem.id}:${viewerSession}`} item={viewerItem}
         subtitle={viewerItem.grandparentTitle || viewerItem.parentTitle}
         photo={viewerItem.type === 'photo'} initialVolume={localVolume} initialPlayback={viewerResume}
         initialPosition={viewerStartPosition}
         initialPresentation={viewerPresentation} close={closeMedia}
+        minimized={viewerMinimized} onMinimizedChange={(minimized, queue) => {
+          setViewerMinimized(minimized);
+          if (minimized) restoreBrowserFocus();
+          else if (queue) setViewerQueue(queue.length ? queue : null);
+        }}
         overGamePip={overGamePip} autoplay={videoAutoplay}
         episodes={episodes} episodeQueueReady={!!viewerQueue} playEpisode={playEpisode}
         removeEpisode={id => {

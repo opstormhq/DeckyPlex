@@ -41,6 +41,7 @@ interface Settings {
   verify_tls: boolean;
   grid_columns: number;
   browser_layouts: BrowserLayouts;
+  browser_never_wrap_categories: boolean;
   companion_receiver_enabled: boolean;
   companion_device_name: string;
   allow_signed_out_companion: boolean;
@@ -82,6 +83,7 @@ const DEFAULT_SETTINGS: Settings = {
   verify_tls: false,
   grid_columns: 0,
   browser_layouts: {},
+  browser_never_wrap_categories: false,
   companion_receiver_enabled: false,
   companion_device_name: 'DeckyPlex',
   allow_signed_out_companion: false,
@@ -518,7 +520,8 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   }, [saveSettings]);
 
   const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
-    | 'quick_player_native_style' | 'quick_player_compact_header' | 'over_game_pip' | 'video_autoplay'>(key: K, value: Settings[K]) => {
+    | 'quick_player_native_style' | 'quick_player_compact_header' | 'over_game_pip' | 'video_autoplay'
+    | 'browser_never_wrap_categories'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
     try {
@@ -923,6 +926,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     );
     return (
     <SettingsSection title="Library browser">
+      <SettingsRow>
+        <ToggleField label="Never wrap category names" description="Keep sidebar labels on one line."
+          checked={settings.browser_never_wrap_categories === true} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('browser_never_wrap_categories', enabled)} />
+      </SettingsRow>
       <SettingsRow>
         <SliderField
           label="Grid columns"

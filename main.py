@@ -57,6 +57,7 @@ DEFAULT_SETTINGS = {
     "selected_player_name": "",
     "grid_columns": 0,
     "browser_layouts": {},
+    "browser_never_wrap_categories": False,
     "library_selections": {},
     "video_quality": "auto",
     "video_autoplay": True,
@@ -2464,7 +2465,7 @@ class Plugin:
         try:
             merged = _load_settings()
             for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns",
-                        "volume",
+                        "volume", "browser_never_wrap_categories",
                         "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
                         "quick_player_maintain_x", "quick_player_show_idle", "quick_player_native_style",
@@ -2479,6 +2480,7 @@ class Plugin:
                 }
             merged["companion_receiver_enabled"] = bool(merged["companion_receiver_enabled"])
             merged["hide_quick_login"] = bool(merged["hide_quick_login"])
+            merged["browser_never_wrap_categories"] = merged["browser_never_wrap_categories"] is True
             merged["quick_player_maintain_x"] = bool(merged["quick_player_maintain_x"])
             merged["quick_player_show_idle"] = merged["quick_player_show_idle"] is not False
             merged["quick_player_native_style"] = merged["quick_player_native_style"] is True

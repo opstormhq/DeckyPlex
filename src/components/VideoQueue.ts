@@ -24,9 +24,9 @@ export function resumeEpisode(episodes: VideoItem[]) {
     ?? episodes[0];
 }
 
-export function resumePosition(offsetMs: number, durationMs: number) {
+export function resumePosition(offsetMs: number, durationMs: number, minimumSeconds = 30) {
   const seconds = offsetMs / 1000;
-  return seconds >= 30 && (!durationMs || seconds < durationMs / 1000 - 15) ? seconds : 0;
+  return seconds >= minimumSeconds && (!durationMs || seconds < durationMs / 1000 - 15) ? seconds : 0;
 }
 
 export function collectionResumes(episodes: VideoItem[]) {

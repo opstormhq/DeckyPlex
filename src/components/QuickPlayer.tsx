@@ -140,21 +140,24 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   const pip = useGamePipPlayback();
   const activeViewer = useViewerPlayback();
   const pausedVideo = usePausedVideo();
-  const viewer = activeViewer ?? (pausedVideo ? {
+  const pausedViewer = pausedVideo ? {
     item: pausedVideo.resume.item, episodes: pausedVideo.resume.episodes ?? [],
     playing: false, ready: true, position: pausedVideo.resume.position, duration: pausedVideo.duration,
-    volume: localVolume, busy: false, transferring: false, error: undefined, popOut: undefined,
-    toggle: () => onResumeVideo(true), expand: () => onResumeVideo(false), stop: clearPausedVideo,
+    volume: pausedVideo.resume.volume, busy: false, transferring: false, error: undefined, popOut: undefined,
+    toggle: () => onResumeVideo(true), expand: () => onResumeVideo(false),
+    stop: () => { clearPausedVideo(); activeViewer?.stop(); },
     seek: (position: number) => updatePausedVideo(resume => ({ ...resume, position })),
     setVolume: (volume: number) => updatePausedVideo(resume => ({ ...resume, volume, muted: volume > 0 ? false : resume.muted })),
     playEpisode: (id: string) => {
       const item = pausedVideo.resume.episodes?.find(episode => episode.id === id);
       if (!item) return;
-      updatePausedVideo(resume => ({ ...resume, item, position: 0 }));
+      updatePausedVideo(resume => ({ ...resume, item, position: 0, mediaIndex: 0, activeHls: undefined }));
       onResumeVideo(true);
     },
     removeEpisode: (id: string) => updatePausedVideo(resume => ({ ...resume, episodes: resume.episodes?.filter(episode => episode.id !== id) })),
-  } : null);
+  } : null;
+  const viewer = activeViewer?.error && pausedViewer?.item.id === activeViewer.item.id
+    ? pausedViewer : activeViewer ?? pausedViewer;
   const video = pip?.item ?? viewer?.item;
   const videoActive = !!video;
   const episodes = pip?.episodes ?? viewer?.episodes ?? [];
@@ -178,8 +181,10 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
 
   useEffect(() => {
     if (!pausedVideo || !settings) return;
-    if (!plexConnected || settings.selected_server_id !== pausedVideo.resume.serverId) clearPausedVideo();
-  }, [settings, pausedVideo, plexConnected]);
+    const disconnected = settings.has_plex_token === false && settings.local_server_enabled === false;
+    const changedServer = settings.selected_server_id && settings.selected_server_id !== pausedVideo.resume.serverId;
+    if (disconnected || changedServer) clearPausedVideo();
+  }, [settings, pausedVideo]);
 
   const playQueueEntry = (index: number) => {
     if (videoActive) {

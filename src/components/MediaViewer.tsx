@@ -9,19 +9,17 @@ import { MdPictureInPictureAlt } from 'react-icons/md';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
 import { showPlaybackStartDialog } from './PlaybackStartDialog';
-import { reportVideoProgress, startGamePip, type VideoItem, type VideoResume } from './GamePip';
-import { setViewerPlayback, suspendVideoPlayback } from './VideoPlayback';
+import { reportVideoProgress, startGamePip, type ActiveVideoHls, type VideoItem, type VideoResume } from './GamePip';
+import { finishPausedVideoResume, setViewerPlayback, suspendVideoPlayback } from './VideoPlayback';
 import { VideoScrubber } from './VideoScrubber';
 import { episodeLabel, resumePosition } from './VideoQueue';
 import { VideoPlayerOptions, type VideoChapter, type VideoMarker, type VideoOption, type VideoOptionPage } from './VideoPlayerOptions';
 
-interface MediaStream {
+interface MediaStream extends Partial<ActiveVideoHls> {
   kind: 'direct' | 'hls' | 'http' | 'image';
   url: string;
   mode?: 'audio-conversion' | 'direct-stream';
   fallback_url?: string;
-  manifest?: string;
-  handoff_key?: string;
 }
 
 interface MediaSource {
@@ -111,7 +109,7 @@ function plexHlsLoader(manifest: URL, proxy: boolean, localConnection: boolean, 
 }
 
 export function MediaViewer({
-  item, subtitle, photo, initialVolume, initialPlayback, initialPosition, initialPresentation, close, episodes, episodeQueueReady,
+  item, subtitle, photo, initialVolume, initialPlayback, initialPosition, initialPresentation, close, minimized, onMinimizedChange, episodes, episodeQueueReady,
   playEpisode, removeEpisode, onPlaying,
   overGamePip, autoplay = true,
 }: {
@@ -123,6 +121,8 @@ export function MediaViewer({
   initialPosition?: number;
   initialPresentation?: VideoPresentation | null;
   close: () => void;
+  minimized: boolean;
+  onMinimizedChange: (minimized: boolean, episodes?: VideoItem[]) => void;
   episodes: VideoItem[];
   episodeQueueReady: boolean;
   playEpisode: (itemId: string, presentation: VideoPresentation) => boolean;
@@ -155,9 +155,11 @@ export function MediaViewer({
   const versionAttempt = useRef<{ previous: number; position: number } | null>(null);
   const quickPlayerOwner = useRef(Symbol());
   const suspended = useRef(false);
+  const retainedStreamFailed = useRef(false);
   const playAfterLoad = useRef(initialPlayback?.playing ?? true);
   const currentPlayback = useRef({ time: 0, duration: 0, started: false, playing: false, ended: false });
   const timeline = useRef(Promise.resolve());
+  const reportPause = useRef(() => {});
   const handoff = useRef<AbortController | null>(null);
   const switchingEpisode = useRef(false);
   const startupRetried = useRef(false);
@@ -169,6 +171,8 @@ export function MediaViewer({
   onPlayingRef.current = onPlaying;
   const closeViewer = useRef(close);
   closeViewer.current = close;
+  const minimizedRef = useRef(minimized);
+  minimizedRef.current = minimized;
   const [media, setMedia] = useState<MediaSource | null>(null);
   const [playbackServerId, setPlaybackServerId] = useState(initialPlayback?.serverId ?? '');
   const [streamIndex, setStreamIndex] = useState(0);
@@ -218,7 +222,7 @@ export function MediaViewer({
   selectEpisodeRef.current = selectEpisode;
 
   const nextId = next?.id;
-  const showUpNext = !!(autoplay && ended && nextId && !pipLoading && !upNextCanceled && !optionsPage && !exitPromptOpen);
+  const showUpNext = !!(autoplay && ended && nextId && !minimized && !pipLoading && !upNextCanceled && !optionsPage && !exitPromptOpen);
   useEffect(() => {
     if (!showUpNext || !nextId || transferred.current) return;
     const deadline = Date.now() + 5000;
@@ -273,10 +277,11 @@ export function MediaViewer({
     qualityAttempt.current = null;
     const changedTrack = trackAttempt.current;
     if (retryable && !startupRetried.current && (!currentPlayback.current.started || changedTrack)
-        && (localServer || (item.type === 'episode' && initialPresentation))) {
+        && (localServer || initialPlayback || (item.type === 'episode' && initialPresentation))) {
       startupRetried.current = true;
       setRetryingStart(true);
-      log(workingQuality.current || 'auto', 'source', 'waiting', localServer ? 'retry-local-startup' : 'retry-episode-startup');
+      log(workingQuality.current || 'auto', 'source', 'waiting',
+        localServer ? 'retry-local-startup' : initialPlayback ? 'retry-resume-startup' : 'retry-episode-startup');
       retryTimer.current = window.setTimeout(reload, localServer ? 1000 : 500);
       return;
     }
@@ -306,13 +311,13 @@ export function MediaViewer({
     setRetryingStart(false);
     setLoading(false);
     setError(detail);
-  }, [initialPresentation, item.type, itemId, log, reload]);
+  }, [initialPlayback, initialPresentation, item.type, itemId, log, reload]);
 
   useEffect(() => () => window.clearTimeout(retryTimer.current), []);
 
   useEffect(() => {
     const viewer = viewerRef.current;
-    if (!fullscreen || !viewer) return;
+    if (!fullscreen || minimized || !viewer) return;
     let active = true;
     const showFullscreen = () => {
       if (!active || document.fullscreenElement === viewer || typeof viewer.showPopover !== 'function') return;
@@ -333,7 +338,7 @@ export function MediaViewer({
         viewer.removeAttribute('popover');
       }
     };
-  }, [fullscreen]);
+  }, [fullscreen, minimized]);
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -355,6 +360,7 @@ export function MediaViewer({
         ownedFullscreen = true;
       } else if (ownedFullscreen) {
         ownedFullscreen = false;
+        if (minimizedRef.current) return;
         restoreControlsFocus.current = true;
         setFullscreen(false);
         setControlsHidden(false);
@@ -368,6 +374,7 @@ export function MediaViewer({
   }, []);
 
   useEffect(() => {
+    if (minimized) return;
     const frame = window.requestAnimationFrame(() => {
       if (exitPromptOpen) pauseChoiceRef.current?.focus({ preventScroll: true });
       else if (controlsHidden) hiddenControlsRef.current?.focus({ preventScroll: true });
@@ -377,7 +384,7 @@ export function MediaViewer({
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [controlsHidden, fullscreen, exitPromptOpen]);
+  }, [controlsHidden, fullscreen, exitPromptOpen, minimized]);
 
   useEffect(() => {
     let active = true;
@@ -402,16 +409,26 @@ export function MediaViewer({
       .then(result => {
         if (!active) return;
         if (!result?.streams?.length) throw new Error('Plex could not prepare this item for playback.');
-        if (firstSource.current && result.local_connection && initialPlayback?.activePipStream) {
-          result = { ...result, streams: [{ kind: 'hls', ...initialPlayback.activePipStream }, ...result.streams] };
+        const activeHls = firstSource.current ? initialPlayback?.activeHls : undefined;
+        if (activeHls && result.server_id === initialPlayback?.serverId && result.quality === initialPlayback?.quality) {
+          const saved = new URL(activeHls.url);
+          const sameConnection = result.streams.some(candidate => {
+            if (candidate.kind !== 'hls') return false;
+            const fresh = new URL(candidate.url);
+            return saved.origin === fresh.origin
+              && saved.searchParams.get('X-Plex-Token') === fresh.searchParams.get('X-Plex-Token');
+          });
+          if (sameConnection) result = { ...result, streams: [{ kind: 'hls', ...activeHls }, ...result.streams] };
         }
         const offerMovieResume = firstSource.current && item.type === 'movie' && !initialPlayback
           && initialPosition === undefined;
-        const savedPosition = offerMovieResume ? resumePosition(result.resume_ms || 0, result.duration_ms || 0) : 0;
+        const savedPosition = offerMovieResume
+          ? resumePosition(result.resume_ms ?? item.viewOffset ?? 0, result.duration_ms || item.duration || 0, 1) : 0;
         if (!savedPosition) {
           applySource(result);
           return;
         }
+        log(result.quality || 'auto', 'source', 'waiting', 'movie-start-choice');
         startDialog = showPlaybackStartDialog({
           title,
           actionTitle: 'Play movie',
@@ -432,7 +449,7 @@ export function MediaViewer({
       active = false;
       startDialog?.Close();
     };
-  }, [itemId, item.type, title, photo, retryCount, requestedQuality, mediaIndex, initialPlayback, initialPosition, failPlayback, log]);
+  }, [itemId, item.type, item.duration, item.viewOffset, title, photo, retryCount, requestedQuality, mediaIndex, initialPlayback, initialPosition, failPlayback, log]);
 
   useEffect(() => {
     if (photo || !playbackServerId) return;
@@ -444,14 +461,14 @@ export function MediaViewer({
   }, [itemId, playbackServerId, photo]);
 
   useEffect(() => {
-    if (!stream) return;
+    if (!stream || minimized) return;
     const frame = window.requestAnimationFrame(() => {
       if (document.activeElement === closeRef.current || document.activeElement === document.body) {
         playRef.current?.focus();
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [stream]);
+  }, [stream, minimized]);
 
   useEffect(() => {
     if (photo || !playbackServerId) return;
@@ -466,6 +483,7 @@ export function MediaViewer({
       if (currentPlayback.current.playing) report('playing');
     }, 10000);
     const video = videoRef.current;
+    reportPause.current = () => report('paused');
     const onPause = () => { if (!suspended.current) report('paused'); };
     const onEnded = () => {
       currentPlayback.current.time = currentPlayback.current.duration || currentPlayback.current.time;
@@ -478,7 +496,8 @@ export function MediaViewer({
       window.clearInterval(timer);
       video?.removeEventListener('pause', onPause);
       video?.removeEventListener('ended', onEnded);
-      report(suspended.current ? 'paused' : 'stopped');
+      reportPause.current = () => {};
+      if (!suspended.current) report('stopped');
     };
   }, [itemId, playbackServerId, photo]);
 
@@ -509,6 +528,10 @@ export function MediaViewer({
       if (!active || failed) return;
       failed = true;
       log(quality, source, 'failed', code);
+      if (minimizedRef.current) {
+        retainedStreamFailed.current = true;
+        return;
+      }
       failedStreams.current.push(detail);
       hadNetworkFailure.current ||= network;
       offset.current = succeeded ? video.currentTime || initialPosition : initialPosition;
@@ -576,6 +599,7 @@ export function MediaViewer({
       succeeded = true;
       window.clearTimeout(timeout);
       setLoading(false);
+      if (initialPlayback) finishPausedVideoResume(initialPlayback);
       setRetryingStart(false);
       trackAttempt.current = null;
       workingQuality.current = quality;
@@ -613,7 +637,7 @@ export function MediaViewer({
         hls = new Hls({
           enableWorker: false,
           startPosition: initialPosition,
-          loader: plexHlsLoader(manifest, proxyHls, media?.local_connection === true, stream.manifest, text => {
+          loader: plexHlsLoader(manifest, proxyHls || stream.proxy === true, media?.local_connection === true, stream.manifest, text => {
             if (active) handoffManifest.current = text;
           }),
         });
@@ -662,7 +686,7 @@ export function MediaViewer({
       video.removeAttribute('src');
       video.load();
     };
-  }, [photo, media, stream, streamIndex, proxyHls, sourceName, requestedQuality, log, failPlayback]);
+  }, [photo, media, stream, streamIndex, proxyHls, sourceName, requestedQuality, initialPlayback, log, failPlayback]);
 
   useEffect(() => {
     if (!videoRef.current) return;
@@ -785,6 +809,17 @@ export function MediaViewer({
     setControlsHidden(true);
   };
 
+  const activeHlsStream = (): ActiveVideoHls | undefined => {
+    const key = stream?.handoff_key ?? media?.handoff_key;
+    const manifest = handoffManifest.current;
+    if (stream?.kind !== 'hls' || !key || !manifest) return;
+    return {
+      url: (proxyHls && stream.fallback_url) || stream.url, manifest, handoff_key: key,
+      proxy: proxyHls || stream.proxy,
+      handoff_source: stream.handoff_source ?? (stream.manifest ? 'hls' : sourceName),
+    };
+  };
+
   const playOverGame = async (fromQuickPlayer = false) => {
     const video = videoRef.current;
     if (!overGamePip || !video || !media?.server_id || handoff.current || loading || error) return;
@@ -793,13 +828,12 @@ export function MediaViewer({
     const attempt = new AbortController();
     handoff.current = attempt;
     try {
-      const handoffKey = stream?.handoff_key ?? media.handoff_key;
-      const reuse = stream?.kind === 'hls' && handoffKey && handoffManifest.current
-        ? { key: handoffKey, manifest: handoffManifest.current } : undefined;
+      const activeHls = activeHlsStream();
+      const reuse = activeHls ? { key: activeHls.handoff_key, manifest: activeHls.manifest } : undefined;
       await startGamePip({
         item, serverId: media.server_id, quality: media.quality || 'auto',
         position: video.currentTime, volume, muted, episodes: episodeQueueReady ? episodes : undefined,
-        preferredSource: stream?.manifest ? 'hls' : sourceName, mediaIndex,
+        preferredSource: activeHls?.handoff_source ?? sourceName, mediaIndex,
         reuse,
       }, attempt.signal, () => ({ position: video.currentTime, playing: !video.paused && !video.ended }));
       if (attempt.signal.aborted) return;
@@ -818,8 +852,42 @@ export function MediaViewer({
     }
   };
 
-  const promptOnBack = fullscreen && !photo && playing && !pipLoading;
+  const promptOnBack = fullscreen && !photo && !!stream && !loading && !error && !ended && !pipLoading;
+  const pauseToQuickPlayer = () => {
+    if (!suspendVideoPlayback({
+      restore: resume => {
+        const video = videoRef.current;
+        if (!viewerRef.current || !video || video.error || !video.readyState || retainedStreamFailed.current
+          || resume.item.id !== itemId || resume.mediaIndex !== mediaIndex) return false;
+        if (Math.abs(video.currentTime - resume.position) > 0.1) video.currentTime = resume.position;
+        suspended.current = false;
+        playAfterLoad.current = resume.playing;
+        currentPlayback.current.time = resume.position;
+        setPosition(resume.position);
+        setVolume(resume.volume);
+        setMuted(resume.muted);
+        setFullscreen(true);
+        setControlsHidden(resume.playing);
+        restoreControlsFocus.current = !resume.playing;
+        onMinimizedChange(false, resume.episodes);
+        if (resume.playing) void video.play().catch(revealControls);
+        log(resume.quality, 'source', 'ready', 'resumed-retained-viewer');
+        return true;
+      },
+      discard: () => {
+        if (!viewerRef.current) return;
+        suspended.current = false;
+        closeViewer.current();
+      },
+    })) return;
+    setExitPromptOpen(false);
+    retainedStreamFailed.current = false;
+    log(media?.quality || 'auto', 'source', 'ready', 'paused-in-quick-player');
+    onMinimizedChange(true);
+    if (document.fullscreenElement === viewerRef.current) void document.exitFullscreen().catch(() => {});
+  };
   const handleBack = (event: Event) => {
+    if (minimized) return;
     if (!exitPromptOpen && document.activeElement?.closest('[data-video-scrubbing]')) return;
     event.preventDefault();
     event.stopImmediatePropagation();
@@ -829,7 +897,10 @@ export function MediaViewer({
       setExitPromptOpen(false);
     } else if (optionsPage) backFromOptions();
     else if (showUpNext) cancelUpNext();
-    else if (promptOnBack) setExitPromptOpen(true);
+    else if (promptOnBack) {
+      if (controlsHidden) setExitPromptOpen(true);
+      else setControlsHidden(true);
+    }
     else if (controlsHidden) revealControls();
     else if (fullscreen && photo) leaveFullscreen();
     else close();
@@ -864,7 +935,7 @@ export function MediaViewer({
   ].filter((line): line is string => !!line);
 
   useEffect(() => {
-    if (!fullscreen || photo || !playing || loading || controlsHidden || optionsPage || showUpNext || pipLoading || exitPromptOpen) return;
+    if (!fullscreen || minimized || photo || !playing || loading || controlsHidden || optionsPage || showUpNext || pipLoading || exitPromptOpen) return;
     const viewer = viewerRef.current;
     if (!viewer) return;
     lastInteraction.current = Date.now();
@@ -878,7 +949,7 @@ export function MediaViewer({
       }
     }, 250);
     return () => window.clearInterval(timer);
-  }, [fullscreen, photo, playing, loading, controlsHidden, optionsPage, showUpNext, pipLoading, exitPromptOpen]);
+  }, [fullscreen, minimized, photo, playing, loading, controlsHidden, optionsPage, showUpNext, pipLoading, exitPromptOpen]);
 
   useEffect(() => {
     const viewer = viewerRef.current;
@@ -912,14 +983,18 @@ export function MediaViewer({
   }, [controlsHidden, showUpNext, activeMarker, exitPromptOpen, promptOnBack]);
 
   useEffect(() => {
-    if (!controlsHidden || showUpNext || exitPromptOpen) return;
+    if (!controlsHidden || minimized || showUpNext || exitPromptOpen) return;
     const document = viewerRef.current?.ownerDocument;
     if (activeMarker && document?.activeElement === hiddenControlsRef.current) skipMarkerRef.current?.focus({ preventScroll: true });
     else if (!activeMarker && document?.activeElement === document?.body) hiddenControlsRef.current?.focus({ preventScroll: true });
-  }, [activeMarker, controlsHidden, showUpNext, exitPromptOpen]);
+  }, [activeMarker, controlsHidden, minimized, showUpNext, exitPromptOpen]);
 
   useEffect(() => {
     if (photo || transferred.current) return;
+    if (minimized) {
+      setViewerPlayback(quickPlayerOwner.current, null);
+      return;
+    }
     setViewerPlayback(quickPlayerOwner.current, {
       item, episodes, playing, busy: loading || buffering || pipLoading, transferring: pipLoading, ready: canControl, error, position, duration, volume,
       toggle: togglePlayback, seek,
@@ -927,17 +1002,25 @@ export function MediaViewer({
         setVolume(value);
         if (value > 0) setMuted(false);
       },
-      stop: close, playEpisode: selectEpisode, removeEpisode,
+      stop: () => {
+        if (initialPlayback) finishPausedVideoResume(initialPlayback);
+        close();
+      },
+      playEpisode: selectEpisode, removeEpisode,
       suspend: () => {
         if (!playbackServerId || handoff.current) return null;
         const video = videoRef.current;
-        const savedPosition = currentPlayback.current.started && video ? video.currentTime : offset.current;
+        const savedPosition = video && (currentPlayback.current.started || canControl) ? video.currentTime : offset.current;
         suspended.current = true;
         currentPlayback.current.time = savedPosition;
+        currentPlayback.current.playing = false;
         playAfterLoad.current = false;
         video?.pause();
+        setPlaying(false);
+        reportPause.current();
         return { item, episodes, serverId: playbackServerId, playing: false, position: savedPosition,
-          quality: requestedQuality || media?.quality || 'auto', volume, muted, mediaIndex };
+          quality: requestedQuality || media?.quality || 'auto', volume, muted, mediaIndex,
+          activeHls: !loading && !error ? activeHlsStream() : undefined };
       },
       popOut: overGamePip ? () => playOverGame(true) : undefined,
       expand: !fullscreen ? () => {
@@ -948,12 +1031,13 @@ export function MediaViewer({
   });
 
   return (
-    <Focusable ref={viewerRef} flow-children="geometric" onCancel={handleBack}
+    <Focusable ref={viewerRef} flow-children="geometric" onCancel={handleBack} inert={minimized}
+      onCancelActionDescription={!controlsHidden && promptOnBack && !optionsPage && !showUpNext ? 'Hide controls' : undefined}
       style={{ ...(fullscreen
         ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', zIndex: 1000,
             margin: 0, padding: 0, border: 0, maxWidth: 'none', maxHeight: 'none' }
         : { position: 'relative', width: '100%', height: 'calc(100% - 40px)', marginTop: '40px' }),
-        background: '#000', color: '#f3f6fa', overflow: 'hidden' }}>
+        display: minimized ? 'none' : undefined, background: '#000', color: '#f3f6fa', overflow: 'hidden' }}>
       <style>{`
         .deckyplex-video-control,
         .deckyplex-video-control::before,
@@ -1124,7 +1208,7 @@ export function MediaViewer({
           <ChoiceDialogBody title="Leave full screen">
             <ChoiceDialogList>
               <ChoiceDialogRow title="Pause playback" detail="Resume from the Quick Player" preferredFocus rowRef={pauseChoiceRef}
-                icon={<FaPause />} onChoose={() => { if (suspendVideoPlayback()) close(); }} />
+                icon={<FaPause />} onChoose={pauseToQuickPlayer} />
               <ChoiceDialogRow title="Stop playback" icon={<FaStop />} destructive onChoose={close} />
             </ChoiceDialogList>
           </ChoiceDialogBody>

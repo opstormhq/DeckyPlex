@@ -32,7 +32,13 @@ export interface VideoItem {
   grandparentTitle?: string;
 }
 
-export type ActivePipStream = { url: string; manifest: string; handoff_key: string };
+export type ActiveVideoHls = {
+  url: string;
+  manifest: string;
+  handoff_key: string;
+  proxy?: boolean;
+  handoff_source?: string;
+};
 
 export interface VideoResume {
   item: VideoItem;
@@ -44,7 +50,7 @@ export interface VideoResume {
   muted: boolean;
   mediaIndex?: number;
   episodes?: VideoItem[];
-  activePipStream?: ActivePipStream;
+  activeHls?: ActiveVideoHls;
 }
 
 interface Overlay {
@@ -516,16 +522,16 @@ export async function prepareGamePipFullscreen() {
   current.busy = true;
   window.clearTimeout(current.clock);
   publish();
-  const [latest, activePipStream] = await Promise.all([
+  const [latest, activeHls] = await Promise.all([
     getStatus(current.id).catch(() => null),
-    call<[string], ActivePipStream | null>('get_game_pip_resume_stream', current.id).catch(() => null),
+    call<[string], ActiveVideoHls | null>('get_game_pip_resume_stream', current.id).catch(() => null),
   ]);
   if (overlay !== current) return false;
   const playback = latest?.status === 'playing' || latest?.status === 'paused' ? latest : current.playback;
   fullscreenRequest = {
     item: current.item, serverId: current.serverId, position: playback.position, playing: playback.status === 'playing',
     quality: current.quality, volume: current.volume, muted: current.muted, episodes: current.episodes, mediaIndex: current.mediaIndex,
-    activePipStream: activePipStream ?? undefined,
+    activeHls: activeHls ?? undefined,
   };
   current.playback = playback;
   stopGamePip();

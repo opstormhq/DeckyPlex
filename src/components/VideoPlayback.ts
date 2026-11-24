@@ -24,7 +24,8 @@ export interface ViewerPlayback {
 }
 
 let viewer: { owner: symbol; playback: ViewerPlayback } | null = null;
-let pausedVideo: { resume: VideoResume; duration: number } | null = null;
+type PausedViewer = { restore: (resume: VideoResume) => boolean; discard: () => void };
+let pausedVideo: { resume: VideoResume; duration: number; viewer?: PausedViewer } | null = null;
 let resumeRequested = false;
 const listeners = new Set<() => void>();
 export const resumePausedVideoEvent = 'deckyplex-resume-paused-video';
@@ -39,12 +40,13 @@ export function setViewerPlayback(owner: symbol, playback: ViewerPlayback | null
   publish();
 }
 
-export function suspendVideoPlayback() {
+export function suspendVideoPlayback(retainedViewer?: PausedViewer) {
   const active = viewer?.playback;
   const resume = active?.suspend();
   if (!active || !resume) return false;
-  pausedVideo = { resume, duration: active.duration };
+  pausedVideo = { resume, duration: active.duration, viewer: retainedViewer };
   resumeRequested = false;
+  if (retainedViewer) viewer = null;
   publish();
   return true;
 }
@@ -57,8 +59,10 @@ export function updatePausedVideo(update: (resume: VideoResume) => VideoResume) 
 
 export function clearPausedVideo() {
   if (!pausedVideo) return;
+  const retainedViewer = pausedVideo.viewer;
   pausedVideo = null;
   resumeRequested = false;
+  retainedViewer?.discard();
   publish();
 }
 
@@ -71,9 +75,20 @@ export function requestPausedVideo(playing: boolean) {
 
 export function takePausedVideo(serverId: string) {
   if (!resumeRequested || pausedVideo?.resume.serverId !== serverId) return null;
-  const resume = pausedVideo.resume;
-  clearPausedVideo();
+  const { resume, viewer } = pausedVideo;
+  resumeRequested = false;
+  if (viewer?.restore(resume)) {
+    pausedVideo = null;
+    publish();
+    return null;
+  }
+  pausedVideo = { ...pausedVideo, viewer: undefined };
+  publish();
   return resume;
+}
+
+export function finishPausedVideoResume(resume: VideoResume) {
+  if (pausedVideo?.resume === resume) clearPausedVideo();
 }
 
 function subscribe(listener: () => void) {
