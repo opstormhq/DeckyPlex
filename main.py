@@ -49,6 +49,7 @@ DEFAULT_SETTINGS = {
     "plexamp_url": "",
     "plex_server_url": "",
     "plex_token": "",
+    "local_server_enabled": False,
     "selected_server_id": "",
     "selected_server_name": "",
     "selected_server_url": "",
@@ -77,6 +78,8 @@ DEFAULT_SETTINGS = {
     "hide_quick_login": False,
     "quick_player_maintain_x": False,
     "quick_player_show_idle": True,
+    "quick_player_native_style": False,
+    "quick_player_compact_header": True,
 }
 
 LIBRARY_TYPES = ("artist", "movie", "show", "photo")
@@ -262,6 +265,7 @@ def _manual_server_url(settings):
 
 def _server_settings(server, account_token):
     return {
+        "local_server_enabled": False,
         "selected_server_id": server["id"],
         "selected_server_name": server.get("name", ""),
         "selected_server_url": server.get("base_url", ""),
@@ -806,13 +810,14 @@ class PlexHTTP:
     """Small Decky-facing adapter around the bundled python-plexapi SDK."""
 
     def __init__(self, base_url: str, token: str, timeout: int = 8, verify_tls: bool = False,
-                 account_token: str = "", *, connected_server=None):
+                 account_token: str = "", *, connected_server=None, local_connection: bool = False):
         import requests
         from plexapi.server import PlexServer
 
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.account_token = account_token or token
+        self.local_connection = local_connection
         self.timeout = timeout
         self.session = connected_server._session if connected_server is not None else requests.Session()
         if connected_server is None:
@@ -824,19 +829,29 @@ class PlexHTTP:
         self._remote_timeline_track = {}
         self._remote_timeline_track_key = None
         self._remote_metadata_servers = {}
+        if local_connection:
+            class LocalPlexServer(PlexServer):
+                def query(self, *args, **kwargs):
+                    # PlexAPI falls back to its configured token before the initial request.
+                    self._token = None
+                    return super().query(*args, **kwargs)
+
+            self.session.trust_env = False
+            PlexServer = LocalPlexServer
         self.sdk = (connected_server if connected_server is not None
                     else PlexServer(self.base_url, token, session=self.session, timeout=timeout))
         self._account = None
 
     @property
     def account(self):
+        if not self.account_token:
+            raise ValueError("Sign in to Plex to use account features.")
         if self._account is None:
             from plexapi.myplex import MyPlexAccount
             self._account = MyPlexAccount(token=self.account_token, session=self.session, timeout=self.timeout)
         return self._account
 
-    @staticmethod
-    def _item_dict(item: Any, *, from_listing: bool = False) -> Dict[str, Any]:
+    def _item_dict(self, item: Any, *, from_listing: bool = False) -> Dict[str, Any]:
         from plexapi.base import PlexPartialObject
 
         if from_listing and isinstance(item, PlexPartialObject):
@@ -883,14 +898,15 @@ class PlexHTTP:
             "summary": attr("summary"), "year": attr("year"),
             "index": attr("index"), "parentIndex": attr("parentIndex"), "parentTitle": attr("parentTitle"),
             "grandparentTitle": attr("grandparentTitle"),
-            "leafCount": attr("leafCount", 0), "viewCount": attr("viewCount", 0),
-            "viewOffset": attr("viewOffset", 0),
+            "leafCount": attr("leafCount", 0),
+            "viewCount": 0 if self.local_connection else attr("viewCount", 0),
+            "viewOffset": 0 if self.local_connection else attr("viewOffset", 0),
             "duration": attr("duration", 0), "sectionId": str(attr("librarySectionID", "") or ""),
         }
         if item_type in ("show", "season"):
-            result["viewedLeafCount"] = attr("viewedLeafCount", None)
+            result["viewedLeafCount"] = None if self.local_connection else attr("viewedLeafCount", None)
         if item_type in ("movie", "show", "season", "episode"):
-            result["userRating"] = attr("userRating", None)
+            result["userRating"] = None if self.local_connection else attr("userRating", None)
         if item_type == "episode":
             # The SDK can fetch the season if its ID is absent. Use IDs already in the listing.
             result["parentId"] = str(vars(item).get("_parentRatingKey") or "")
@@ -909,46 +925,48 @@ class PlexHTTP:
             result["gridPoster"] = thumbnail(poster_path, 480)
         return result
 
-    def _discover_lan_deckyplex(self, refresh: bool = False) -> Dict[str, Dict[str, str]]:
+    @staticmethod
+    def _scan_lan_players(own_id: str, *, include_other: bool = False) -> Dict[str, Dict[str, str]]:
         from plexapi.gdm import GDM
 
+        players = {}
+        for entry in GDM().all(scan_for_clients=True):
+            data = entry["data"]
+            machine_id = data.get("Resource-Identifier", "")
+            product = data.get("Product", "")
+            if (not machine_id or machine_id == own_id or (not include_other and product != "DeckyPlex")
+                    or data.get("Content-Type") != "plex/media-player"
+                    or "playback" not in data.get("Protocol-Capabilities", "").split(",")):
+                continue
+            try:
+                address = ipaddress.IPv4Address(entry["from"][0])
+                port = int(data.get("Port", ""))
+            except ValueError:
+                continue
+            if (not address.is_private or address.is_unspecified or address.is_reserved
+                    or not 1 <= port <= 65535):
+                continue
+            players[machine_id] = {
+                "title": data.get("Name") or product or "Plex player",
+                "product": product, "platform": "SteamOS" if product == "DeckyPlex" else "",
+                "machineIdentifier": machine_id, "key": machine_id,
+                "url": f"http://{address}:{port}",
+            }
+        return players
+
+    def _discover_lan_players(self, refresh: bool = False) -> Dict[str, Dict[str, str]]:
         with self._lan_player_scan_lock:
             if not refresh and time.monotonic() < self._lan_player_scan_until:
                 return self._lan_players
-            own_id = _load_settings()["companion_id"]
-            players = {}
+            self._lan_player_scan_until = time.monotonic() + 15
             try:
-                entries = GDM().all(scan_for_clients=True)
+                self._lan_players = self._scan_lan_players(_load_settings()["companion_id"],
+                                                           include_other=self.local_connection)
             except (OSError, ValueError) as error:
                 logger.debug("Local Plex player discovery failed (%s)", _plex_error_code(error))
-                return self._lan_players
-            finally:
-                self._lan_player_scan_until = time.monotonic() + 15
-            for entry in entries:
-                data = entry["data"]
-                machine_id = data.get("Resource-Identifier", "")
-                if (not machine_id or machine_id == own_id or data.get("Product") != "DeckyPlex"
-                        or data.get("Content-Type") != "plex/media-player"
-                        or "playback" not in data.get("Protocol-Capabilities", "").split(",")):
-                    continue
-                try:
-                    address = ipaddress.IPv4Address(entry["from"][0])
-                    port = int(data.get("Port", ""))
-                except ValueError:
-                    continue
-                if (not address.is_private or address.is_unspecified or address.is_reserved
-                        or not 1 <= port <= 65535):
-                    continue
-                players[machine_id] = {
-                    "title": data.get("Name") or "DeckyPlex",
-                    "product": "DeckyPlex", "platform": "SteamOS",
-                    "machineIdentifier": machine_id, "key": machine_id,
-                    "url": f"http://{address}:{port}",
-                }
-            self._lan_players = players
-            return players
+            return self._lan_players
 
-    def _connect_lan_deckyplex(self, machine_id: str, refused_url: str = ""):
+    def _connect_lan_player(self, machine_id: str, refused_url: str = ""):
         import requests
         from plexapi.client import PlexClient
 
@@ -970,7 +988,8 @@ class PlexHTTP:
         session.max_redirects = 0
         try:
             client = PlexClient(baseurl=url, identifier=machine_id, session=session, timeout=2)
-            if client.product == "DeckyPlex" and "playback" in client.protocolCapabilities:
+            if (client.machineIdentifier == machine_id and (self.local_connection or client.product == "DeckyPlex")
+                    and "playback" in client.protocolCapabilities):
                 return client
         except Exception as error:
             logger.debug("Could not reach local DeckyPlex receiver (%s)", _plex_error_code(error))
@@ -1044,7 +1063,7 @@ class PlexHTTP:
                 }
         except Exception as e:
             logger.debug("Could not discover registered Plex devices: %s", e)
-        for machine_id, peer in self._discover_lan_deckyplex(refresh=True).items():
+        for machine_id, peer in self._discover_lan_players(refresh=True).items():
             session = sessions.get(machine_id)
             players[machine_id] = {key: value for key, value in peer.items() if key != "url"}
             players[machine_id].update(state=getattr(session, "state", "idle") or "idle", available=True)
@@ -1078,7 +1097,7 @@ class PlexHTTP:
         if usable(client):
             return client
         lan_url = self._lan_players.get(machine_id, {}).get("url")
-        client = self._connect_lan_deckyplex(machine_id, refused_url)
+        client = self._connect_lan_player(machine_id, refused_url)
         if client is None:
             try:
                 client = next((c for c in self.sdk.clients() if c.machineIdentifier == machine_id and usable(c)), None)
@@ -1100,9 +1119,9 @@ class PlexHTTP:
             except Exception as e:
                 logger.debug("Could not connect to Plex player resource %s: %s", machine_id, _plex_error_code(e))
         if not usable(client):
-            players = self._discover_lan_deckyplex(refresh=bool(refused_url))
+            players = self._discover_lan_players(refresh=bool(refused_url))
             if players.get(machine_id, {}).get("url") != lan_url:
-                client = self._connect_lan_deckyplex(machine_id, refused_url)
+                client = self._connect_lan_player(machine_id, refused_url)
         if not usable(client):
             raise RemotePlaybackError("Could not connect to the selected player. Open it and try again.")
         self._remote_client_cache[machine_id] = client
@@ -1735,7 +1754,8 @@ class PlexHTTP:
                                      videoResolution=(resolution or "") if not copy_video else "",
                                      maxVideoBitrate=bitrate if not copy_video else None,
                                      videoBitrate=bitrate if not copy_video else None,
-                                     transcodeSessionId=session_id,
+                                     # Older PMS releases use the session parameter sent by Plex for Kodi.
+                                     transcodeSessionId=session_id, session=session_id,
                                      **{"X-Plex-Client-Identifier": self.sdk._headers()["X-Plex-Client-Identifier"],
                                         "X-Plex-Session-Identifier": session_id,
                                         "X-Plex-Client-Profile-Name": "Generic",
@@ -1772,7 +1792,7 @@ class PlexHTTP:
                                 getattr(version, "container", None)) if value)
             version_options.append({"data": index, "label": f"{index + 1}. {label}" if label else f"Version {index + 1}"})
         preview_path = f"/library/parts/{part.id}/indexes/sd" if part and getattr(part, "hasPreviewThumbnails", False) else ""
-        return {"streams": streams, "resume_ms": getattr(item, "viewOffset", 0) or 0,
+        return {"streams": streams, "resume_ms": 0 if self.local_connection else getattr(item, "viewOffset", 0) or 0,
                 "duration_ms": getattr(primary_media, "duration", None) or getattr(item, "duration", 0) or 0,
                 "has_audio": bool(codec), "media_index": media_index, "versions": version_options,
                 "audio_tracks": self._video_track_options(audio_tracks, "Audio"),
@@ -1802,6 +1822,8 @@ class PlexHTTP:
             part.setSelectedSubtitleStream(track)
 
     def video_skip_markers(self, rating_key: str):
+        if not self.account_token:
+            return []
         item = self.sdk.fetchItem(int(rating_key), params={"includeMarkers": 1})
         if item.type not in ("movie", "episode"):
             return []
@@ -1957,6 +1979,8 @@ class PlexHTTP:
     def companion_track_streams(self, rating_key: str, source_server_id: str = "", account_plex=None, *, track=None):
         server = self._companion_media_server(source_server_id, account_plex)
         streams = self.get_stream_urls(rating_key, track=track, media_server=server)
+        if self.local_connection and server is self.sdk:
+            streams["local_connection"] = True
         if server is not self.sdk:
             # The linked account authorizes Deck playback. The receiver's
             # timeline must not send that account's token to LAN controllers.
@@ -2439,10 +2463,12 @@ class Plugin:
         """Save user-editable preferences without accepting auth tokens from the UI."""
         try:
             merged = _load_settings()
-            for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns", "volume",
+            for key in ("selected_player_id", "selected_player_name", "manual_server_url", "grid_columns",
+                        "volume",
                         "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
-                        "quick_player_maintain_x", "quick_player_show_idle", "video_quality", "video_autoplay",
+                        "quick_player_maintain_x", "quick_player_show_idle", "quick_player_native_style",
+                        "quick_player_compact_header", "video_quality", "video_autoplay",
                         "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
                     merged[key] = settings[key]
@@ -2455,6 +2481,8 @@ class Plugin:
             merged["hide_quick_login"] = bool(merged["hide_quick_login"])
             merged["quick_player_maintain_x"] = bool(merged["quick_player_maintain_x"])
             merged["quick_player_show_idle"] = merged["quick_player_show_idle"] is not False
+            merged["quick_player_native_style"] = merged["quick_player_native_style"] is True
+            merged["quick_player_compact_header"] = merged["quick_player_compact_header"] is True
             merged["over_game_pip"] = merged["over_game_pip"] is True
             merged["video_autoplay"] = merged["video_autoplay"] is not False
             if merged["pip_position"] not in PIP_POSITIONS:
@@ -2510,6 +2538,7 @@ class Plugin:
         settings = _load_settings()
         settings.update({
             "plex_token": "", "server_access_token": "", "logged_in_username": "",
+            "local_server_enabled": False,
             "plexamp_url": "", "selected_server_id": "", "selected_server_name": "",
             "selected_server_url": "", "selected_player_id": "", "selected_player_name": "",
             "playback_target": "local",
@@ -2555,18 +2584,93 @@ class Plugin:
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("Enter a server IP or an http(s) URL")
-        if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username:
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username is not None:
             raise ValueError("Enter only the server address, without a path or credentials")
         try:
-            port = parsed.port or 32400
+            port = parsed.port if parsed.port is not None else 32400
+            if not 1 <= port <= 65535:
+                raise ValueError("Invalid port")
         except ValueError as e:
             raise ValueError("Server port must be between 1 and 65535") from e
         hostname = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
         return f"{parsed.scheme}://{hostname}:{port}"
 
+    async def connect_local_server(self, address: str) -> Dict[str, Any]:
+        """Validate a user-supplied Plex address without account credentials."""
+        from plexapi.exceptions import Unauthorized
+
+        global _plex_cache
+        original = _load_settings()
+        login_id = _pin_state.get("id")
+        if original["plex_token"]:
+            return {"error": "Log out of your Plex account to connect without sign-in."}
+        try:
+            url = self._normalize_server_url(address)
+        except ValueError as error:
+            return {"error": str(error)}
+        if not url:
+            return {"error": "Enter the address of your Plex server."}
+
+        def validate():
+            plex = PlexHTTP(url, "", timeout=original["connection_timeout"], verify_tls=original["verify_tls"],
+                            local_connection=True)
+            try:
+                identity = plex.get_server_identity()
+                if not identity["machineIdentifier"]:
+                    raise ValueError("Address did not return a Plex server identity.")
+                return identity, [library for library in plex.get_library_sections() if library["type"] in LIBRARY_TYPES]
+            finally:
+                plex.session.close()
+
+        try:
+            identity, libraries = await asyncio.to_thread(validate)
+        except Unauthorized:
+            return {"error": "This Plex server requires sign-in. Use the code sign-in under Account."}
+        except Exception as error:
+            logger.info("Could not connect directly to Plex (%s)", _plex_error_code(error))
+            if _plex_error_code(error).endswith("HTTP 403"):
+                return {"error": "This Plex server denied library access. Use the code sign-in under Account."}
+            return {"error": "Could not reach the Plex libraries at this address. Check the address and try again."}
+
+        settings = _load_settings()
+        connection_fields = ("plex_token", "selected_server_id", "selected_server_url", "local_server_enabled")
+        if _pin_state.get("id") != login_id or any(settings[field] != original[field] for field in connection_fields):
+            return {"error": "Your Plex connection changed. Try again."}
+        server_id = identity["machineIdentifier"]
+        settings.update({
+            "local_server_enabled": True, "selected_server_id": server_id,
+            "selected_server_name": identity["friendlyName"] or "Plex Media Server", "selected_server_url": url,
+            "server_access_token": "",
+        })
+        choice = _library_choice(settings)
+        selected_ids = {entry["id"] for entry in choice} if isinstance(choice, list) else set()
+        selected = [library for library in libraries if library["id"] in selected_ids]
+        _set_library_choice(settings, server_id, selected or libraries)
+        try:
+            _save_settings(settings)
+        except OSError:
+            return {"error": "Could not save the local Plex connection."}
+        _cancel_plex_login()
+        _plex_cache = (None, None)
+        self._video_handoff_sources = None
+        await self.stop_game_pip()
+        return {**self._public_settings(_load_settings()), "catalog": {
+            "server_id": server_id, "libraries": libraries, "selected_ids": [entry["id"] for entry in selected or libraries],
+        }}
+
+    async def disconnect_local_server(self) -> Dict[str, Any]:
+        settings = _load_settings()
+        if settings["local_server_enabled"] and not settings["plex_token"]:
+            return await self.logout()
+        return self._public_settings(settings)
+
     def _get_plex(self) -> Optional[PlexHTTP]:
         """Connect to the Plex server using saved settings."""
         return self._plex_for_settings(_load_settings())
+
+    def _get_account_plex(self) -> Optional[PlexHTTP]:
+        settings = _load_settings()
+        return self._plex_for_settings(settings) if settings["plex_token"] else None
 
     def _plex_for_settings(self, settings: Dict[str, Any]) -> Optional[PlexHTTP]:
         global _plex_cache
@@ -2574,13 +2678,17 @@ class Plugin:
         # Use server-specific access token if available, otherwise fall back to user token
         token = settings["server_access_token"] or settings.get("plex_token", "").strip()
         account_token = settings.get("plex_token", "").strip()
-        if not url or not token:
+        local = settings["local_server_enabled"] is True and not account_token
+        if local:
+            token = ""
+        if not url or not (token or local):
             # Only log once at DEBUG level — this is expected when no server is configured
             logger.debug(f"_get_plex: missing url or token (url={bool(url)}, token={bool(token)}), plex_token in settings={bool(settings.get('plex_token', '').strip())}")
             return None
         timeout = int(settings.get("connection_timeout", 8) or 8)
         verify_tls = bool(settings.get("verify_tls", False))
-        cache_key = (url.rstrip("/"), token, account_token, timeout, verify_tls)
+        cache_key = (url.rstrip("/"), token, account_token, timeout, verify_tls,
+                     settings["selected_server_id"] if local else None)
         previous_key, previous_plex = _plex_cache
         if previous_key == cache_key:
             return previous_plex
@@ -2590,7 +2698,11 @@ class Plugin:
                 return previous_plex
             try:
                 # PlexServer validates the connection and retains the authenticated session.
-                plex = PlexHTTP(url, token, timeout=timeout, verify_tls=verify_tls, account_token=account_token)
+                options = {"local_connection": True} if local else {}
+                plex = PlexHTTP(url, token, timeout=timeout, verify_tls=verify_tls, account_token=account_token, **options)
+                if local and plex.sdk.machineIdentifier != settings["selected_server_id"]:
+                    plex.session.close()
+                    return None
                 _plex_cache = (cache_key, plex)
                 return plex
             except Exception as error:
@@ -2621,10 +2733,13 @@ class Plugin:
     async def discover_players(self) -> Dict[str, Any]:
         """List all connected Plex clients for player selection."""
         plex = await asyncio.to_thread(self._get_plex)
-        if not plex:
-            return {"players": [], "error": "Not connected to Plex server"}
         try:
-            clients = await asyncio.to_thread(plex.discover_players)
+            if plex:
+                clients = await asyncio.to_thread(plex.discover_players)
+            else:
+                peers = await asyncio.to_thread(PlexHTTP._scan_lan_players, _load_settings()["companion_id"],
+                                                include_other=True)
+                clients = peers.values()
             players = []
             for client in clients:
                 players.append({
@@ -2796,12 +2911,16 @@ class Plugin:
     def _companion_plex_for_context(self, context: Dict[str, Any], *, for_playback: bool = False):
         """Resolve the authorized Plex server for an active Companion session."""
         settings = _load_settings()
-        plex = self._get_plex()
+        plex = self._plex_for_settings(settings) if settings["plex_token"] else None
         expected_id = str(plex.sdk.machineIdentifier or "") if plex else ""
         requested_id = str(context.get("machine_identifier") or "")
         token = str(context.get("token") or "")
         source = context.get("source")
         allow_sender = settings.get("allow_signed_out_companion", False) and source != "local"
+        if allow_sender and not token and settings["local_server_enabled"] and requested_id == settings["selected_server_id"]:
+            local = self._plex_for_settings(settings)
+            if local:
+                return local, False
         linked_plex = plex
         if plex and requested_id and requested_id != expected_id:
             server = plex._account_plex_server(requested_id)
@@ -2817,7 +2936,7 @@ class Plugin:
             base_url = linked_plex.base_url
         elif allow_sender:
             if not token or not requested_id or requested_id == "node":
-                raise RemotePlaybackError("Plexamp did not provide authorization for a Plex Media Server.")
+                raise RemotePlaybackError("The sender supplied no Plex authorization. Connect the receiver to the same local Plex server or sign in.")
             base_url = _private_plex_base_url(
                 str(context.get("address") or ""), int(context.get("port") or 32400),
                 str(context.get("protocol") or "http"),
@@ -2836,7 +2955,8 @@ class Plugin:
     async def share_local_companion_queue(self, server_id: str, rating_keys: List[str]) -> Dict[str, Any]:
         receiver = _companion_receiver
         settings = _load_settings()
-        if not receiver or not receiver.is_active() or not server_id or server_id != settings["selected_server_id"]:
+        if (not settings["plex_token"] or not receiver or not receiver.is_active()
+                or not server_id or server_id != settings["selected_server_id"]):
             return {"success": False, "error": "The Plex Companion receiver or selected server changed."}
         if (not isinstance(rating_keys, list) or not rating_keys or
                 any(not isinstance(key, str) or not re.fullmatch(r"[0-9]{1,20}", key) for key in rating_keys)):
@@ -3067,7 +3187,8 @@ class Plugin:
         def send():
             plex, owns_session = self._companion_plex_for_context(context)
             try:
-                plex.report_companion_queue_timeline(timeline)
+                if not plex.local_connection:
+                    plex.report_companion_queue_timeline(timeline)
             finally:
                 if owns_session:
                     plex.session.close()
@@ -3220,7 +3341,8 @@ class Plugin:
         if catalog.get("error"):
             return catalog
         settings = _load_settings()
-        if server_id != settings["selected_server_id"] or original["plex_token"] != settings["plex_token"]:
+        if (server_id != settings["selected_server_id"] or original["plex_token"] != settings["plex_token"]
+                or self._get_plex_server_url(original) != self._get_plex_server_url(settings)):
             return {"error": "Your Plex server changed. Reload the library list and try again."}
         selected = [section for section in catalog["libraries"] if section["id"] in selected_ids]
         if not selected:
@@ -3262,6 +3384,8 @@ class Plugin:
         if row not in ("continue", "movies", "shows", "watchlist"):
             return {"items": [], "error": "Unknown video home section."}
         settings = _load_settings()
+        if settings["local_server_enabled"] and row in ("continue", "watchlist"):
+            return {"items": []}
 
         def load():
             plex = self._plex_for_settings(settings)
@@ -3285,8 +3409,10 @@ class Plugin:
                 or (action == "rate" and rating is not None and (type(rating) is not int or not 0 <= rating <= 10))):
             return {"error": "Unknown Plex video action."}
         settings = _load_settings()
-        if not server_id or server_id != settings["selected_server_id"] or not settings["plex_token"]:
+        if not server_id or server_id != settings["selected_server_id"]:
             return {"error": "Connect to the item's Plex server first."}
+        if not settings["plex_token"]:
+            return {"error": "Sign in to Plex to change your watch status, ratings, or Watchlist."}
 
         def update():
             plex = self._plex_for_settings(settings)
@@ -3363,7 +3489,7 @@ class Plugin:
             return {"items": [], "error": str(e)}
 
     async def get_recently_played(self, section_id: str = "", limit: int = 50) -> Dict[str, Any]:
-        plex = await asyncio.to_thread(self._get_plex)
+        plex = await asyncio.to_thread(self._get_account_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
@@ -3383,7 +3509,7 @@ class Plugin:
             return {"items": [], "error": str(e)}
 
     async def get_audio_playlists(self, limit: int = 100) -> Dict[str, Any]:
-        plex = await asyncio.to_thread(self._get_plex)
+        plex = await asyncio.to_thread(self._get_account_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
@@ -3433,7 +3559,7 @@ class Plugin:
             return {"success": False, "error": str(e)}
 
     async def get_playlist_tracks(self, playlist_id: str, limit: int = 100) -> Dict[str, Any]:
-        plex = await asyncio.to_thread(self._get_plex)
+        plex = await asyncio.to_thread(self._get_account_plex)
         if not plex:
             return {"items": [], "error": "Not connected to Plex server"}
         try:
@@ -3461,6 +3587,16 @@ class Plugin:
             logger.error(f"Failed to search library: {e}")
             return {"items": [], "error": str(e)}
 
+    def _remember_video_handoff(self, identity, source):
+        if self._video_handoff_sources is None:
+            self._video_handoff_sources = {}
+        cache = self._video_handoff_sources
+        if len(cache) >= 8:
+            cache.pop(next(iter(cache)))
+        key = secrets.token_urlsafe(18)
+        cache[key] = (identity, source)
+        return key
+
     async def get_media_source(self, rating_key: str, requested_quality: str = "", media_index: int = 0) -> Dict[str, Any]:
         settings = _load_settings()
         plex = await asyncio.to_thread(self._plex_for_settings, settings)
@@ -3474,21 +3610,57 @@ class Plugin:
                 raise ValueError("Invalid video version.")
             result = await asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index)
             if any(stream["kind"] == "hls" for stream in result.get("streams", [])):
-                if self._video_handoff_sources is None:
-                    self._video_handoff_sources = {}
-                cache = self._video_handoff_sources
-                if len(cache) >= 8:
-                    cache.pop(next(iter(cache)))
-                key = secrets.token_urlsafe(18)
                 identity = (settings["selected_server_id"], settings["plex_token"],
                             self._get_plex_server_url(settings), rating_key, quality, media_index)
-                cache[key] = (identity, result)
-                result = {**result, "handoff_key": key}
-            return {**result, "server_id": settings["selected_server_id"], "quality": quality}
+                result = {**result, "handoff_key": self._remember_video_handoff(identity, result)}
+            return {**result, "server_id": settings["selected_server_id"], "quality": quality,
+                    "local_connection": plex.local_connection}
         except Exception as error:
             logger.warning("Could not prepare Plex video item=%s error=%s",
                            rating_key if str(rating_key).isdigit() else "invalid", type(error).__name__)
             return {"error": "Plex could not prepare this item for playback."}
+
+    async def prepare_video_transcode(self, handoff_key: str, session_id: str) -> None:
+        """Ask PMS for a decision for one of the local viewer's generated streams."""
+        if not isinstance(handoff_key, str) or not isinstance(session_id, str) or not session_id:
+            return
+        saved = (self._video_handoff_sources or {}).get(handoff_key)
+        settings = _load_settings()
+        if not saved or not settings["local_server_enabled"] or settings["plex_token"]:
+            return
+        identity, source = saved
+        if identity[:3] != (settings["selected_server_id"], "", self._get_plex_server_url(settings)):
+            return
+        for stream in source["streams"]:
+            for field in ("url", "fallback_url"):
+                url = urllib.parse.urlsplit(stream.get(field, ""))
+                if url.path not in ("/video/:/transcode/universal/start.m3u8", "/video/:/transcode/universal/start.mp4"):
+                    continue
+                query = dict(urllib.parse.parse_qsl(url.query))
+                if query.get("transcodeSessionId") != session_id:
+                    continue
+                headers = {"Accept": "application/xml"}
+                for name in tuple(query):
+                    if name.startswith("X-Plex-"):
+                        value = query.pop(name)
+                        if name != "X-Plex-Token":
+                            headers[name] = value
+                def decide():
+                    plex = self._plex_for_settings(settings)
+                    if not plex:
+                        return
+                    response = plex.sdk.query("/video/:/transcode/universal/decision",
+                                              headers=headers, params=query, timeout=3)
+                    if response is not None:
+                        codes = [response.get(key, "") for key in (
+                            "generalDecisionCode", "transcodeDecisionCode", "directPlayDecisionCode")]
+                        logger.info("Plex local video decision item=%s general=%s transcode=%s direct=%s",
+                                    identity[3], *(code if code.isdecimal() else "-" for code in codes))
+                try:
+                    await asyncio.to_thread(decide)
+                except Exception as error:
+                    logger.info("Plex local video decision unavailable for item %s (%s)", identity[3], _plex_error_code(error))
+                return
 
     async def set_video_stream(self, rating_key: str, server_id: str, index: int, kind: str, stream_id: int) -> Dict[str, Any]:
         settings = _load_settings()
@@ -3524,7 +3696,7 @@ class Plugin:
             return
         if not rating_key.isdecimal() or len(rating_key) > 20 or not re.fullmatch(r"[a-zA-Z0-9_.:-]{0,96}", code):
             return
-        if source not in ("source", "direct", "hls", "hls-audio", "hls-copy", "hls-proxy", "http", "pip"):
+        if source not in ("source", "direct", "hls", "hls-active", "hls-audio", "hls-copy", "hls-proxy", "http", "pip"):
             return
         logger.log(30 if event in ("failed", "quality-restored") else 20,
                    "Video %s item=%s quality=%s source=%s code=%s",
@@ -3596,7 +3768,7 @@ class Plugin:
                 return {"error": "The over-game video request was canceled."}
             if not source.get("streams") or source["streams"][0]["kind"] == "image":
                 return {"error": "Over-game picture-in-picture requires a video."}
-            video = GameVideo(plex, source, position, volume, muted, preferred_source, manifest)
+            video = GameVideo(plex, source, position, volume, muted, preferred_source, manifest, source_identity=identity)
             video.start()
             self._game_video = video
             if previous:
@@ -3608,6 +3780,20 @@ class Plugin:
             logger.warning("Could not prepare PiP item=%s error=%s",
                            rating_key if str(rating_key).isdecimal() else "invalid", type(error).__name__)
             return {"error": "Could not prepare the Plex stream for over-game picture-in-picture."}
+
+    async def get_game_pip_resume_stream(self, video_id: str) -> Optional[Dict[str, str]]:
+        video = self._game_video
+        settings = _load_settings()
+        if not video or video.id != video_id or not settings["local_server_enabled"] or not video.source_identity:
+            return None
+        if video.source_identity[:3] != (settings["selected_server_id"], settings["plex_token"], self._get_plex_server_url(settings)):
+            return None
+        active = video.fullscreen_hls()
+        if not active:
+            return None
+        url, manifest = active
+        key = self._remember_video_handoff(video.source_identity, {"streams": [{"kind": "hls", "url": url}]})
+        return {"url": url, "manifest": manifest, "handoff_key": key}
 
     async def get_game_pip_status(self, video_id: str) -> Dict[str, Any]:
         video = self._game_video
@@ -3631,9 +3817,10 @@ class Plugin:
 
     async def report_video_progress(self, rating_key: str, server_id: str, time_ms: int,
                                     duration_ms: int, state: str) -> Optional[Dict[str, Any]]:
-        if not server_id or _load_settings()["selected_server_id"] != server_id:
+        settings = _load_settings()
+        if not server_id or not settings["plex_token"] or settings["selected_server_id"] != server_id:
             return None
-        plex = await asyncio.to_thread(self._get_plex)
+        plex = await asyncio.to_thread(self._plex_for_settings, settings)
         if plex:
             try:
                 return await asyncio.to_thread(plex.report_video_progress, rating_key, time_ms, duration_ms, state)
@@ -3697,6 +3884,7 @@ class Plugin:
             return {
                 "success": True,
                 **streams,
+                "local_connection": plex.local_connection,
                 "play_queue_id": play_queue_id,
                 "selected_item_id": selected_item_id,
                 "container_key": container_key,
@@ -3729,9 +3917,9 @@ class Plugin:
             return {"success": False, "error": "Invalid playback state"}
 
         def send():
-            plex = self._get_plex()
+            plex = self._get_account_plex()
             if not plex:
-                raise ValueError("Not connected to Plex server")
+                return
             track = plex.sdk.fetchItem(int(rating_key))
             track.updateTimeline(max(0, int(time_ms)), state=state, duration=max(0, int(duration_ms)) or None)
 
@@ -3748,12 +3936,22 @@ class Plugin:
 
     async def plex_login(self) -> Dict[str, Any]:
         """Start PlexAPI link-code authentication."""
+        import requests
         from plexapi.myplex import MyPlexPinLogin
+        from requests.adapters import HTTPAdapter
+        from urllib3.util import Retry
 
         _cancel_plex_login()
         login_id = secrets.token_hex(16)
         _pin_state["id"] = login_id
+        session = requests.Session()
+        task_started = False
         try:
+            # If the first code never reaches DeckyPlex, one retry can request a new code.
+            retry = Retry(total=1, other=0, allowed_methods={"GET", "POST"},
+                          status_forcelist=(502, 503, 504), raise_on_status=False,
+                          respect_retry_after_header=False)
+            session.mount("https://plex.tv/", HTTPAdapter(max_retries=retry))
             headers = {
                 "X-Plex-Client-Identifier": login_id,
                 "X-Plex-Product": "DeckyPlex",
@@ -3762,19 +3960,32 @@ class Plugin:
                 "X-Plex-Device": "Steam Machine",
                 "X-Plex-Device-Name": "DeckyPlex",
             }
-            pin_login = MyPlexPinLogin(requestTimeout=15, headers=headers)
+            pin_login = MyPlexPinLogin(session=session, requestTimeout=(5, 10), headers=headers)
             pin = await asyncio.to_thread(lambda: pin_login.pin)
             if not pin:
                 raise ValueError("Plex did not return a login code.")
             if _pin_state.get("id") != login_id:
                 return {"error": "This sign-in attempt was replaced."}
-            _pin_state["task"] = asyncio.create_task(self._finish_plex_login(pin_login, login_id))
+            task = asyncio.create_task(self._finish_plex_login(pin_login, login_id))
+            task.add_done_callback(lambda _: session.close())
+            _pin_state["task"] = task
+            task_started = True
             return {"pin": pin, "url": "https://plex.tv/link", "login_id": login_id}
-        except Exception:
+        except Exception as error:
             if _pin_state.get("id") == login_id:
                 _pin_state.clear()
-            logger.warning("Could not start Plex login through PlexAPI", exc_info=True)
+            detail = _plex_error_code(error)
+            logger.warning("Could not request a Plex sign-in code (%s)", detail)
+            if detail.endswith("HTTP 429"):
+                return {"error": "Plex is limiting sign-in attempts. Wait a moment and try again."}
+            if isinstance(error, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+                return {"error": "Could not reach plex.tv for a sign-in code. Try again."}
+            if " HTTP " in detail:
+                return {"error": f"Plex could not issue a sign-in code ({detail.split(' HTTP ')[1]}). Try again."}
             return {"error": "Could not start Plex sign-in. Try again."}
+        finally:
+            if not task_started:
+                session.close()
 
     def _account_resources(self, auth_token: str) -> Dict[str, Any]:
         # Discovery and server selection can be invoked together by Settings.
@@ -3850,6 +4061,7 @@ class Plugin:
             settings = _load_settings()
             settings.update({
                 "plex_token": pin_login.token, "logged_in_username": "",
+                "local_server_enabled": False,
                 "selected_player_id": "", "selected_player_name": "", "playback_target": "local",
                 "selected_server_id": "", "selected_server_name": "", "selected_server_url": "",
                 "server_access_token": "", "plexamp_url": "",
@@ -3940,7 +4152,8 @@ class Plugin:
         info = await asyncio.to_thread(self._account_resources, token)
         settings = _load_settings()
         if settings.get("plex_token", "").strip() != token:
-            raise ValueError("Plex account changed during discovery.")
+            logger.debug("Discarding Plex server discovery after the account changed")
+            return {"servers": [], "plexamp_url": ""}
         settings["logged_in_username"] = info.get("username", "")
         if info["plexamp_url"]:
             settings["plexamp_url"] = info["plexamp_url"]
@@ -3998,6 +4211,8 @@ class Plugin:
         """
         if settings is None:
             settings = _load_settings()
+        if settings["local_server_enabled"] and not settings["plex_token"]:
+            return settings["selected_server_url"].strip()
         manual_url = _manual_server_url(settings)
         if manual_url:
             return manual_url

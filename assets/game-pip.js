@@ -10,6 +10,7 @@
   let streamIndex = 0;
   let startTimeout;
   let streamKind = '';
+  let streamPath = '';
   const failures = [];
 
   const seek = position => {
@@ -34,6 +35,7 @@
     }
 
     streamKind = stream.name;
+    streamPath = stream.url;
     status = 'waiting';
     const loadingStream = streamIndex;
     const fail = code => { if (loadingStream === streamIndex) handleFailure(code); };
@@ -86,6 +88,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           status: reported, position: video.currentTime, duration: video.duration, seek_sequence: seekSequence,
+          stream_path: streamPath,
           applied_sequence: !video.seeking && video.readyState >= 2 ? appliedSequence : undefined,
           code: failures.length ? failures.join('.').slice(-96) : streamKind,
         }),

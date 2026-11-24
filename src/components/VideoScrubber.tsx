@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button, GamepadButton } from '@decky/ui';
+import { plexMediaUrl } from './PlexMediaUrl';
 import { videoSeekStep } from './VideoQueue';
 
 export function formatVideoTime(seconds: number) {
@@ -10,8 +11,9 @@ export function formatVideoTime(seconds: number) {
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
 }
 
-export function VideoScrubber({ position, duration, disabled, seek, previewUrl }: {
+export function VideoScrubber({ position, duration, disabled, seek, previewUrl, localConnection, compact, steamStyle }: {
   position: number; duration: number; disabled?: boolean; seek: (position: number) => void; previewUrl?: string;
+  localConnection?: boolean; compact?: boolean; steamStyle?: boolean;
 }) {
   const [preview, setPreview] = useState<number | null>(null);
   const [thumbnail, setThumbnail] = useState('');
@@ -45,12 +47,14 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl }
     const timer = window.setTimeout(() => {
       const url = new URL(previewUrl);
       url.pathname += `/${thumbnailTime}`;
-      setThumbnail(url.href);
+      setThumbnail(plexMediaUrl(url.href, localConnection));
     }, 140);
     return () => window.clearTimeout(timer);
-  }, [previewUrl, thumbnailTime]);
+  }, [previewUrl, thumbnailTime, localConnection]);
   const percent = duration > 0 ? 100 * displayed / duration : 0;
-  return <div data-deckyplex-video-scrubber="" data-video-scrubbing={editing || undefined} style={{ width: '100%', position: 'relative' }}
+  return <div data-deckyplex-video-scrubber="" data-compact={compact || undefined} data-steam-style={steamStyle || undefined}
+    data-video-scrubbing={editing || undefined}
+    style={{ width: '100%', position: 'relative' }}
     onBlur={() => { if (draft.current !== null) update(null); }}
     onKeyDown={editing ? event => {
       if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
@@ -63,21 +67,40 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl }
       }
     } : undefined}>
     <style>{`
-      [data-deckyplex-video-scrubber] .deckyplex-video-position {
+      [data-deckyplex-video-scrubber][data-steam-style] .deckyplex-video-position {
+        --deckyplex-seek-rail: rgba(138, 159, 182, 0.65);
+        --deckyplex-seek-fill: currentColor;
+      }
+      [data-deckyplex-video-scrubber]:not([data-steam-style]) .deckyplex-video-position {
         background: #283441 !important;
         color: #f3f6fa !important;
         --deckyplex-seek-rail: #5c6b7a;
         --deckyplex-seek-fill: #89d3ff;
       }
-      [data-deckyplex-video-scrubber] .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
-      [data-video-scrubbing="true"] .deckyplex-video-position {
+      [data-deckyplex-video-scrubber]:not([data-steam-style]) .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
+      [data-video-scrubbing="true"]:not([data-steam-style]) .deckyplex-video-position {
         background: #e5edf5 !important;
         color: #172433 !important;
         --deckyplex-seek-rail: #a0aebc;
         --deckyplex-seek-fill: #20577b;
       }
+      [data-deckyplex-video-scrubber][data-compact]:not([data-steam-style]) .deckyplex-video-position {
+        background: transparent !important;
+        color: #dae5f2 !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+        --deckyplex-seek-rail: #52657b;
+        --deckyplex-seek-fill: #9acfff;
+      }
+      [data-compact]:not([data-steam-style]) .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
+      [data-compact][data-video-scrubbing="true"]:not([data-steam-style]) .deckyplex-video-position {
+        background: #314760 !important;
+        color: #fff !important;
+        --deckyplex-seek-rail: #788c9f;
+        --deckyplex-seek-fill: #bce0ff;
+      }
     `}</style>
-    <Button className="deckyplex-video-position" onClick={activate} disabled={disabled}
+    <Button className="deckyplex-video-position" onClick={activate} disabled={disabled} focusable={!disabled}
       aria-label={`Playback position ${formatVideoTime(displayed)} of ${formatVideoTime(duration)}`}
       onOKActionDescription={editing ? 'Seek' : 'Choose position'}
       onCancelActionDescription={editing ? 'Cancel scrub' : undefined}

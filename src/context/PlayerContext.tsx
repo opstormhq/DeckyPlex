@@ -8,6 +8,7 @@ import {
   ReactNode,
 } from 'react';
 import { addEventListener, call } from '@decky/api';
+import { plexMediaUrl } from '../components/PlexMediaUrl';
 
 interface TrackInfo {
   id: string;
@@ -45,7 +46,7 @@ interface PlayerContextType extends PlayerState {
   loadMusicArtwork: (trackId: string, sourceServerId?: string) => Promise<string>;
   localVolume: number;
   volumeSliderRevision: number;
-  playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl?: string, loadMore?: () => Promise<TrackInfo[]>, requestToken?: number) => void;
+  playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl?: string, loadMore?: () => Promise<TrackInfo[]>, requestToken?: number, localConnection?: boolean) => void;
   beginPlaybackRequest: () => number;
   readMusicPlaybackTarget: () => Promise<string>;
   playRemoteQueue: (playerId: string, queue: TrackInfo[], startId?: string) => Promise<{ success: boolean; error?: string }>;
@@ -236,7 +237,7 @@ function reportTimeline(state: 'playing' | 'paused' | 'stopped', force = false) 
         .catch(() => {});
     }
   }
-  if (engine.companionActive || engine.remoteActive || !engine.track?.id) return;
+  if (engine.companionActive || engine.remoteActive || engine.localConnection || !engine.track?.id) return;
   if (state !== 'stopped' && engine.receiverEnabled) void shareLocalCompanionQueue();
   const now = Date.now();
   const reportKey = `${engine.track.id}:${state}`;
@@ -261,6 +262,7 @@ function stopSharedPlayback(report = true) {
   sharedAudio.removeAttribute('src');
   sharedAudio.load();
   engine.track = null;
+  engine.localConnection = false;
   engine.remoteActive = false;
   engine.queue = [];
   engine.queueIndex = -1;
@@ -322,10 +324,21 @@ function isPlayingOnDeck() {
 }
 
 function canControlRemotePlayer() {
-  return !!engine.remoteTargetId && !isPlayingOnDeck() && (!engine.pendingRequestId || !!engine.remoteActive);
+  return !!engine.remoteTargetId && engine.plexConnection !== 'none' && !isPlayingOnDeck() && (!engine.pendingRequestId || !!engine.remoteActive);
 }
 
-function applyMusicPlaybackTarget(settings: { playback_target?: string; selected_player_id?: string; selected_player_name?: string }) {
+function applyMusicPlaybackTarget(settings: {
+  playback_target?: string; selected_player_id?: string; selected_player_name?: string;
+  selected_server_id?: string; selected_server_url?: string; local_server_enabled?: boolean; has_plex_token?: boolean;
+}) {
+  const connection = settings.local_server_enabled ? `local:${settings.selected_server_url}` : settings.has_plex_token ? 'account' : 'none';
+  const previous = engine.plexConnection;
+  if (previous && previous !== connection && (!engine.companionActive || engine.localCompanionQueueId)) {
+    stopSharedPlayback(false);
+    engine.lastCompanionSession = null;
+  }
+  engine.plexConnection = connection;
+  engine.selectedServerId = settings.selected_server_id || '';
   const playerId = settings.playback_target === 'remote' ? settings.selected_player_id || '' : '';
   const playerName = playerId ? settings.selected_player_name || '' : '';
   const targetChanged = engine.remoteTargetId !== playerId;
@@ -347,7 +360,7 @@ async function readMusicPlaybackTarget() {
   return applyMusicPlaybackTarget(await call('get_settings'));
 }
 
-async function playStreamWithFallback(primaryUrl: string, fallbackUrl: string, title: string, requestId: number) {
+async function playStreamWithFallback(primaryUrl: string, fallbackUrl: string, title: string, requestId: number, localConnection?: boolean) {
   const candidates = [primaryUrl, fallbackUrl].filter((url, index, all) => !!url && all.indexOf(url) === index);
   let lastError: Error | null = null;
   try {
@@ -357,7 +370,8 @@ async function playStreamWithFallback(primaryUrl: string, fallbackUrl: string, t
       engine.diagnosedSource = '';
       engine.explicitlyStopped = false;
       sharedAudio.pause();
-      sharedAudio.src = candidates[index];
+      engine.sourceUrl = candidates[index];
+      sharedAudio.src = plexMediaUrl(engine.sourceUrl, localConnection);
       sharedAudio.load();
       try {
         await sharedAudio.play();
@@ -414,7 +428,8 @@ async function playQueuedIndex(index: number) {
     engine.companionMediaContext = result.media_context || null;
     logToBackend(`queue: Plex provided audio for track ${nextTrack.id}`);
     engine.explicitlyStopped = false;
-    const started = await playStreamWithFallback(result.stream_url, result.fallback_stream_url || '', nextTrack.title, requestId);
+    engine.localConnection = result.local_connection === true;
+    const started = await playStreamWithFallback(result.stream_url, result.fallback_stream_url || '', nextTrack.title, requestId, engine.localConnection);
     if (requestId === engine.requestId && !started) throw new Error('Playback request was interrupted');
     if (requestId === engine.requestId) reportTimeline('playing', true);
   } catch (e: any) {
@@ -431,7 +446,7 @@ async function playQueuedIndex(index: number) {
     sharedAudio.pause();
     sharedAudio.removeAttribute('src');
     sharedAudio.load();
-    if (index + 1 < engine.queue.length) {
+    if (!engine.localConnection && index + 1 < engine.queue.length) {
       logToBackend(`queue: skipping unplayable track ${nextTrack.title} and trying the next song`);
       void playQueuedIndex(index + 1);
       return;
@@ -461,7 +476,7 @@ sharedAudio.addEventListener('error', () => {
   engine.diagnosedSource = source;
   const mediaError = sharedAudio.error;
   logToBackend(`audio source rejected for track ${trackId}: code=${mediaError?.code || 0}; networkState=${sharedAudio.networkState}; readyState=${sharedAudio.readyState}`);
-  call('inspect_stream', trackId, source).then((result: any) => {
+  call('inspect_stream', trackId, engine.localConnection ? engine.sourceUrl : source).then((result: any) => {
     logToBackend(`stream diagnostic for ${trackId}: HTTP ${result?.status || 'unavailable'}; range=${Boolean(result?.content_range)}; bytes=${result?.bytes || 0}`);
   }).catch(() => {
     logToBackend(`stream diagnostic failed for track ${trackId}`);
@@ -585,7 +600,9 @@ async function startCompanionTrack(params: Record<string, string[]>) {
   logToBackend(`Plex Companion starting ${selected.title} (${engine.queue.length} queued track(s))`);
   logToBackend(`Plex Companion selected queue item ${engine.queueIndex + 1}/${engine.queue.length} for key ${requestedKey}`);
   try {
-    const started = await playStreamWithFallback(prepared.stream_url, prepared.fallback_stream_url || '', selected.title, requestId);
+    engine.localConnection = prepared.local_connection === true;
+    const started = await playStreamWithFallback(prepared.stream_url, prepared.fallback_stream_url || '', selected.title,
+      requestId, engine.localConnection);
     if (requestId !== engine.requestId || !started) return;
     reportTimeline('playing', true);
     window.dispatchEvent(new Event('deckyplex-track-change'));
@@ -958,10 +975,12 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         remotePlayerName: engine.remoteTargetName || '',
       }));
     };
+    let settingsRequest = 0;
     const refreshTarget = async () => {
+      const request = ++settingsRequest;
       try {
         const settings: any = await call('get_settings');
-        if (!mounted || engine.volumeSession !== volumeSession) return;
+        if (!mounted || engine.volumeSession !== volumeSession || request !== settingsRequest) return;
         if (!engine.volumePreferenceLoaded) {
           const savedVolume = settings.volume;
           const normalizedVolume = Number.isFinite(savedVolume)
@@ -970,8 +989,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
           setSharedVolume(normalizedVolume, true);
         }
         applyMusicPlaybackTarget(settings);
-        engine.selectedServerId = settings.selected_server_id || '';
-        const enabled = settings.companion_receiver_enabled === true;
+        const enabled = settings.companion_receiver_enabled === true && settings.local_server_enabled !== true;
         if (enabled && !engine.receiverEnabled) engine.shareQueueRetryAt = 0;
         engine.receiverEnabled = enabled;
         if (!enabled || (engine.localPlaybackServerId && engine.localPlaybackServerId !== engine.selectedServerId)) {
@@ -1152,7 +1170,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, [state.remotePlayerId]);
 
-  const playTrack = useCallback((streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl = '', loadMore?: () => Promise<TrackInfo[]>, requestToken?: number) => {
+  const playTrack = useCallback((streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl = '', loadMore?: () => Promise<TrackInfo[]>, requestToken?: number, localConnection = false) => {
     const audio = audioRef.current;
     if (!audio) {
       logToBackend(`playTrack: audio element not initialized`);
@@ -1169,6 +1187,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (engine.track && engine.track.id !== trackInfo.id && !wasRemotePlayback) reportTimeline('stopped', true);
     unshareLocalCompanionQueue();
     engine.localPlaybackServerId = engine.selectedServerId || '';
+    engine.localConnection = localConnection;
     engine.shareQueueRetryAt = 0;
     engine.remoteActive = false;
     engine.track = trackInfo;
@@ -1188,7 +1207,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
     // Prefer the direct Plex media part for MP3/FLAC, then try Plex's MP3 transcode.
     logToBackend(`playTrack: using native audio playback`);
-    playStreamWithFallback(streamUrl, fallbackStreamUrl, trackInfo.title, requestId).then((started) => {
+    playStreamWithFallback(streamUrl, fallbackStreamUrl, trackInfo.title, requestId, localConnection).then((started) => {
       if (!started || requestId !== engine.requestId) return;
       engine.failedRequestId = 0;
       logToBackend(`playTrack: playback started successfully`);
@@ -1207,7 +1226,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       sharedAudio.removeAttribute('src');
       sharedAudio.load();
       const nextIndex = engine.queueIndex + 1;
-      if (nextIndex < engine.queue.length) {
+      if (!localConnection && nextIndex < engine.queue.length) {
         logToBackend(`queue: skipping unplayable track ${trackInfo.title} and trying the next song`);
         void playQueuedIndex(nextIndex);
         return;

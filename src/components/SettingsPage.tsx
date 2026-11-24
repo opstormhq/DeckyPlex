@@ -1,8 +1,7 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import {
   Dropdown,
-  PanelSection,
-  PanelSectionRow,
+  gamepadDialogClasses,
   DialogBodyText,
   ButtonItem,
   Button,
@@ -17,16 +16,18 @@ import { FaUser, FaServer, FaMusic, FaCog, FaSlidersH } from 'react-icons/fa';
 import { InlineSpinner } from './InlineSpinner';
 import { stopGamePip } from './GamePip';
 import { LibraryRow, PlexSetupDialog, type LibraryCatalog, type PlexServerOption } from './PlexSetupDialog';
-import { musicCategories, videoCategories, type BrowserLayouts, type CategoryLayout } from './BrowserCategories';
+import { musicBrowserCategories, videoCategories, type BrowserLayouts, type CategoryLayout } from './BrowserCategories';
 import { BrowserCategoriesDialog } from './BrowserCategoriesDialog';
 import { defaultPipPosition, pipPositions, type PipPosition } from './PipPosition';
 import { PipPositionDialog } from './PipPositionDialog';
+import { FocusOutlineStyles } from './FocusOutline';
 
 interface Settings {
   plexamp_url: string;
   plex_server_url: string;
   plex_token: string;
   has_plex_token: boolean;
+  local_server_enabled: boolean;
   selected_server_id: string;
   selected_server_name: string;
   selected_server_url: string;
@@ -46,6 +47,8 @@ interface Settings {
   hide_quick_login: boolean;
   quick_player_maintain_x: boolean;
   quick_player_show_idle: boolean;
+  quick_player_native_style: boolean;
+  quick_player_compact_header: boolean;
   over_game_pip: boolean;
   video_autoplay: boolean;
   pip_position: PipPosition;
@@ -65,6 +68,7 @@ const DEFAULT_SETTINGS: Settings = {
   plex_server_url: "",
   plex_token: "",
   has_plex_token: false,
+  local_server_enabled: false,
   selected_server_id: "",
   selected_server_name: "",
   selected_server_url: "",
@@ -84,22 +88,37 @@ const DEFAULT_SETTINGS: Settings = {
   hide_quick_login: false,
   quick_player_maintain_x: false,
   quick_player_show_idle: true,
+  quick_player_native_style: false,
+  quick_player_compact_header: true,
   over_game_pip: false,
   video_autoplay: true,
   pip_position: defaultPipPosition,
   pip_size: 29,
 };
 
+function SettingsRow({ children }: { children: ReactNode }) {
+  return <div className="deckyplex-settings-row">{children}</div>;
+}
+
+function SettingsSection({ title, children }: { title?: string; children: ReactNode }) {
+  return (
+    <section className="deckyplex-settings-section" aria-label={title}>
+      {title && <h2>{title}</h2>}
+      <div className="deckyplex-settings-fields">{children}</div>
+    </section>
+  );
+}
+
 function StatusLine({ text, busy, light }: { text: string; busy?: boolean; light?: string }) {
   return (
-    <PanelSectionRow>
+    <SettingsRow>
       <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minHeight: '1.2rem' }}>
         {busy ? <InlineSpinner /> : light && (
           <span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: light }} />
         )}
         <DialogBodyText style={{ margin: 0 }}>{text}</DialogBodyText>
       </div>
-    </PanelSectionRow>
+    </SettingsRow>
   );
 }
 
@@ -127,6 +146,10 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   const [savingLibraries, setSavingLibraries] = useState(false);
   const [libraryStatus, setLibraryStatus] = useState('');
   const [advancedStatus, setAdvancedStatus] = useState("");
+  const [localAddress, setLocalAddress] = useState('');
+  const [localConnectionStatus, setLocalConnectionStatus] = useState('');
+  const [changingLocalConnection, setChangingLocalConnection] = useState(false);
+  const localConnectionPending = useRef(false);
   const [loginAttempt, setLoginAttempt] = useState<{ id: string; pin: string } | null>(null);
   const [loggingIn, setLoggingIn] = useState(false);
   const [connectingToPlex, setConnectingToPlex] = useState(false);
@@ -193,16 +216,17 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         } finally {
           setCheckingCompanionStatus(false);
         }
-        if (!result.has_plex_token) return;
-        setRefreshingServers(true);
+        setRefreshingServers(result.has_plex_token === true);
         void (async () => {
           try {
-            const discoverResult: any = await callWithTimeout("discover_servers", 15000);
-            if (discoverResult.servers) setServers(discoverResult.servers);
-            if (settingsRef.current.has_plex_token && !settingsRef.current.selected_server_id) {
-              const updated: Settings = await callWithTimeout('get_settings', 10000);
-              settingsRef.current = updated;
-              setSettings(updated);
+            if (result.has_plex_token) {
+              const discoverResult: any = await callWithTimeout("discover_servers", 15000);
+              if (discoverResult.servers) setServers(discoverResult.servers);
+              if (settingsRef.current.has_plex_token && !settingsRef.current.selected_server_id) {
+                const updated: Settings = await callWithTimeout('get_settings', 10000);
+                settingsRef.current = updated;
+                setSettings(updated);
+              }
             }
             setRefreshingServers(false);
             setRefreshingPlayers(true);
@@ -234,7 +258,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     setLibrarySelection([]);
     setLibraryStatus('');
     setSavingLibraries(false);
-    if (settingUpPlex || !settings.has_plex_token || !settings.selected_server_id) {
+    if (settingUpPlex || !(settings.has_plex_token || settings.local_server_enabled) || !settings.selected_server_id) {
       setLoadingLibraries(false);
       return;
     }
@@ -255,7 +279,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       if (active) setLoadingLibraries(false);
     });
     return () => { active = false; };
-  }, [settingUpPlex, settings.has_plex_token, settings.selected_server_id]);
+  }, [settingUpPlex, settings.has_plex_token, settings.local_server_enabled, settings.selected_server_id, settings.selected_server_url]);
+
+  useEffect(() => {
+    if (settings.local_server_enabled) setLocalAddress(settings.selected_server_url);
+  }, [settings.local_server_enabled, settings.selected_server_url]);
 
   const handlePlexLogin = useCallback(async () => {
     if (requestingLoginCode.current || settingsRef.current.has_plex_token) return;
@@ -264,7 +292,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     setLoginAttempt(null);
     setStatus('Requesting a login code…');
     try {
-      const result: any = await callWithTimeout('plex_login', 20000);
+      const result: any = await callWithTimeout('plex_login', 35000);
       if (result?.error) throw new Error(result.error);
       if (!result?.login_id || !result.pin) throw new Error('Plex did not return a sign-in code.');
       setLoginAttempt({ id: result.login_id, pin: result.pin });
@@ -376,6 +404,13 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       setServers([]);
       setPlayers([]);
       setStatus("Logged out.");
+      setRefreshingPlayers(true);
+      void callWithTimeout('discover_players', 30000)
+        .then((result: any) => {
+          if (settingsMounted.current && !settingsRef.current.has_plex_token) setPlayers(result.players || []);
+        })
+        .catch(() => {})
+        .finally(() => { if (settingsMounted.current) setRefreshingPlayers(false); });
     } catch (e: any) {
       setStatus(e?.message || "Could not log out of Plex.");
     } finally {
@@ -483,7 +518,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   }, [saveSettings]);
 
   const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
-    | 'over_game_pip' | 'video_autoplay'>(key: K, value: Settings[K]) => {
+    | 'quick_player_native_style' | 'quick_player_compact_header' | 'over_game_pip' | 'video_autoplay'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
     try {
@@ -557,6 +592,63 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     }
   }, [advancedStatus, saveSettings]);
 
+  const changeLocalConnection = async (disconnect = false) => {
+    if (localConnectionPending.current || (!disconnect && !localAddress.trim())) return;
+    localConnectionPending.current = true;
+    setChangingLocalConnection(true);
+    setLocalConnectionStatus(disconnect ? 'Disconnecting…' : 'Connecting to Plex…');
+    try {
+      const result = disconnect
+        ? await call<[], Settings & { error?: string }>('disconnect_local_server')
+        : await call<[string], Settings & { error?: string; catalog?: LibraryCatalog }>('connect_local_server', localAddress.trim());
+      if (!result || result.error) throw new Error(result?.error || 'Could not change the local connection.');
+      if (settingsMounted.current) {
+        settingsRef.current = result;
+        setSettings(result);
+        setLocalConnectionStatus(disconnect ? 'Disconnected.' : '');
+        if ('catalog' in result && result.catalog) {
+          const catalog = result.catalog;
+          setLoginAttempt(null);
+          setConnectingToPlex(false);
+          setStatus('');
+          setSettingUpPlex(true);
+          const server = { id: result.selected_server_id, name: result.selected_server_name };
+          const dialog = showModal(
+            <PlexSetupDialog servers={[server]} defaultServerId={server.id}
+              loadLibraries={async () => catalog}
+              complete={async (serverId, selectedIds) => {
+                const saved: Settings & { error?: string } = await callWithTimeout('set_library_selection', 20000, serverId, selectedIds);
+                if (saved.error) throw new Error(saved.error);
+                if (settingsMounted.current) {
+                  settingsRef.current = saved;
+                  setSettings(saved);
+                }
+                window.dispatchEvent(new Event('deckyplex-settings-change'));
+              }}
+              close={() => dialog.Close()}
+            />,
+            window, { strTitle: 'Set up Plex', bNeverPopOut: true },
+          );
+          setupDialog.current = dialog;
+          void dialog.ClosedPromise.then(() => {
+            if (setupDialog.current !== dialog) return;
+            setupDialog.current = null;
+            if (settingsMounted.current) {
+              setSettingUpPlex(false);
+              void handleRefreshPlayers();
+            }
+          });
+        }
+      }
+      window.dispatchEvent(new Event('deckyplex-settings-change'));
+    } catch (error) {
+      if (settingsMounted.current) setLocalConnectionStatus(error instanceof Error ? error.message : 'Could not change the local connection.');
+    } finally {
+      localConnectionPending.current = false;
+      if (settingsMounted.current) setChangingLocalConnection(false);
+    }
+  };
+
   const toggleLibrary = (id: string, checked: boolean) => {
     const serverId = libraryCatalog?.server_id;
     if (!serverId) return;
@@ -589,39 +681,39 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   };
 
   const renderLibraryPicker = () => (
-    <PanelSection title="Libraries">
+    <SettingsSection title="Libraries">
       {loadingLibraries && <StatusLine busy text="Loading Plex libraries…" />}
       {!loadingLibraries && libraryCatalog?.server_id === settings.selected_server_id && libraryCatalog.libraries?.map(library => (
         <LibraryRow key={library.id} library={library}
-          checked={librarySelection.includes(library.id)}
+          included={librarySelection.includes(library.id)}
           disabled={selectingServer || (librarySelection.length === 1 && librarySelection[0] === library.id)}
-          onChange={checked => toggleLibrary(library.id, checked)}
+          onChange={included => toggleLibrary(library.id, included)}
         />
       ))}
       {libraryCatalog?.libraries?.length === 0 && <StatusLine text="This server has no supported libraries." />}
       {(savingLibraries || libraryStatus) && <StatusLine busy={savingLibraries} text={savingLibraries ? 'Saving libraries…' : libraryStatus} />}
-    </PanelSection>
+    </SettingsSection>
   );
 
   const renderAccountPage = () => (
-    <PanelSection>
+    <SettingsSection>
       {settings.has_plex_token ? (
         <>
           <StatusLine text={`Logged in as ${settings.logged_in_username || 'your Plex account'}`} />
-          <PanelSectionRow>
-            <ButtonItem onClick={handleLogout} disabled={loggingOut || connectingToPlex}>Log out</ButtonItem>
-          </PanelSectionRow>
+          <SettingsRow>
+            <Button className="deckyplex-settings-button" onClick={handleLogout} disabled={loggingOut || connectingToPlex}>Log out</Button>
+          </SettingsRow>
         </>
       ) : (
-        <PanelSectionRow>
-          <ButtonItem onClick={handlePlexLogin} disabled={loadingSettings || loggingIn || connectingToPlex || !!loginAttempt}>
+        <SettingsRow>
+          <Button className="deckyplex-settings-button" onClick={handlePlexLogin} disabled={loadingSettings || loggingIn || connectingToPlex || !!loginAttempt}>
             Sign in with a code
-          </ButtonItem>
-        </PanelSectionRow>
+          </Button>
+        </SettingsRow>
       )}
       {status && <StatusLine busy={loggingIn || loggingOut || connectingToPlex} text={status} />}
       {loginAttempt?.pin && !connectingToPlex && (
-        <PanelSectionRow>
+        <SettingsRow>
           <div style={{ textAlign: 'center', width: '100%' }}>
             <DialogBodyText>Enter this code at plex.tv/link</DialogBodyText>
             <DialogBodyText style={{ fontSize: '2rem', fontWeight: 'bold', margin: '0.6rem 0' }}>
@@ -632,20 +724,30 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
               <DialogBodyText style={{ margin: 0, opacity: 0.7 }}>Waiting for approval…</DialogBodyText>
             </div>
           </div>
-        </PanelSectionRow>
+        </SettingsRow>
       )}
-    </PanelSection>
+    </SettingsSection>
   );
 
   const renderInterfacePage = () => (
     <>
-    <PanelSection title="Quick Player">
-      <PanelSectionRow>
+    <SettingsSection title="Quick Player">
+      <SettingsRow>
+        <ToggleField label="Compact header" description="Put Log in or Browse beside the status."
+          checked={settings.quick_player_compact_header} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('quick_player_compact_header', enabled)} />
+      </SettingsRow>
+      <SettingsRow>
+        <ToggleField label="Use Steam button styling" description="Use Steam’s default buttons and keep the playback card."
+          checked={settings.quick_player_native_style === true} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('quick_player_native_style', enabled)} />
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField label="Show idle player" description="Keep the playback controls visible when nothing is playing."
           checked={settings.quick_player_show_idle !== false} disabled={!settingsAvailable || savingInterface}
           onChange={enabled => saveInterfaceSetting('quick_player_show_idle', enabled)} />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField
           label="Remember media control position"
           description="Return to the previous control when entering the row. When off, focus starts on Play/Pause."
@@ -653,23 +755,23 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           disabled={!settingsAvailable || savingInterface}
           onChange={(enabled: boolean) => saveInterfaceSetting('quick_player_maintain_x', enabled)}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField
           label="Hide Quick Player login button"
           checked={settings.hide_quick_login}
           disabled={!settingsAvailable || savingInterface}
           onChange={(hidden: boolean) => saveInterfaceSetting('hide_quick_login', hidden)}
         />
-      </PanelSectionRow>
-    </PanelSection>
-    <PanelSection title="Video">
-      <PanelSectionRow>
+      </SettingsRow>
+    </SettingsSection>
+    <SettingsSection title="Video">
+      <SettingsRow>
         <ToggleField label="Autoplay next episode" checked={settings.video_autoplay !== false}
           disabled={!settingsAvailable || savingInterface}
           onChange={enabled => saveInterfaceSetting('video_autoplay', enabled)} />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField
           label="Allow picture-in-picture over games"
           description="Keep video visible while playing a game in Steam Gaming Mode."
@@ -677,23 +779,23 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           disabled={!settingsAvailable || savingInterface}
           onChange={(enabled: boolean) => saveInterfaceSetting('over_game_pip', enabled)}
         />
-      </PanelSectionRow>
+      </SettingsRow>
       {settings.over_game_pip && <>
-        <PanelSectionRow>
+        <SettingsRow>
           <ButtonItem label="Picture-in-picture position" layout="below" bottomSeparator="none"
             disabled={!settingsAvailable || savingInterface} onClick={openPipPosition}>
             {pipPositions.find(({ id }) => id === settings.pip_position)?.label ?? 'Bottom left'}
           </ButtonItem>
-        </PanelSectionRow>
-        <PanelSectionRow>
+        </SettingsRow>
+        <SettingsRow>
           <SliderField label="Picture-in-picture width" value={settings.pip_size} min={20} max={50}
             step={1} valueSuffix="%" showValue layout="below" bottomSeparator="none"
             disabled={!settingsAvailable} onChange={value => updateSetting('pip_size', value)} />
-        </PanelSectionRow>
+        </SettingsRow>
       </>}
       {(savingInterface || interfaceStatus) && <StatusLine busy={savingInterface || interfaceStatus === 'Saving…'}
         text={savingInterface ? 'Saving…' : interfaceStatus} />}
-    </PanelSection>
+    </SettingsSection>
     {renderBrowserSettings()}
     </>
   );
@@ -701,11 +803,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   // Server page content
   const renderServerPage = () => (
     <>
-    <PanelSection>
+    <SettingsSection>
       <StatusLine busy={refreshingServers || selectingServer} text={selectingServer ? 'Connecting to selected server…' : refreshingServers ? 'Finding Plex servers…' : `Servers found: ${servers.length}`} />
-      {serverStatus && <PanelSectionRow><DialogBodyText>{serverStatus}</DialogBodyText></PanelSectionRow>}
+      {serverStatus && <SettingsRow><DialogBodyText>{serverStatus}</DialogBodyText></SettingsRow>}
       {servers.length > 0 && (
-        <PanelSectionRow>
+        <SettingsRow>
           <div style={{ width: '100%' }}>
             <DialogBodyText style={{ marginBottom: '0.25rem' }}>Select Server</DialogBodyText>
             <Dropdown
@@ -715,19 +817,19 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
               onChange={(option: any) => handleSelectServer(option.data)}
             />
           </div>
-        </PanelSectionRow>
+        </SettingsRow>
       )}
       {!servers.length && settings.selected_server_name && (
-        <PanelSectionRow>
+        <SettingsRow>
           <DialogBodyText>Current: {settings.selected_server_name}</DialogBodyText>
-        </PanelSectionRow>
+        </SettingsRow>
       )}
-      <PanelSectionRow>
+      <SettingsRow>
         <DialogBodyText style={{ opacity: 0.65 }}>
           Use Advanced settings to enter a local IP address when automatic server discovery chooses an unreachable address.
         </DialogBodyText>
-      </PanelSectionRow>
-    </PanelSection>
+      </SettingsRow>
+    </SettingsSection>
     {settings.selected_server_id && renderLibraryPicker()}
     </>
   );
@@ -735,26 +837,26 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   // Players page content
   const renderPlayersPage = () => (
     <>
-    <PanelSection title="Receive playback">
-      <PanelSectionRow>
+    <SettingsSection title="Receive playback">
+      <SettingsRow>
         <ToggleField
           label="Plexamp receiver"
-          description="Let Plexamp and other Plex apps send music to this device over your local network."
+          description="Receive music from Plexamp and other Plex apps on your network."
           checked={settings.companion_receiver_enabled}
           disabled={!settingsAvailable || savingPlayerSettings}
           onChange={(enabled: boolean) => updatePlayerSettings({ companion_receiver_enabled: enabled }, true)}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField
           label="Accept playback from any Plex account"
-          description="Receive music over your local network using Plexamp’s access token. Works while signed out of DeckyPlex."
+          description="Receive music while signed out using the sender’s Plex access or your connected local server."
           checked={settings.allow_signed_out_companion}
           disabled={!settingsAvailable || savingPlayerSettings}
           onChange={(enabled: boolean) => updatePlayerSettings({ allow_signed_out_companion: enabled })}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <TextField
           label="Receiver device name"
           value={settings.companion_device_name}
@@ -762,52 +864,53 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           disabled={!settingsAvailable}
           onChange={(event: React.ChangeEvent<HTMLInputElement>) => updateSetting('companion_device_name', event.target.value.slice(0, 48))}
         />
-      </PanelSectionRow>
+      </SettingsRow>
       {receiverNameStatus && <StatusLine busy={receiverNameStatus === 'Saving…'} text={receiverNameStatus} />}
       <StatusLine busy={checkingCompanionStatus}
         light={!settings.companion_receiver_enabled ? '#8b8b8b' : companionStatus.active ? '#77d98b' : '#e7a64a'}
-        text={checkingCompanionStatus ? 'Updating receiver status…' : !settings.companion_receiver_enabled ? 'Receiver is off.' : companionStatus.active ? `Receiver ready on port ${companionStatus.port}.` : companionStatus.error || 'Receiver is unavailable.'} />
-    </PanelSection>
-    <PanelSection title="Send playback">
-      <PanelSectionRow>
+        text={checkingCompanionStatus ? 'Updating receiver status…' : !settings.companion_receiver_enabled ? 'Receiver is off.' : companionStatus.active ? `Receiver ready · TCP ${companionStatus.port}` : companionStatus.error || 'Receiver is unavailable.'} />
+    </SettingsSection>
+    <SettingsSection title="Send playback">
+      <SettingsRow>
         <div style={{ width: '100%' }}>
           <DialogBodyText style={{ marginBottom: '0.25rem' }}>Playback target</DialogBodyText>
           <Dropdown
             rgOptions={[
               { label: 'This Decky device', data: 'local' },
-              ...(settings.has_plex_token ? players.map(player => ({
+              ...players.map(player => ({
                 label: `${player.name} (${player.product})${player.state && player.state !== 'idle' ? ` — ${player.state}` : ''}`,
                 data: player.machineIdentifier,
-              })) : []),
-              ...(settings.has_plex_token && settings.playback_target === 'remote' && settings.selected_player_id
+              })),
+              ...(settings.playback_target === 'remote' && settings.selected_player_id
                   && !players.some(player => player.machineIdentifier === settings.selected_player_id)
                 ? [{ label: settings.selected_player_name || 'Saved Plex player', data: settings.selected_player_id }]
                 : []),
             ]}
-            selectedOption={settings.has_plex_token && settings.playback_target === 'remote'
+            selectedOption={settings.playback_target === 'remote'
               ? settings.selected_player_id : 'local'}
-            disabled={!settings.has_plex_token || savingPlayerSettings || refreshingPlayers}
+            disabled={savingPlayerSettings || refreshingPlayers}
             onChange={(option: any) => handleSelectPlayer(option.data === 'local' ? '' : option.data)}
           />
         </div>
-      </PanelSectionRow>
-      {!settings.has_plex_token ? (
-        <PanelSectionRow><DialogBodyText style={{ opacity: 0.65 }}>Sign in to send music to another device.</DialogBodyText></PanelSectionRow>
-      ) : <>
-      <PanelSectionRow>
-        <ButtonItem onClick={handleRefreshPlayers} disabled={refreshingPlayers || savingPlayerSettings}>
+      </SettingsRow>
+      <SettingsRow>
+        <Button className="deckyplex-settings-button" onClick={handleRefreshPlayers} disabled={refreshingPlayers || savingPlayerSettings}>
           Refresh players
-        </ButtonItem>
-      </PanelSectionRow>
+        </Button>
+      </SettingsRow>
       {players.length === 0 && !refreshingPlayers && (
-        <PanelSectionRow>
+        <SettingsRow>
           <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>
-        </PanelSectionRow>
+        </SettingsRow>
       )}
-      </>}
+      {!settings.has_plex_token && !settings.local_server_enabled && (
+        <SettingsRow><DialogBodyText style={{ opacity: 0.7 }}>
+          Connect a Plex server in Advanced to send music from your library.
+        </DialogBodyText></SettingsRow>
+      )}
       {(refreshingPlayers || savingPlayerSettings || playersStatus) && <StatusLine busy={refreshingPlayers || savingPlayerSettings}
         text={savingPlayerSettings ? 'Saving player settings…' : refreshingPlayers ? 'Finding Plex players…' : playersStatus} />}
-    </PanelSection>
+    </SettingsSection>
     </>
   );
 
@@ -816,10 +919,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       libraryCatalog?.server_id === settings.selected_server_id
         ? (libraryCatalog.libraries || []).filter(library => librarySelection.includes(library.id))
         : [],
+      settings.has_plex_token,
     );
     return (
-    <PanelSection title="Library browser">
-      <PanelSectionRow>
+    <SettingsSection title="Library browser">
+      <SettingsRow>
         <SliderField
           label="Grid columns"
           min={3}
@@ -830,41 +934,80 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           disabled={!settingsAvailable}
           onChange={(value: number) => updateSetting('grid_columns', Math.round(value))}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ButtonItem label="Music categories" description="Choose what to show and in which order."
           disabled={!settingsAvailable}
-          onClick={() => editBrowserCategories('Music categories', 'music', musicCategories)}>Customize</ButtonItem>
-      </PanelSectionRow>
+          onClick={() => editBrowserCategories('Music categories', 'music', musicBrowserCategories(settings.has_plex_token))}>Customize</ButtonItem>
+      </SettingsRow>
       {loadingLibraries && <StatusLine busy text="Loading video categories…" />}
-      {selectedVideoCategories.length > 0 && <PanelSectionRow>
+      {selectedVideoCategories.length > 0 && <SettingsRow>
         <ButtonItem label="Video categories" description={settings.selected_server_name}
           disabled={!settingsAvailable || savingLibraries}
           onClick={() => editBrowserCategories(
             'Video categories', `video:${settings.selected_server_id}`, selectedVideoCategories,
           )}>Customize</ButtonItem>
-      </PanelSectionRow>}
+      </SettingsRow>}
       {browserStatus && <StatusLine busy={browserStatus === 'Saving…'} text={browserStatus} />}
-    </PanelSection>
+    </SettingsSection>
     );
   };
 
+  const canConnectLocal = !changingLocalConnection && !!localAddress.trim()
+    && (!settings.local_server_enabled || localAddress.trim() !== settings.selected_server_url);
+  const submitServerAddress = () => {
+    if (settings.has_plex_token) void testServerConnection();
+    else if (canConnectLocal) void changeLocalConnection();
+  };
+
   const renderAdvancedPage = () => (
-    <PanelSection>
-      <PanelSectionRow>
-        <DialogBodyText>
-          Optional local address override. Enter an IP address such as 192.168.1.20 or a full URL. Leave blank to use automatic Plex discovery.
-        </DialogBodyText>
-      </PanelSectionRow>
-      <PanelSectionRow>
+    <SettingsSection>
+      {settings.has_plex_token && <SettingsRow>
+        <DialogBodyText>Use a server address override when Plex discovery picks an unreachable address.</DialogBodyText>
+      </SettingsRow>}
+      <SettingsRow>
         <TextField
-          label="Plex server IP or URL"
-          value={settings.manual_server_url}
+          label={settings.has_plex_token ? 'Plex server IP or URL' : 'Local Plex server address'}
+          value={settings.has_plex_token ? settings.manual_server_url : localAddress}
+          description={settings.has_plex_token ? undefined : 'Connect directly to a server that already allows access from this device.'}
           placeholder="192.168.1.20:32400"
-          onChange={(e: React.ChangeEvent<HTMLInputElement>) => updateSetting('manual_server_url', e.target.value)}
+          disabled={changingLocalConnection}
+          {...{
+            strEnterKeyLabel: settings.has_plex_token ? 'Test connection' : 'Connect',
+            onEnterKeyPress: submitServerAddress,
+          }}
+          onKeyDown={event => {
+            if (event.key !== 'Enter' || event.nativeEvent.isComposing) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (!event.repeat) submitServerAddress();
+          }}
+          onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+            if (settings.has_plex_token) updateSetting('manual_server_url', e.target.value);
+            else {
+              setLocalAddress(e.target.value);
+              setLocalConnectionStatus('');
+            }
+          }}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      {!settings.has_plex_token && <>
+        {(!settings.local_server_enabled || localAddress.trim() !== settings.selected_server_url) && (
+          <SettingsRow>
+            <Button className="deckyplex-settings-button" onClick={submitServerAddress}
+              disabled={!canConnectLocal}>
+              Connect
+            </Button>
+          </SettingsRow>
+        )}
+        {settings.local_server_enabled && <SettingsRow>
+          <Button className="deckyplex-settings-button" onClick={() => void changeLocalConnection(true)}
+            disabled={changingLocalConnection}>Disconnect</Button>
+        </SettingsRow>}
+        {(localConnectionStatus || settings.local_server_enabled) && <StatusLine busy={changingLocalConnection}
+          text={localConnectionStatus || `Connected to ${settings.selected_server_name}.`} />}
+      </>}
+      <SettingsRow>
         <SliderField
           label={`Connection timeout: ${settings.connection_timeout}s`}
           value={settings.connection_timeout}
@@ -873,20 +1016,21 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           step={1}
           onChange={(value: number) => updateSetting('connection_timeout', Math.round(value))}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
+      </SettingsRow>
+      <SettingsRow>
         <ToggleField
           label="Verify HTTPS certificates"
           description="Turn off only for a server with an invalid or self-signed certificate."
           checked={settings.verify_tls}
           onChange={(checked: boolean) => updateSetting('verify_tls', checked)}
         />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <Button onClick={testServerConnection} disabled={advancedStatus === 'Testing Plex server connection…'}>Test connection</Button>
-      </PanelSectionRow>
+      </SettingsRow>
+      {settings.has_plex_token && <SettingsRow>
+        <Button className="deckyplex-settings-button" onClick={testServerConnection}
+          disabled={advancedStatus === 'Testing Plex server connection…'}>Test connection</Button>
+      </SettingsRow>}
       {advancedStatus && <StatusLine busy={advancedStatus === 'Saving…' || advancedStatus === 'Testing Plex server connection…'} text={advancedStatus} />}
-    </PanelSection>
+    </SettingsSection>
   );
 
   const pages = [
@@ -898,12 +1042,17 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     {
       title: 'Server',
       icon: <FaServer />,
-      content: settings.has_plex_token ? renderServerPage() : (
-        <PanelSection>
-          <PanelSectionRow>
-            <DialogBodyText style={{ opacity: 0.5 }}>Log in first to select a server.</DialogBodyText>
-          </PanelSectionRow>
-        </PanelSection>
+      content: settings.has_plex_token ? renderServerPage() : settings.local_server_enabled ? (
+        <>
+          <SettingsSection><StatusLine text={`Connected to ${settings.selected_server_name}.`} /></SettingsSection>
+          {renderLibraryPicker()}
+        </>
+      ) : (
+        <SettingsSection>
+          <SettingsRow>
+            <DialogBodyText style={{ opacity: 0.7 }}>Sign in under Account or connect directly under Advanced.</DialogBodyText>
+          </SettingsRow>
+        </SettingsSection>
       ),
     },
     {
@@ -919,17 +1068,59 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     {
       title: 'Advanced',
       icon: <FaCog />,
-      content: settings.has_plex_token ? renderAdvancedPage() : (
-        <PanelSection><PanelSectionRow><DialogBodyText style={{ opacity: 0.5 }}>Log in first to change connection settings.</DialogBodyText></PanelSectionRow></PanelSection>
-      ),
+      content: renderAdvancedPage(),
     },
   ];
 
+  const compactPages = pages.map(page => ({ ...page, hideTitle: true, padding: 'none' as const,
+    content: <div className="deckyplex-settings-page">{page.content}</div>,
+  }));
   return (
-    <div style={{ marginTop: '40px', height: 'calc(100% - 40px)' }}>
+    <div data-deckyplex-settings="" style={{ marginTop: 40, height: 'calc(100% - 40px)', width: '100%' }}>
+      <FocusOutlineStyles />
+      <style>{`
+        @media (min-width: 501px) {
+          [data-deckyplex-settings] .PageListColumn {
+            flex: 0 0 clamp(10rem, 19vw, 13rem); width: clamp(10rem, 19vw, 13rem); min-width: 0;
+          }
+        }
+        [data-deckyplex-settings] [role="tabpanel"] > .DialogContent_InnerWidth {
+          width: 100%; max-width: none; box-sizing: border-box;
+        }
+        .deckyplex-settings-page { display: grid; gap: 0.95rem; width: 100%; min-width: 0;
+          box-sizing: border-box; padding: 0.75rem clamp(0.8rem, 1.8vw, 1.6rem) 3rem; }
+        .deckyplex-settings-section > h2 { font-size: 0.92rem; font-weight: 650; line-height: 1.25;
+          margin: 0 0 0.4rem; color: #dce8f6; }
+        .deckyplex-settings-fields { display: grid; gap: 0.25rem; align-items: start; padding: 0.48rem 0.7rem;
+          background: #1b2635; border: 1px solid #304057; border-radius: 7px; }
+        .deckyplex-settings-row { min-width: 0; padding-block: 0.08rem; }
+        .deckyplex-settings-button { width: 100%; margin: 0 !important; box-sizing: border-box; }
+        [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton) {
+          background: #29394d !important; color: #edf3fd !important; border: 0 !important;
+          border-radius: 5px;
+        }
+        [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton):is(.gpfocus, :focus-visible, :active) {
+          background: #416489 !important; color: #edf3fd !important;
+          outline: 2px solid #a0c9ef !important; outline-offset: -2px;
+        }
+        [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton):is(:disabled, .Disabled, [aria-disabled="true"]) {
+          background: #202c3b !important; color: #8b9caf !important; outline: none !important;
+        }
+        [data-deckyplex-settings] :is(button, [role="button"]),
+        [data-deckyplex-settings] :is(button, [role="button"])::before,
+        [data-deckyplex-settings] :is(button, [role="button"])::after {
+          box-shadow: none !important; text-shadow: none !important; filter: none !important;
+        }
+        [data-deckyplex-settings] .${gamepadDialogClasses?.FieldLabel || 'deckyplex-no-match'} {
+          font-size: 0.91rem; line-height: 1.28; }
+        [data-deckyplex-settings] .${gamepadDialogClasses?.FieldDescription || 'deckyplex-no-match'} {
+          font-size: 0.79rem; line-height: 1.35; color: #bac9da; }
+        [data-deckyplex-settings] .${gamepadDialogClasses?.Field || 'deckyplex-no-match'} {
+          padding-block: 0.38rem; }
+      `}</style>
       {loadingSettings
-        ? <PanelSection title="DeckyPlex Settings"><StatusLine busy text="Loading settings…" /></PanelSection>
-        : <SidebarNavigation title="DeckyPlex Settings" showTitle pages={pages} />}
+        ? <div className="deckyplex-settings-page"><SettingsSection><StatusLine busy text="Loading settings…" /></SettingsSection></div>
+        : <SidebarNavigation title="DeckyPlex Settings" showTitle={false} pages={compactPages} />}
     </div>
   );
 }

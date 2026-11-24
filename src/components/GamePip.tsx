@@ -32,6 +32,8 @@ export interface VideoItem {
   grandparentTitle?: string;
 }
 
+export type ActivePipStream = { url: string; manifest: string; handoff_key: string };
+
 export interface VideoResume {
   item: VideoItem;
   serverId: string;
@@ -42,6 +44,7 @@ export interface VideoResume {
   muted: boolean;
   mediaIndex?: number;
   episodes?: VideoItem[];
+  activePipStream?: ActivePipStream;
 }
 
 interface Overlay {
@@ -171,7 +174,7 @@ export function stopGamePip() {
   publish();
 }
 
-function quickAccessLeft(view: Window | undefined, screenWidth: number) {
+function quickAccessLeft(view: Window | undefined, main: Window, screenWidth: number) {
   if (!view) return undefined;
   try {
     const doc = view.document;
@@ -187,11 +190,17 @@ function quickAccessLeft(view: Window | undefined, screenWidth: number) {
       if (left >= viewportWidth) return screenWidth;
       const visibleWidth = Math.min(right, viewportWidth) - Math.max(0, left);
       if (visibleWidth <= 0) continue;
-      // Separate tray windows have a local origin but still dock to the display's right edge.
-      const edge = viewportWidth >= displayWidth - 2 && left > 0
-        ? left * screenWidth / viewportWidth
-        : screenWidth - visibleWidth * screenWidth / displayWidth;
-      if (edge >= screenWidth * 0.1) return Math.floor(edge);
+      if ((view === main || viewportWidth >= displayWidth - 2) && left > 0 && right >= viewportWidth * 0.97) {
+        // A full-width Steam window can give us the panel's actual left edge.
+        if (left >= viewportWidth * 0.1) return Math.floor(left * screenWidth / viewportWidth);
+      } else if (view !== main && viewportWidth < displayWidth - 2) {
+        // Use the reported offset of a separate window only if it lines up with this display.
+        const scale = screenWidth / displayWidth;
+        const origin = (view.screenX - main.screenX) * scale;
+        if (origin > 0 && Math.abs(origin + viewportWidth * scale - screenWidth) <= 8) {
+          return Math.floor(origin + Math.max(0, left) * scale);
+        }
+      }
     }
   } catch {
     // The focused Steam window can belong to a different browser view.
@@ -215,15 +224,15 @@ function updateBounds(current: Overlay, steam: SteamWindow) {
   let trayLeft: number | undefined;
   if (quickAccessOpen) {
     for (const view of new Set([trayView, focused?.BrowserWindow, main])) {
-      const edge = quickAccessLeft(view, screenWidth);
+      const edge = quickAccessLeft(view, main, screenWidth);
       if (edge === undefined) continue;
       trayLeft = edge;
       if (edge < screenWidth) break;
     }
   }
-  // If the tray is visible but has no measurable panel, use the opposite side for right placements.
-  const position = quickAccessOpen && trayLeft === undefined && current.position.endsWith('right')
-    ? current.position.replace(/right$/, 'left') as PipPosition : current.position;
+  const position = quickAccessOpen && trayLeft === undefined
+    ? (current.position === 'center' ? 'center-left' : current.position.replace(/-(center|right)$/, '-left')) as PipPosition
+    : current.position;
   const { x, y, width, height } = getPipBounds(screenWidth, screenHeight, current.size, position, trayLeft);
   if (!(width > 0 && height > 0)) throw new Error('Steam did not report the overlay display size.');
   const bounds = `${x},${y},${width},${height}`;
@@ -507,12 +516,16 @@ export async function prepareGamePipFullscreen() {
   current.busy = true;
   window.clearTimeout(current.clock);
   publish();
-  const latest = await getStatus(current.id).catch(() => null);
+  const [latest, activePipStream] = await Promise.all([
+    getStatus(current.id).catch(() => null),
+    call<[string], ActivePipStream | null>('get_game_pip_resume_stream', current.id).catch(() => null),
+  ]);
   if (overlay !== current) return false;
   const playback = latest?.status === 'playing' || latest?.status === 'paused' ? latest : current.playback;
   fullscreenRequest = {
     item: current.item, serverId: current.serverId, position: playback.position, playing: playback.status === 'playing',
     quality: current.quality, volume: current.volume, muted: current.muted, episodes: current.episodes, mediaIndex: current.mediaIndex,
+    activePipStream: activePipStream ?? undefined,
   };
   current.playback = playback;
   stopGamePip();

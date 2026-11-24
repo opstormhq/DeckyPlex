@@ -7,6 +7,7 @@ import { BrowserPage } from './components/BrowserPage';
 import { SettingsPage } from './components/SettingsPage';
 import { GamePipHost, gamePipFullscreenEvent, prepareGamePipFullscreen, stopGamePip } from './components/GamePip';
 import { preservePreferencesDuringUpdates } from './packagePreferences';
+import { clearPausedVideo, requestPausedVideo, resumePausedVideoEvent, suspendVideoPlayback } from './components/VideoPlayback';
 
 const BROWSER_ROUTE = "/deckyplex-browser";
 const SETTINGS_ROUTE = "/deckyplex-settings";
@@ -20,6 +21,7 @@ function openPluginPage(route: typeof pluginRoutes[number]) {
     ?? Router?.WindowStore?.SteamUIWindows?.[0];
   const current = steamWindow?.m_locationPathname;
   if (current !== route) {
+    if (route === SETTINGS_ROUTE || route === LOGIN_ROUTE) suspendVideoPlayback();
     if (typeof steamWindow?.Navigate === 'function') {
       // Keep the Steam page underneath the plugin as the Back destination.
       const replace = pluginRoutes.some(path => path === current);
@@ -48,6 +50,7 @@ export default definePlugin(() => {
   try { window.localStorage.removeItem('deckyplex-grid-columns'); } catch {}
   const stopPreservingPreferences = preservePreferencesDuringUpdates();
   const endLocalVolumeSession = startLocalVolumeSession();
+  window.addEventListener('deckyplex-local-music-playing', clearPausedVideo);
   routerHook.addRoute(BROWSER_ROUTE, BrowserPageWithProvider, { exact: true });
   routerHook.addRoute(SETTINGS_ROUTE, SettingsPage, { exact: true });
   routerHook.addRoute(LOGIN_ROUTE, LoginPage, { exact: true });
@@ -62,7 +65,11 @@ export default definePlugin(() => {
     content: (
       <PlayerProvider>
         <QuickPlayer onLogin={() => openPluginPage(LOGIN_ROUTE)} onBrowse={() => openPluginPage(BROWSER_ROUTE)}
-          onSettings={() => openPluginPage(SETTINGS_ROUTE)} onExpandPip={() => {
+          onSettings={() => openPluginPage(SETTINGS_ROUTE)} onResumeVideo={playing => {
+            if (!requestPausedVideo(playing)) return;
+            openPluginPage(BROWSER_ROUTE);
+            window.requestAnimationFrame(() => window.dispatchEvent(new Event(resumePausedVideoEvent)));
+          }} onExpandPip={() => {
           void prepareGamePipFullscreen().then(prepared => {
             if (!prepared) return;
             openPluginPage(BROWSER_ROUTE);
@@ -75,6 +82,8 @@ export default definePlugin(() => {
       stopPreservingPreferences();
       endLocalVolumeSession();
       stopGamePip();
+      window.removeEventListener('deckyplex-local-music-playing', clearPausedVideo);
+      clearPausedVideo();
       routerHook.removeGlobalComponent(GAME_PIP_HOST);
       routerHook.removeRoute(BROWSER_ROUTE);
       routerHook.removeRoute(SETTINGS_ROUTE);

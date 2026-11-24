@@ -13,7 +13,12 @@ export type VideoTab = 'videoHome' | 'videoWatchlist' | LibraryTab;
 export type CategoryLayout = { order: string[]; hidden: string[] };
 export type BrowserLayouts = Record<string, CategoryLayout>;
 
-export function videoCategories(libraries: { id: string; name: string; type: string }[]) {
+export function musicBrowserCategories(hasPlexAccount: boolean) {
+  return hasPlexAccount ? musicCategories
+    : musicCategories.filter(category => category.key !== 'recent' && category.key !== 'playlists');
+}
+
+export function videoCategories(libraries: { id: string; name: string; type: string }[], hasPlexAccount = true) {
   const categories: { key: VideoTab; title: string; type: string }[] = [];
   const hasVideos = libraries.some(library => library.type === 'movie' || library.type === 'show');
   if (hasVideos) {
@@ -24,7 +29,7 @@ export function videoCategories(libraries: { id: string; name: string; type: str
       categories.push({ key: `library:${library.id}`, title: library.name, type: library.type });
     }
   }
-  if (hasVideos) categories.push({ key: 'videoWatchlist', title: 'Watchlist', type: 'watchlist' });
+  if (hasVideos && hasPlexAccount) categories.push({ key: 'videoWatchlist', title: 'Watchlist', type: 'watchlist' });
   return categories;
 }
 

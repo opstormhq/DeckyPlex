@@ -72,10 +72,12 @@ function RatingPicker({ userRating, save }: {
   </>;
 }
 
-export function VideoOptionsDialog({ item, userRating, onWatchlist, canRemoveContinue, playFromBeginning, queueNext, apply, close }: {
+export function VideoOptionsDialog({ item, userRating, onWatchlist, allowAccountActions = true,
+  canRemoveContinue, playFromBeginning, queueNext, apply, close }: {
   item: VideoItem;
   userRating?: number | null;
   onWatchlist?: boolean;
+  allowAccountActions?: boolean;
   canRemoveContinue?: boolean;
   playFromBeginning: () => void;
   queueNext?: () => void;
@@ -83,7 +85,7 @@ export function VideoOptionsDialog({ item, userRating, onWatchlist, canRemoveCon
   close: () => void;
 }) {
   const playable = item.type === 'movie' || item.type === 'episode';
-  const supportsWatchlist = item.type === 'movie' || item.type === 'show';
+  const supportsWatchlist = allowAccountActions && (item.type === 'movie' || item.type === 'show');
   const partial = resumePosition(item.viewOffset || 0, item.duration || 0) > 0;
   const [page, setPage] = useState<'options' | 'reset' | 'rating'>('options');
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -114,17 +116,17 @@ export function VideoOptionsDialog({ item, userRating, onWatchlist, canRemoveCon
           {page === 'options' && <>
             {queueNext && <ChoiceDialogRow title="Play next" icon={<FaStepForward />} onChoose={queueNext} />}
             {partial && playable && <ChoiceDialogRow title="Play from beginning" icon={<FaStepBackward />} onChoose={playFromBeginning} />}
-            {playable && canRemoveContinue && <ChoiceDialogRow title="Remove from Continue Watching" icon={<FaTimes />}
+            {allowAccountActions && playable && canRemoveContinue && <ChoiceDialogRow title="Remove from Continue Watching" icon={<FaTimes />}
               onChoose={() => apply('remove_continue')} />}
-            {playable && (!item.viewCount || !!item.viewOffset) && <ChoiceDialogRow title="Mark as watched" icon={<FaCheck />}
+            {allowAccountActions && playable && (!item.viewCount || !!item.viewOffset) && <ChoiceDialogRow title="Mark as watched" icon={<FaCheck />}
               onChoose={() => apply('mark_watched')} />}
-            {playable && (!!item.viewCount || !!item.viewOffset) && <ChoiceDialogRow title="Mark as unwatched" icon={<FaEyeSlash />}
+            {allowAccountActions && playable && (!!item.viewCount || !!item.viewOffset) && <ChoiceDialogRow title="Mark as unwatched" icon={<FaEyeSlash />}
               onChoose={() => item.viewOffset ? setPage('reset') : apply('mark_unwatched')} />}
             {supportsWatchlist && <ChoiceDialogRow
               title={onWatchlist ? 'Remove from Watchlist' : 'Add to Watchlist'} icon={<FaBookmark />}
               onChoose={() => apply(onWatchlist ? 'remove_watchlist' : 'add_watchlist')} />}
-            <ChoiceDialogRow title="Your rating" detail={userRating == null ? undefined : `${userRating / 2} / 5 stars`}
-              icon={<FaStar />} onChoose={() => setPage('rating')} />
+            {allowAccountActions && <ChoiceDialogRow title="Your rating" detail={userRating == null ? undefined : `${userRating / 2} / 5 stars`}
+              icon={<FaStar />} onChoose={() => setPage('rating')} />}
           </>}
         </ChoiceDialogList>
       </ChoiceDialogBody>

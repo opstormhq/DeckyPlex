@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type Ref } from 'react';
-import { Button, DialogBodyText, DialogCheckbox, Focusable, ModalRoot, PanelSectionRow } from '@decky/ui';
-import { FaServer } from 'react-icons/fa';
+import { Button, DialogBodyText, ModalRoot, ToggleField } from '@decky/ui';
+import { FaArrowRight, FaServer } from 'react-icons/fa';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
 
@@ -24,23 +24,18 @@ export interface LibraryCatalog {
 
 const libraryTypes: Record<string, string> = { artist: 'Music', movie: 'Movies', show: 'TV shows', photo: 'Photos' };
 
-export function LibraryRow({ library, checked, disabled, onChange, checkboxRef }: {
+export function LibraryRow({ library, included, disabled, onChange, rowRef }: {
   library: LibraryChoice;
-  checked: boolean;
+  included: boolean;
   disabled?: boolean;
-  onChange: (checked: boolean) => void;
-  checkboxRef?: Ref<HTMLDivElement>;
+  onChange: (included: boolean) => void;
+  rowRef?: Ref<HTMLDivElement>;
 }) {
-  return (
-    <PanelSectionRow>
-      <DialogCheckbox ref={checkboxRef} checked={checked} disabled={disabled} onChange={onChange}
-        label={<span style={{ display: 'flex', alignItems: 'baseline', gap: '0.65rem', minWidth: 0 }}>
-          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={library.name}>{library.name}</span>
-          <span style={{ fontSize: '0.8em', opacity: 0.65, flexShrink: 0 }}>{libraryTypes[library.type]}</span>
-        </span>}
-      />
-    </PanelSectionRow>
-  );
+  return <div ref={rowRef} data-deckyplex-choice-row="" style={{ width: '100%' }}>
+    <ToggleField label={<span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '0.45rem' }}>
+      {library.name}<span style={{ opacity: 0.65, fontSize: '0.82em' }}>{libraryTypes[library.type]}</span>
+    </span>} checked={included} disabled={disabled} onChange={onChange} bottomSeparator="none" highlightOnFocus />
+  </div>;
 }
 
 export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, complete, close }: {
@@ -60,7 +55,6 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
   const savingRef = useRef(false);
   const firstServerRef = useRef<HTMLDivElement>(null);
   const firstLibraryRef = useRef<HTMLDivElement>(null);
-  const footerRef = useRef<HTMLDivElement>(null);
   const retryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -82,8 +76,9 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
     const frame = window.requestAnimationFrame(() => {
       if (!server) firstServerRef.current?.focus();
       else if (loadingError) retryRef.current?.focus();
-      else if (catalog?.length) firstLibraryRef.current?.focus();
-      else if (catalog) footerRef.current?.focus();
+      else if (catalog?.length) {
+        firstLibraryRef.current?.querySelector<HTMLElement>('[tabindex="0"], button:not([disabled])')?.focus();
+      }
     });
     return () => window.cancelAnimationFrame(frame);
   }, [server, catalog, loadingError]);
@@ -97,7 +92,11 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
   };
 
   const confirm = async () => {
-    if (!server || !selectedIds.length || savingRef.current) return;
+    if (!server || !catalog?.length || savingRef.current) return;
+    if (!selectedIds.length) {
+      setSaveError('Select at least one library.');
+      return;
+    }
     savingRef.current = true;
     setSaving(true);
     setSaveError('');
@@ -112,11 +111,16 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
     }
   };
 
-  const cancel = () => { if (!savingRef.current) close(); };
+  const cancel = () => {
+    if (savingRef.current) return;
+    if (server && servers.length > 1) choose(null);
+    else close();
+  };
   const defaultServer = servers.find(option => option.id === defaultServerId) || servers[0];
   return (
-    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}} bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
-      <ChoiceDialogBody title={server ? 'Choose Plex libraries' : 'Choose a Plex server'}>
+    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}}
+      bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
+      <ChoiceDialogBody title={server ? 'Choose Plex libraries' : 'Choose a Plex server'} subtitle={server?.name}>
       {!server ? (
         <ChoiceDialogList>
           {servers.map(option => <ChoiceDialogRow key={option.id} title={option.name} icon={<FaServer />} actionDescription="Choose server"
@@ -125,7 +129,6 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
         </ChoiceDialogList>
       ) : (
         <>
-          <DialogBodyText style={{ margin: '0 0 0.4rem' }}>{server.name}</DialogBodyText>
           {!catalog && !loadingError && <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <InlineSpinner />Loading Plex libraries…
           </div>}
@@ -137,24 +140,23 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
           )}
           {catalog?.length === 0 && <DialogBodyText>This server has no supported libraries.</DialogBodyText>}
           {!!catalog?.length && (
-            <ChoiceDialogList>
+            <ChoiceDialogList centerFocused>
               {catalog.map((library, index) => (
-                <LibraryRow key={library.id} library={library} checked={selectedIds.includes(library.id)} disabled={saving}
-                  checkboxRef={index === 0 ? firstLibraryRef : undefined}
-                  onChange={checked => setSelectedIds(current => checked
-                    ? [...new Set([...current, library.id])]
-                    : current.filter(id => id !== library.id))} />
+                <LibraryRow key={library.id} library={library} included={selectedIds.includes(library.id)}
+                  rowRef={index === 0 ? firstLibraryRef : undefined} disabled={saving}
+                  onChange={included => {
+                    if (savingRef.current) return;
+                    setSaveError('');
+                    setSelectedIds(current => included ? [...new Set([...current, library.id])] : current.filter(id => id !== library.id));
+                  }} />
               ))}
+              <ChoiceDialogRow title={saving ? 'Applying…' : 'Continue'}
+                icon={saving ? <InlineSpinner /> : <FaArrowRight />}
+                disabled={saving || !selectedIds.length} onChoose={() => void confirm()} />
             </ChoiceDialogList>
           )}
-          {saveError && <DialogBodyText>{saveError}</DialogBodyText>}
-          <Focusable flow-children="horizontal" style={{ display: 'flex', gap: '0.5rem', marginTop: '0.6rem' }}>
-            {servers.length > 1 && <Button disabled={saving} onClick={() => choose(null)}>Change server</Button>}
-            {catalog && <Button ref={footerRef} disabled={saving || (catalog.length > 0 && !selectedIds.length)}
-              onClick={catalog.length ? confirm : cancel}>
-              {saving ? <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><InlineSpinner />Applying…</span> : 'Done'}
-            </Button>}
-          </Focusable>
+          {saveError && <DialogBodyText style={{ margin: '0.4rem', color: '#ffc1c1' }}>{saveError}</DialogBodyText>}
+
         </>
       )}
       </ChoiceDialogBody>

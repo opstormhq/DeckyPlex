@@ -35,9 +35,14 @@ def _seconds(value):
 
 
 class GameVideo:
-    def __init__(self, plex, source, position, volume, muted, preferred_source="", active_manifest=None):
+    def __init__(self, plex, source, position, volume, muted, preferred_source="", active_manifest=None,
+                 source_identity=None):
         self.id = secrets.token_urlsafe(32)
         self.plex = plex
+        self.source_identity = source_identity
+        self.hls_urls = {}
+        self.hls_manifests = {}
+        self.active_hls_url = None
         self.origin = urlsplit(plex.base_url)
         self.lock = threading.Lock()
         self.closed = threading.Event()
@@ -61,9 +66,14 @@ class GameVideo:
             if kind not in ("direct", "hls", "http"):
                 continue
             name = {"audio-conversion": "hls-audio", "direct-stream": "hls-copy"}.get(stream.get("mode"), kind)
-            streams.append({"kind": kind, "url": self._media_url(stream["url"]), "name": name})
-            if kind == "hls" and stream.get("fallback_url"):
-                streams.append({"kind": kind, "url": self._media_url(stream["fallback_url"]), "name": "hls-proxy"})
+            route = self._media_url(stream["url"])
+            streams.append({"kind": kind, "url": route, "name": name})
+            if kind == "hls":
+                self.hls_urls[route] = stream["url"]
+                if stream.get("fallback_url"):
+                    fallback = self._media_url(stream["fallback_url"])
+                    self.hls_urls[fallback] = stream["fallback_url"]
+                    streams.append({"kind": kind, "url": fallback, "name": "hls-proxy"})
         streams.sort(key=lambda candidate: candidate["name"] != preferred_source)
         self.handoff_manifest = None
         if active_manifest:
@@ -74,7 +84,10 @@ class GameVideo:
                 # A manifest from a different endpoint cannot be relayed.
                 pass
             else:
-                streams.insert(0, {"kind": "hls", "url": f"/{self.id}/handoff.m3u8", "name": "hls-active"})
+                route = f"/{self.id}/handoff.m3u8"
+                self.hls_urls[route] = upstream
+                self.remember_hls_manifest(upstream, content)
+                streams.insert(0, {"kind": "hls", "url": route, "name": "hls-active"})
         self.config = {
             "streams": streams,
             "position": self.position,
@@ -155,6 +168,21 @@ class GameVideo:
             return {"status": status, "position": self.position, "duration": self.duration,
                     "code": code[-96:], "committed": self.committed}
 
+    def remember_hls_manifest(self, upstream, content):
+        if not self.source_identity or not self.plex.local_connection or len(content) > 65536 or upstream not in self.hls_urls.values():
+            return
+        manifest = content.decode("utf-8-sig")
+        if manifest.lstrip().startswith("#EXTM3U"):
+            with self.lock:
+                self.hls_manifests[upstream] = manifest
+
+    def fullscreen_hls(self):
+        with self.lock:
+            if self.closed.is_set() or self.status not in ("playing", "paused"):
+                return None
+            manifest = self.hls_manifests.get(self.active_hls_url)
+            return (self.active_hls_url, manifest) if manifest else None
+
     def record_upstream_error(self, code):
         with self.lock:
             self.upstream_error = code
@@ -165,6 +193,8 @@ class GameVideo:
             status = data.get("status")
             if status in ("waiting", "ready", "playing", "paused", "ended", "error"):
                 self.status = status
+                route = data.get("stream_path")
+                self.active_hls_url = self.hls_urls.get(route) if isinstance(route, str) else None
                 if self.control["audible"] and status in ("playing", "paused"):
                     self.committed = self.committed or data.get("applied_sequence") == self.control["sequence"]
                 if data.get("seek_sequence", 0) == self.control["seek_sequence"]:
@@ -273,7 +303,9 @@ class _GameVideoHandler(BaseHTTPRequestHandler):
         if not upstream:
             self.send_error(404)
             return
-        headers = {"Accept-Encoding": "identity", "X-Plex-Token": video.plex.token}
+        headers = {"Accept-Encoding": "identity"}
+        if video.plex.token:
+            headers["X-Plex-Token"] = video.plex.token
         headers.update((name, value) for name, value in parse_qsl(urlsplit(upstream).query)
                        if name in SESSION_HEADERS)
         if self.headers.get("Range"):
@@ -296,6 +328,7 @@ class _GameVideoHandler(BaseHTTPRequestHandler):
                             self.send_error(502)
                             return
                     manifest = video._playlist(upstream, content)
+                    video.remember_hls_manifest(upstream, content)
                     sent_headers = True
                     self._response(200, "application/vnd.apple.mpegurl", manifest)
                     return

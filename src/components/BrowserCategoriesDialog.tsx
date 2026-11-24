@@ -59,8 +59,8 @@ export function BrowserCategoriesDialog({ title, categories, initialLayout, clos
           {rows.map(({ key, title }, index) => {
             const checked = !layout.hidden.includes(key);
             return (
-              <Focusable key={key} flow-children="horizontal" style={{ display: 'flex', alignItems: 'center',
-                gap: '0.4rem', padding: '0.15rem 0.5rem', flexShrink: 0, minWidth: 0,
+              <Focusable key={key} data-deckyplex-choice-row="" flow-children="horizontal" style={{ display: 'flex', alignItems: 'center',
+                gap: '0.4rem', padding: '0.15rem 0.5rem', flex: '0 0 auto', minWidth: 0,
                 borderRadius: '0.5rem', background: 'rgba(255,255,255,0.06)' }}>
                 <div style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>
                   <ToggleField label={title} checked={checked} bottomSeparator="none"
@@ -81,10 +81,10 @@ export function BrowserCategoriesDialog({ title, categories, initialLayout, clos
             );
           })}
         </ChoiceDialogList>
-        <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', minHeight: '1.45rem', margin: '0.35rem 0.4rem 0' }}>
+        {(saving || error) && <div role="status" style={{ flexShrink: 0, display: 'flex', alignItems: 'center', gap: '0.4rem', minHeight: '1.45rem', margin: '0.35rem 0.4rem 0' }}>
           {saving && <><InlineSpinner /><DialogBodyText style={{ margin: 0 }}>Saving…</DialogBodyText></>}
           {error && <DialogBodyText style={{ margin: 0 }}>{error}</DialogBodyText>}
-        </div>
+        </div>}
       </ChoiceDialogBody>
     </ModalRoot>
   );

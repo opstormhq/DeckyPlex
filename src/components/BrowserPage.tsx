@@ -1,3 +1,4 @@
+import { plexMediaUrl } from './PlexMediaUrl';
 import { Fragment, memo, useState, useEffect, useCallback, useMemo, useRef, type CSSProperties } from 'react';
 import {
   PanelSection,
@@ -29,10 +30,13 @@ import { showPlaybackStartDialog } from './PlaybackStartDialog';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
 import { collectionResumes, episodeLabel, insertNextEpisode, queueFromEpisode, resumeEpisode, resumePosition } from './VideoQueue';
-import { musicCategories, videoCategories, visibleCategories, type BrowserLayouts, type MusicTab, type VideoTab } from './BrowserCategories';
+import { musicBrowserCategories, videoCategories, visibleCategories,
+  type BrowserLayouts, type MusicTab, type VideoTab } from './BrowserCategories';
 import { VideoOptionsDialog, type VideoAction, type VideoActionResult } from './VideoOptionsDialog';
 import { VideoWatchIndicator } from './VideoWatchIndicator';
+import { clearPausedVideo, resumePausedVideoEvent, takePausedVideo } from './VideoPlayback';
 import { playNavigationSound, selectWithSound } from './GamepadSounds';
+import { retryPlexRead } from './PlexRead';
 
 interface LibraryItem {
   id: string;
@@ -94,6 +98,8 @@ const browserHeaderStyle: CSSProperties = {
 const browserHeaderScrollMargin = `calc(${browserHeaderStyle.height} + ${browserHeaderStyle.marginBottom} + 0.5rem)`;
 const DEFAULT_GRID_COLUMNS = 6;
 const BROWSER_FOOTER_CLEARANCE = 150;
+const BROWSER_SIDEBAR_FOOTER_CLEARANCE = 110;
+const BROWSER_FOCUS_EDGE_PADDING = 28;
 const ALPHABET_HOLD_DELAY = 450;
 const PAGE_SIZE = 36;
 const LIBRARY_CACHE_TTL = 600000;
@@ -180,15 +186,17 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const [videoAutoplay, setVideoAutoplay] = useState(true);
   const [librarySelectionKey, setLibrarySelectionKey] = useState('');
   const [serverId, setServerId] = useState('');
+  const [serverAddress, setServerAddress] = useState('');
+  const [hasPlexAccount, setHasPlexAccount] = useState(false);
   const [browserLayouts, setBrowserLayouts] = useState<BrowserLayouts>({});
   const browserLayoutsRef = useRef(browserLayouts);
   const layoutSnapshot = useRef('{}');
   const visibleMusic = useMemo(() => visibleCategories(
-    selectedSection || !libraries.length ? musicCategories : [], browserLayouts.music,
-  ), [selectedSection, libraries.length, browserLayouts.music]);
+    selectedSection || !libraries.length ? musicBrowserCategories(hasPlexAccount) : [], browserLayouts.music,
+  ), [selectedSection, libraries.length, browserLayouts.music, hasPlexAccount]);
   const visibleVideo = useMemo(() => visibleCategories(
-    videoCategories(libraries), browserLayouts[`video:${serverId}`],
-  ), [libraries, serverId, browserLayouts]);
+    videoCategories(libraries, hasPlexAccount), browserLayouts[`video:${serverId}`],
+  ), [libraries, serverId, hasPlexAccount, browserLayouts]);
   const tabs = useMemo((): { key: BrowserTab; title: string; icon: React.ReactNode }[] => [
     ...visibleMusic.map(category => ({ ...category, icon: musicCategoryIcons[category.key] })),
     ...visibleVideo.map(category => ({ ...category,
@@ -345,8 +353,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       const viewportRect = viewport.getBoundingClientRect();
       // Steam overlays a footer on the bottom of routed plugin views. Keep a
       // safe area for the sidebar and header controls.
-      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? 110 : BROWSER_FOOTER_CLEARANCE));
-      const edgePadding = 28;
+      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? BROWSER_SIDEBAR_FOOTER_CLEARANCE : BROWSER_FOOTER_CLEARANCE));
+      const edgePadding = BROWSER_FOCUS_EDGE_PADDING;
       const bottomOverflow = itemRect.bottom - (visibleBottom - edgePadding);
       const topOverflow = viewportRect.top + edgePadding - itemRect.top;
       const offset = bottomOverflow > 0 ? bottomOverflow : -Math.max(0, topOverflow);
@@ -369,7 +377,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const pending = pendingItems.current;
     const existing = pending.get(key);
     if (existing) return existing;
-    const load = request().then(result => {
+    const load = retryPlexRead(request).then(result => {
       if (cache === itemCache.current && Array.isArray(result?.items) && !result?.error) {
         cache.set(key, { items: result.items, hasMore: result.has_more,
           nextOffset: result.next_offset, recentOffsets: result.recent_offsets, expiresAt: Date.now() + ttlMs });
@@ -510,7 +518,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
           setBrowserLayouts(layouts);
         }
         setLibrarySelectionKey((result.library_selection_ids || []).join(','));
-        setServerId(result.has_plex_token ? result.selected_server_id || '' : '');
+        setHasPlexAccount(result.has_plex_token === true);
+        setServerAddress(result.selected_server_url || '');
+        setServerId(result.has_plex_token || result.local_server_enabled ? result.selected_server_id || '' : '');
       } catch (e) {
         if (active && id === requestId) setServerId('');
       } finally {
@@ -636,11 +646,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
     };
     const close = () => { clearDialog(); dialog.Close(); };
     const dialog = showModal(<TrackOptionsDialog track={{ ...track, sourceServerId: serverId }}
-      playlistId={playlistId} addToQueue={addToQueue} onClose={close} />,
+      playlistId={playlistId} allowPlaylists={hasPlexAccount} addToQueue={addToQueue} onClose={close} />,
       window, { strTitle: track.title, bNeverPopOut: true, fnOnClose: clearDialog });
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [addToQueue, serverId]);
+  }, [addToQueue, serverId, hasPlexAccount]);
 
   const openPlaylistOptions = useCallback((playlist: LibraryItem) => {
     const clearDialog = () => {
@@ -696,11 +706,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
     homeShelfFocus.current.clear();
     pendingHomeRow.current = undefined;
     restoringHistoryRef.current = false;
-    const initialTab = visibleCategories(musicCategories, browserLayoutsRef.current.music)[0]?.key ?? 'search';
+    const initialTab = visibleCategories(musicBrowserCategories(hasPlexAccount), browserLayoutsRef.current.music)[0]?.key ?? 'search';
     selectTab(initialTab);
     setLoadingLibraries(true);
     setError(null);
-    void call<[boolean], { sections?: LibrarySection[]; error?: string }>('get_library_sections', showAllMedia)
+    void retryPlexRead(() => call<[boolean], { sections?: LibrarySection[]; error?: string }>('get_library_sections', showAllMedia))
       .then(result => {
         if (!active) return;
         if (result?.error) throw new Error(result.error);
@@ -709,9 +719,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
         setLibraries(result.sections);
         if (activeTabRef.current === initialTab && focusZone.current === 'sidebar' && !pendingSearchInputFocus.current) {
           const layouts = browserLayoutsRef.current;
-          const music = result.sections.some(section => section.type === 'artist') ? musicCategories : [];
+          const music = result.sections.some(section => section.type === 'artist') ? musicBrowserCategories(hasPlexAccount) : [];
           const tab: BrowserTab = visibleCategories(music, layouts.music)[0]?.key
-            ?? visibleCategories(videoCategories(result.sections), layouts[`video:${serverId}`])[0]?.key ?? 'search';
+            ?? visibleCategories(videoCategories(result.sections, hasPlexAccount), layouts[`video:${serverId}`])[0]?.key ?? 'search';
           selectTab(tab);
           window.requestAnimationFrame(() => {
             if (active && focusZone.current === 'sidebar' && activeTabRef.current === tab && !pendingSearchInputFocus.current) {
@@ -727,7 +737,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       })
       .finally(() => { if (active) setLoadingLibraries(false); });
     return () => { active = false; };
-  }, [serverId, showAllMedia, librarySelectionKey, invalidateTabLoad, selectTab]);
+  }, [serverId, serverAddress, hasPlexAccount, showAllMedia, librarySelectionKey, invalidateTabLoad, selectTab]);
 
   useEffect(() => {
     if (!connected || loadingLibraries || !libraries.length || viewerExpanded || activeTab !== activeTabRef.current
@@ -750,18 +760,22 @@ const LibraryBrowser = memo(function LibraryBrowser({
   useEffect(() => {
     if (!serverId) return;
     const restoreVideo = () => {
-      const resume = takeGamePipFullscreen(serverId);
+      const resume = takeGamePipFullscreen(serverId) ?? takePausedVideo(serverId);
       if (!resume) return;
       viewerOrigin.current = { scrollTop: contentRef.current?.scrollTop || 0 };
       setViewerQueue(resume.episodes?.length ? resume.episodes : null);
       setViewerResume(resume);
-      setViewerPresentation(null);
+      setViewerPresentation({ fullscreen: true, controlsHidden: resume.playing, volume: resume.volume, muted: resume.muted });
       setViewerStartPosition(undefined);
       setViewerItem(resume.item);
     };
     window.addEventListener(gamePipFullscreenEvent, restoreVideo);
+    window.addEventListener(resumePausedVideoEvent, restoreVideo);
     restoreVideo();
-    return () => window.removeEventListener(gamePipFullscreenEvent, restoreVideo);
+    return () => {
+      window.removeEventListener(gamePipFullscreenEvent, restoreVideo);
+      window.removeEventListener(resumePausedVideoEvent, restoreVideo);
+    };
   }, [serverId]);
 
   useEffect(() => {
@@ -823,6 +837,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const hasTV = libraries.some(library => library.type === 'show');
     if (!hasMovies) rows.movies = { items: [] };
     if (!hasTV) rows.shows = { items: [] };
+    if (!hasPlexAccount) {
+      rows.watchlist = { items: [] };
+      rows.continue = { items: [] };
+      rows.next = { items: [] };
+    }
     setLoading(false);
     const loadRow = (row: typeof VIDEO_HOME_ROWS[number]) => {
       void cachedItems(`video-home:${row.id}`, row.ttl,
@@ -886,15 +905,17 @@ const LibraryBrowser = memo(function LibraryBrowser({
     };
     const refreshContinueWatching = () => refreshHomeRow(VIDEO_HOME_ROWS[0]);
     const refreshWatchlist = () => refreshHomeRow(VIDEO_HOME_ROWS[4]);
-    window.addEventListener(videoProgressEvent, refreshContinueWatching);
-    window.addEventListener(videoWatchlistEvent, refreshWatchlist);
+    if (hasPlexAccount) {
+      window.addEventListener(videoProgressEvent, refreshContinueWatching);
+      window.addEventListener(videoWatchlistEvent, refreshWatchlist);
+    }
     return () => {
       active = false;
       loadMoreHome.current = () => {};
       window.removeEventListener(videoProgressEvent, refreshContinueWatching);
       window.removeEventListener(videoWatchlistEvent, refreshWatchlist);
     };
-  }, [activeTab, connected, libraries, loadingLibraries, subView, cachedItems]);
+  }, [activeTab, connected, libraries, loadingLibraries, subView, cachedItems, hasPlexAccount]);
 
   // Load data when tab changes
   useEffect(() => {
@@ -1260,7 +1281,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       }
       if (result.stream_url) {
         console.log(`[DeckyPlex] Got stream URL, starting playback`);
-        playTrack(result.stream_url, trackInfo, trackQueue, result.fallback_stream_url || '', undefined, playbackToken);
+        playTrack(result.stream_url, trackInfo, trackQueue, result.fallback_stream_url || '', undefined, playbackToken, result.local_connection);
       } else {
         setError("Plex returned no audio stream URL.");
       }
@@ -1322,7 +1343,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
   }, [items, subView, tabHasMore, cachedItems, invalidateTabLoad]);
 
   const openMedia = useCallback((item: LibraryItem, collectionQueue?: VideoItem[], startPosition?: number) => {
-    if (item.type !== 'photo') stopGamePip();
+    if (item.type !== 'photo') {
+      clearPausedVideo();
+      stopGamePip();
+    }
     setViewerResume(null);
     setViewerPresentation(null);
     setViewerStartPosition(startPosition);
@@ -1491,6 +1515,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     };
     const dialog = showModal(
       <VideoOptionsDialog item={item} userRating={item.userRating} onWatchlist={onWatchlist}
+        allowAccountActions={hasPlexAccount}
         canRemoveContinue={homeRow === 'continue' || homeRow === 'next'}
         playFromBeginning={() => { close(); openMedia(item, undefined, 0); }}
         queueNext={queueNext ? () => { close(); queueNext(); } : undefined} apply={(action, rating) => void apply(action, rating)} close={close} />,
@@ -1691,8 +1716,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
     const sortTitle = alphabeticallySorted ? item.titleSort || item.title : undefined;
     const kind = item.type;
     const showPoster = homeView && kind === 'episode';
-    const originalImage = showPoster ? item.poster : kind === 'artist' ? item.art || item.thumb : item.thumb || item.art;
-    const imageUrl = (showPoster ? item.gridPoster : item.gridThumb) || originalImage;
+    const rawImage = showPoster ? item.poster : kind === 'artist' ? item.art || item.thumb : item.thumb || item.art;
+    const originalImage = rawImage && plexMediaUrl(rawImage, !hasPlexAccount);
+    const gridImage = showPoster ? item.gridPoster : item.gridThumb;
+    const imageUrl = gridImage ? plexMediaUrl(gridImage, !hasPlexAccount) : originalImage;
     const portrait = showPoster || ['movie', 'show', 'season'].includes(kind);
     const canQueueNext = kind === 'episode' && (pipEpisodeQueue || !!viewerQueue && viewerItem?.type === 'episode');
     const queueNext = () => {
@@ -1707,7 +1734,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (videoOptions) openVideoOptions(item, idx, homeRow, canQueueNext ? queueNext : undefined);
       else openPlaylistOptions(item);
     };
-    const secondaryAction = videoOptions || kind === 'playlist' ? options : undefined;
+    const secondaryAction = (videoOptions && (hasPlexAccount || canQueueNext)) || kind === 'playlist' ? options : undefined;
     const secondaryLabel = secondaryAction ? 'Options' : undefined;
     const title = episodeLabel(item);
     const subtitle = showPoster && item.grandparentTitle
@@ -1907,7 +1934,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         <PanelSection>
           <PanelSectionRow>
             <DialogBodyText style={{ opacity: 0.7 }}>
-              Please log in to Plex in Settings to browse your music library.
+              Sign in under Account or connect directly under Advanced to browse Plex.
             </DialogBodyText>
           </PanelSectionRow>
         </PanelSection>
@@ -2274,6 +2301,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       <FocusOutlineStyles />
       <style>{`
         [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
+        [data-browser-zone="sidebar"] {
+          width: max-content; min-width: min(12rem, 24vw); max-width: min(17rem, 30vw);
+        }
         [data-browser-alphabet]:not([hidden]) { display: grid; place-items: center; }
       `}</style>
     <div
@@ -2290,8 +2320,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
         overflow: 'hidden' }}
     >
       <div data-browser-zone="sidebar" ref={sidebarRef}
-        style={{ width: 'clamp(140px, 13vw, 175px)', boxSizing: 'border-box', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)',
-          padding: '0.5rem 0.4rem 110px 0.2rem', scrollPaddingBottom: '110px', overflowY: 'auto' }}>
+        style={{ boxSizing: 'border-box', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)',
+          padding: `0.5rem 0.4rem ${BROWSER_SIDEBAR_FOOTER_CLEARANCE + BROWSER_FOCUS_EDGE_PADDING}px 0.2rem`,
+          scrollPaddingBottom: BROWSER_SIDEBAR_FOOTER_CLEARANCE, overflowY: 'auto' }}>
         <div style={browserHeaderStyle}><DialogLabel style={{ margin: 0 }}>DeckyPlex</DialogLabel></div>
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
           {tabs.map(({ key: tab, title, icon }) => (
@@ -2307,7 +2338,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
               }}
               onActivate={event => selectWithSound(event, enterContent)}
               onClick={enterContent}
-              style={{ display: 'flex', alignSelf: 'stretch', width: '100%', height: '42px', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px', whiteSpace: 'nowrap' }}
+              style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0.35rem 0.65rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
               <span style={{ fontWeight: 400, fontSize: '0.85rem', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{title}</span>
@@ -2342,7 +2373,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   return (
     <>
       {browser}
-      {viewerItem && <MediaViewer key={viewerResume ? `${viewerItem.id}-from-pip` : viewerItem.id} item={viewerItem}
+      {viewerItem && <MediaViewer key={viewerResume ? `${viewerItem.id}-resumed` : viewerItem.id} item={viewerItem}
         subtitle={viewerItem.grandparentTitle || viewerItem.parentTitle}
         photo={viewerItem.type === 'photo'} initialVolume={localVolume} initialPlayback={viewerResume}
         initialPosition={viewerStartPosition}
@@ -2520,9 +2551,10 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
   );
 }
 
-function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
+function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onClose }: {
   track: Parameters<ReturnType<typeof usePlayer>['addToQueue']>[0];
   playlistId?: string;
+  allowPlaylists: boolean;
   addToQueue: ReturnType<typeof usePlayer>['addToQueue'];
   onClose: () => void;
 }) {
@@ -2658,7 +2690,7 @@ function TrackOptionsDialog({ track, playlistId, addToQueue, onClose }: {
         {view === 'actions' && <ChoiceDialogList>
           <ChoiceDialogRow title="Play Next" icon={<FaStepForward />} disabled={busy} onChoose={() => void queueTrack(true)} />
           <ChoiceDialogRow title="Add to Queue" icon={<FaListOl />} disabled={busy} onChoose={() => void queueTrack(false)} />
-          <ChoiceDialogRow title="Add to Playlist" icon={<FaListUl />} disabled={busy} onChoose={() => void showPlaylists()} />
+          {allowPlaylists && <ChoiceDialogRow title="Add to Playlist" icon={<FaListUl />} disabled={busy} onChoose={() => void showPlaylists()} />}
           {playlistId && <ChoiceDialogRow title="Remove from Playlist" icon={<FaMinus />} disabled={busy}
             onChoose={() => void removeFromPlaylist()} />}
         </ChoiceDialogList>}

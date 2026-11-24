@@ -10,27 +10,34 @@ export function ChoiceDialogBody({ title, subtitle, bodyRef, children }: {
   children: ReactNode;
 }) {
   return (
-    <div ref={bodyRef} style={{ width: 'min(31rem, 78vw)', minHeight: '9rem' }}>
+    <div ref={bodyRef} style={{ display: 'flex', flexDirection: 'column', width: 'min(31rem, 78vw)', maxHeight: 'min(68vh, 36rem)', minHeight: '9rem' }}>
       <FocusOutlineStyles />
-      <DialogHeader style={{ marginBottom: subtitle ? '0.35rem' : '0.8rem', overflowWrap: 'anywhere' }}>{title}</DialogHeader>
-      {subtitle && <DialogBodyText style={{ margin: '0 0 0.6rem', overflowWrap: 'anywhere' }}>{subtitle}</DialogBodyText>}
+      <DialogHeader style={{ flexShrink: 0, marginBottom: subtitle ? '0.35rem' : '0.8rem', overflowWrap: 'anywhere' }}>{title}</DialogHeader>
+      {subtitle && <DialogBodyText style={{ flexShrink: 0, margin: '0 0 0.6rem', overflowWrap: 'anywhere' }}>{subtitle}</DialogBodyText>}
       {children}
     </div>
   );
 }
 
-export function ChoiceDialogList({ children }: { children: ReactNode }) {
+export function ChoiceDialogList({ children, centerFocused = false }: { children: ReactNode; centerFocused?: boolean }) {
   const keepChoiceVisible = ({ Element: choice }: { Element?: HTMLElement }) => {
     const list = choice?.closest<HTMLElement>('[data-deckyplex-choice-list]');
     if (!choice || !list?.offsetHeight) return false;
     const bounds = list.getBoundingClientRect();
     const scale = bounds.height / list.offsetHeight;
     if (!scale) return false;
-    const choiceBounds = choice.getBoundingClientRect();
+    const row = choice.closest<HTMLElement>('[data-deckyplex-choice-row]') ?? choice;
+    const choiceBounds = row.getBoundingClientRect();
     const top = (choiceBounds.top - bounds.top) / scale - list.clientTop;
     const bottom = (choiceBounds.bottom - bounds.top) / scale - list.clientTop;
     const padding = 6;
-    if (top < padding) list.scrollTop += top - padding;
+    if (centerFocused) {
+      const center = list.scrollTop + (top + bottom - list.clientHeight) / 2;
+      const target = Math.max(0, Math.min(list.scrollHeight - list.clientHeight, center));
+      const visible = top >= padding && bottom <= list.clientHeight - padding;
+      const moving = !list.ownerDocument.defaultView?.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (Math.abs(list.scrollTop - target) > 1) list.scrollTo({ top: target, behavior: visible && moving ? 'smooth' : 'instant' });
+    } else if (top < padding) list.scrollTop += top - padding;
     else if (bottom > list.clientHeight - padding) list.scrollTop += bottom - list.clientHeight + padding;
     return true;
   };
@@ -41,14 +48,14 @@ export function ChoiceDialogList({ children }: { children: ReactNode }) {
         if (event.target instanceof HTMLElement) keepChoiceVisible({ Element: event.target });
       }}
       style={{ display: 'flex', flexDirection: 'column', gap: '0.45rem',
-        maxHeight: '48vh', overflowY: 'auto', padding: '0.4rem', scrollPaddingBlock: '6px' }}>
+        minHeight: 0, maxHeight: '48vh', boxSizing: 'border-box', overflowY: 'auto', padding: '6px', scrollPaddingBlock: '6px' }}>
       {children}
     </Focusable>
   );
 }
 
 export function ChoiceDialogRow({ title, detail, icon, badge, actionDescription = title, rowRef, preferredFocus, disabled, selected,
-  destructive, onChoose }: {
+  destructive, onChoose, onToggle }: {
   title: string;
   detail?: string;
   icon: ReactNode;
@@ -60,19 +67,24 @@ export function ChoiceDialogRow({ title, detail, icon, badge, actionDescription 
   selected?: boolean;
   destructive?: boolean;
   onChoose: () => void;
+  onToggle?: () => void;
 }) {
-  const activate = (event: { preventDefault(): void; stopPropagation(): void }, isRepeat = false) => {
+  const activate = (event: { preventDefault(): void; stopPropagation(): void }, action: () => void, isRepeat = false) => {
     event.preventDefault();
     event.stopPropagation();
-    if (!disabled && !isRepeat) selectWithSound(event, onChoose);
+    if (!disabled && !isRepeat) selectWithSound(event, action);
   };
   return (
     <Focusable ref={rowRef} role="button" tabIndex={disabled ? -1 : 0} aria-disabled={disabled} aria-pressed={selected}
       {...focusOutlineProps} {...{ focusable: !disabled, preferredFocus }} onOKActionDescription={actionDescription}
-      onActivate={activate}
-      onOKButton={event => activate(event, event.detail?.is_repeat)}
-      onClick={activate}
-      onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') activate(event, event.repeat); }}
+      onActivate={event => activate(event, onChoose)}
+      onOKButton={event => activate(event, onChoose, event.detail?.is_repeat)}
+      onSecondaryActionDescription={onToggle ? 'Toggle library' : undefined}
+      onSecondaryButton={onToggle ? event => activate(event, onToggle, event.detail?.is_repeat) : undefined}
+      onClick={event => activate(event, onToggle ?? onChoose)}
+      onKeyDown={event => {
+        if (event.key === 'Enter' || event.key === ' ') activate(event, event.key === ' ' ? onToggle ?? onChoose : onChoose, event.repeat);
+      }}
       style={{ display: 'flex', alignItems: 'center', gap: '0.8rem', padding: '0.65rem 0.8rem', minHeight: '2.6rem',
         flexShrink: 0, minWidth: 0, color: destructive ? '#ffb3b3' : undefined,
         borderRadius: '0.5rem', border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)',
