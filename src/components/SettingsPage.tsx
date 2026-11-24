@@ -180,7 +180,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       if (result?.error) {
         return result;
       } else {
-        window.dispatchEvent(new Event('deckyplex-settings-change'));
+        window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: result }));
       }
       return result;
     }).catch(() => {
@@ -343,7 +343,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         const applySettings = (next: Settings) => {
           settingsRef.current = next;
           setSettings(next);
-          window.dispatchEvent(new Event('deckyplex-settings-change'));
+          window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: next }));
         };
         setLoginAttempt(null);
         setConnectingToPlex(false);
@@ -402,7 +402,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       const cleared: any = await callWithTimeout("logout", 15000);
       settingsRef.current = cleared;
       setSettings(cleared);
-      window.dispatchEvent(new Event('deckyplex-settings-change'));
+      window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: cleared }));
       setServers([]);
       setPlayers([]);
       setStatus("Logged out.");
@@ -431,7 +431,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       if (!result?.success) throw new Error(result?.error || "Could not select Plex server.");
       settingsRef.current = result.settings;
       setSettings(result.settings);
-      window.dispatchEvent(new Event('deckyplex-settings-change'));
+      window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: result.settings }));
     } catch (error) {
       setServerStatus(error instanceof Error ? error.message : "Could not select Plex server.");
     } finally {
@@ -626,7 +626,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
                   settingsRef.current = saved;
                   setSettings(saved);
                 }
-                window.dispatchEvent(new Event('deckyplex-settings-change'));
+                window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: saved }));
               }}
               close={() => dialog.Close()}
             />,
@@ -643,7 +643,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           });
         }
       }
-      window.dispatchEvent(new Event('deckyplex-settings-change'));
+      window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: result }));
     } catch (error) {
       if (settingsMounted.current) setLocalConnectionStatus(error instanceof Error ? error.message : 'Could not change the local connection.');
     } finally {
@@ -671,7 +671,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         if (settingsRef.current.selected_server_id !== serverId) return;
         savedLibraries.current = selected;
         if (revision === libraryRevision.current) setLibraryStatus('Libraries saved.');
-        window.dispatchEvent(new Event('deckyplex-settings-change'));
+        window.dispatchEvent(new CustomEvent('deckyplex-settings-change', { detail: result }));
       } catch (error) {
         if (revision !== libraryRevision.current) return;
         libraryDraft.current = savedLibraries.current;

@@ -65,6 +65,7 @@ interface PlayerContextType extends PlayerState {
 
 const PlayerContext = createContext<PlayerContextType | null>(null);
 const DEFAULT_LOCAL_VOLUME = 50;
+const remotePlaybackChanged = 'deckyplex-remote-playback-change';
 
 // Decky may mount the sidebar and routed browser from separate bundle contexts.
 // Keep the whole playback engine on window so both controls always share one queue,
@@ -327,10 +328,13 @@ function canControlRemotePlayer() {
   return !!engine.remoteTargetId && engine.plexConnection !== 'none' && !isPlayingOnDeck() && (!engine.pendingRequestId || !!engine.remoteActive);
 }
 
-function applyMusicPlaybackTarget(settings: {
+interface MusicPlaybackSettings {
   playback_target?: string; selected_player_id?: string; selected_player_name?: string;
   selected_server_id?: string; selected_server_url?: string; local_server_enabled?: boolean; has_plex_token?: boolean;
-}) {
+  volume?: number; companion_receiver_enabled?: boolean;
+}
+
+function applyMusicPlaybackTarget(settings: MusicPlaybackSettings) {
   const connection = settings.local_server_enabled ? `local:${settings.selected_server_url}` : settings.has_plex_token ? 'account' : 'none';
   const previous = engine.plexConnection;
   if (previous && previous !== connection && (!engine.companionActive || engine.localCompanionQueueId)) {
@@ -894,6 +898,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }));
     const onTrackChange = () => {
       const remoteMode = canControlRemotePlayer();
+      const startingRemotely = remoteMode && engine.remoteStatusTransition?.waitingForPlayback;
       setState(s => ({
         ...s,
         track: engine.track,
@@ -901,7 +906,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         duration: engine.track ? (engine.track.duration || 0) / 1000 : 0,
         remoteMode,
         companionMode: !!engine.companionActive && !engine.localCompanionQueueId,
-        playbackState: !engine.track ? 'stopped' : remoteMode ? s.playbackState
+        playbackState: !engine.track ? 'stopped' : startingRemotely ? 'starting' : remoteMode ? s.playbackState
           : isPlayingOnDeck() && !sharedAudio.paused ? 'playing' : 'paused',
         error: null,
       }));
@@ -976,38 +981,48 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       }));
     };
     let settingsRequest = 0;
+    const applyTargetSettings = (settings: MusicPlaybackSettings) => {
+      if (!mounted || engine.volumeSession !== volumeSession || !settings) return;
+      if (!engine.volumePreferenceLoaded) {
+        const savedVolume = settings.volume;
+        const normalizedVolume = typeof savedVolume === 'number' && Number.isFinite(savedVolume)
+          ? Math.max(0, Math.min(100, savedVolume)) : DEFAULT_LOCAL_VOLUME;
+        engine.volumePreferenceLoaded = true;
+        setSharedVolume(normalizedVolume, true);
+      }
+      applyMusicPlaybackTarget(settings);
+      const enabled = settings.companion_receiver_enabled === true && settings.local_server_enabled !== true;
+      if (enabled && !engine.receiverEnabled) engine.shareQueueRetryAt = 0;
+      engine.receiverEnabled = enabled;
+      if (!enabled || (engine.localPlaybackServerId && engine.localPlaybackServerId !== engine.selectedServerId)) {
+        unshareLocalCompanionQueue();
+      } else if (!engine.companionActive) {
+        void shareLocalCompanionQueue();
+      }
+      updateTargetState();
+    };
     const refreshTarget = async () => {
       const request = ++settingsRequest;
       try {
-        const settings: any = await call('get_settings');
-        if (!mounted || engine.volumeSession !== volumeSession || request !== settingsRequest) return;
-        if (!engine.volumePreferenceLoaded) {
-          const savedVolume = settings.volume;
-          const normalizedVolume = Number.isFinite(savedVolume)
-            ? Math.max(0, Math.min(100, savedVolume)) : DEFAULT_LOCAL_VOLUME;
-          engine.volumePreferenceLoaded = true;
-          setSharedVolume(normalizedVolume, true);
-        }
-        applyMusicPlaybackTarget(settings);
-        const enabled = settings.companion_receiver_enabled === true && settings.local_server_enabled !== true;
-        if (enabled && !engine.receiverEnabled) engine.shareQueueRetryAt = 0;
-        engine.receiverEnabled = enabled;
-        if (!enabled || (engine.localPlaybackServerId && engine.localPlaybackServerId !== engine.selectedServerId)) {
-          unshareLocalCompanionQueue();
-        } else if (!engine.companionActive) {
-          void shareLocalCompanionQueue();
-        }
-        updateTargetState();
+        const settings = await call<[], MusicPlaybackSettings>('get_settings');
+        if (request === settingsRequest) applyTargetSettings(settings);
       } catch {}
+    };
+    const onSettingsChange = (event: Event) => {
+      const settings = (event as CustomEvent<MusicPlaybackSettings>).detail;
+      if (typeof settings?.has_plex_token === 'boolean') {
+        settingsRequest++;
+        applyTargetSettings(settings);
+      } else void refreshTarget();
     };
     window.addEventListener('deckyplex-music-target-change', updateTargetState);
     refreshTarget();
     const interval = window.setInterval(refreshTarget, 5000);
-    window.addEventListener('deckyplex-settings-change', refreshTarget);
+    window.addEventListener('deckyplex-settings-change', onSettingsChange);
     return () => {
       mounted = false;
       window.clearInterval(interval);
-      window.removeEventListener('deckyplex-settings-change', refreshTarget);
+      window.removeEventListener('deckyplex-settings-change', onSettingsChange);
       window.removeEventListener('deckyplex-music-target-change', updateTargetState);
     };
   }, []);
@@ -1016,8 +1031,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     if (!state.remoteMode || !state.remotePlayerId) return;
     let active = true;
     let loading = false;
+    let refreshRequested = false;
     const refreshRemoteStatus = async () => {
-      if (loading || engine.pendingRequestId || engine.remoteCommandsPending) return;
+      if (!active || loading || engine.pendingRequestId || engine.remoteCommandsPending) return;
+      refreshRequested = false;
       const requestId = engine.requestId;
       const queueRevision = engine.remoteQueueRevision;
       const playerId = state.remotePlayerId;
@@ -1090,15 +1107,20 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         }
       } finally {
         loading = false;
+        if (refreshRequested) void refreshRemoteStatus();
       }
+    };
+    const requestRemoteRefresh = () => {
+      refreshRequested = true;
+      void refreshRemoteStatus();
     };
     refreshRemoteStatus();
     const interval = window.setInterval(refreshRemoteStatus, 2500);
-    window.addEventListener('deckyplex-remote-queue-edited', refreshRemoteStatus);
+    window.addEventListener(remotePlaybackChanged, requestRemoteRefresh);
     return () => {
       active = false;
       window.clearInterval(interval);
-      window.removeEventListener('deckyplex-remote-queue-edited', refreshRemoteStatus);
+      window.removeEventListener(remotePlaybackChanged, requestRemoteRefresh);
     };
   }, [state.remoteMode, state.remotePlayerId]);
 
@@ -1147,7 +1169,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       return { success: false, error: e?.message || 'Could not start remote playback.' };
     } finally {
       if (engine.remoteStartRequestId === requestId) engine.remoteStartRequestId = 0;
-      if (engine.pendingRequestId === requestId) setPendingPlaybackRequest(0);
+      if (engine.pendingRequestId === requestId) {
+        setPendingPlaybackRequest(0);
+        if (engine.remoteStatusTransition?.waitingForPlayback) window.dispatchEvent(new Event(remotePlaybackChanged));
+      }
     }
   }, []);
 
@@ -1156,9 +1181,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     engine.remoteCommandsPending = (engine.remoteCommandsPending || 0) + 1;
     if (command !== 'volume') engine.remoteQueueRevision = (engine.remoteQueueRevision || 0) + 1;
     window.dispatchEvent(new Event('deckyplex-playback-pending'));
+    let accepted = false;
     try {
       const result: any = await call('control_remote_player', state.remotePlayerId, command, Math.round(value));
       if (!result?.success) throw new Error(result?.error || `Could not ${command} remote player.`);
+      accepted = true;
       setState(s => ({ ...s, error: null }));
       return true;
     } catch (e: any) {
@@ -1167,6 +1194,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     } finally {
       engine.remoteCommandsPending--;
       window.dispatchEvent(new Event('deckyplex-playback-pending'));
+      if (accepted && command !== 'stop' && command !== 'volume') window.dispatchEvent(new Event(remotePlaybackChanged));
     }
   }, [state.remotePlayerId]);
 
@@ -1299,6 +1327,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         engine.remoteActive = false;
         clearRemoteQueue();
         setState(s => ({ ...s, playbackState: 'stopped', track: null, progress: 0, duration: 0 }));
+        window.dispatchEvent(new Event(remotePlaybackChanged));
       });
       return;
     }
@@ -1355,7 +1384,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       engine.remoteCommandsPending--;
       engine.remoteQueueVersion = '';
       window.dispatchEvent(new Event('deckyplex-playback-pending'));
-      window.dispatchEvent(new Event('deckyplex-remote-queue-edited'));
+      window.dispatchEvent(new Event(remotePlaybackChanged));
     }
   }, []);
 

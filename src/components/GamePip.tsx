@@ -92,12 +92,19 @@ interface PipRequest {
   reuse?: { key: string; manifest: string };
 }
 
-let overlay: Overlay | null = null;
-let starting = false;
-let revision = 0;
-let version = 0;
-let fullscreenRequest: VideoResume | null = null;
-const listeners = new Set<() => void>();
+interface GamePipStore {
+  overlay: Overlay | null;
+  starting: boolean;
+  revision: number;
+  version: number;
+  fullscreenRequest: VideoResume | null;
+  listeners: Set<() => void>;
+}
+
+const pipWindow = window as Window & { __deckyPlexGamePipState?: GamePipStore };
+const pipState = pipWindow.__deckyPlexGamePipState ??= {
+  overlay: null, starting: false, revision: 0, version: 0, fullscreenRequest: null, listeners: new Set(),
+};
 export const gamePipFullscreenEvent = 'deckyplex-game-pip-fullscreen';
 export const videoProgressEvent = 'deckyplex-video-progress-change';
 export type VideoWatchState = { view_count?: number; view_offset?: number; collections?: Record<string, number> };
@@ -114,18 +121,18 @@ export async function reportVideoProgress(itemId: string, serverId: string, posi
 }
 
 function publish() {
-  version++;
-  listeners.forEach(listener => listener());
+  pipState.version++;
+  pipState.listeners.forEach(listener => listener());
 }
 
 function subscribe(listener: () => void) {
-  listeners.add(listener);
-  return () => { listeners.delete(listener); };
+  pipState.listeners.add(listener);
+  return () => { pipState.listeners.delete(listener); };
 }
 
 function useOverlay() {
-  useSyncExternalStore(subscribe, () => version);
-  return overlay;
+  useSyncExternalStore(subscribe, () => pipState.version);
+  return pipState.overlay;
 }
 
 export function useGamePipPlayback() {
@@ -134,7 +141,7 @@ export function useGamePipPlayback() {
 }
 
 export function useGamePipEpisodeQueue() {
-  return useSyncExternalStore(subscribe, () => !!overlay?.playback && overlay.episodes.length > 0);
+  return useSyncExternalStore(subscribe, () => !!pipState.overlay?.playback && pipState.overlay.episodes.length > 0);
 }
 
 export async function getEpisodeQueue(itemId: string, serverId: string) {
@@ -145,7 +152,7 @@ function loadEpisodeQueue(current: Overlay) {
   if (current.item.type !== 'episode') return;
   const id = current.id;
   void getEpisodeQueue(current.item.id, current.serverId).then(result => {
-    if (overlay !== current || current.id !== id || !result?.length) return;
+    if (pipState.overlay !== current || current.id !== id || !result?.length) return;
     current.episodes = queueFromEpisode(result, current.item.id);
     publish();
   }).catch(() => {});
@@ -165,10 +172,11 @@ function report(current: Overlay, state: 'playing' | 'paused' | 'stopped') {
 }
 
 export function stopGamePip() {
-  revision++;
-  const current = overlay;
+  pipState.revision++;
+  pipState.fullscreenRequest = null;
+  const current = pipState.overlay;
   if (!current) return;
-  overlay = null;
+  pipState.overlay = null;
   window.clearTimeout(current.clock);
   try {
     current.view.Destroy();
@@ -251,10 +259,10 @@ function updateBounds(current: Overlay, steam: SteamWindow) {
 function poll(current: Overlay) {
   current.clock = window.setTimeout(async () => {
     const id = current.id;
-    if (overlay !== current || current.busy) return;
+    if (pipState.overlay !== current || current.busy) return;
     try {
       const next = await getStatus(id);
-      if (overlay !== current || current.id !== id || current.busy) return;
+      if (pipState.overlay !== current || current.id !== id || current.busy) return;
       if (next.status === 'closed') {
         stopGamePip();
         return;
@@ -290,7 +298,7 @@ function poll(current: Overlay) {
       updateBounds(current, current.steam);
       poll(current);
     } catch {
-      if (overlay !== current || current.id !== id || current.busy) return;
+      if (pipState.overlay !== current || current.id !== id || current.busy) return;
       stopGamePip();
       void toaster.toast({ title: 'DeckyPlex', body: 'The over-game video stopped.' });
     }
@@ -367,7 +375,7 @@ async function prepareView(current: Overlay, url: string, checkActive: () => voi
 
 export async function startGamePip(request: PipRequest, signal: AbortSignal,
   readPlayback: () => { position: number; playing: boolean }) {
-  if (starting || overlay) throw new Error('Close the over-game video before opening another one.');
+  if (pipState.starting || pipState.overlay) throw new Error('Close the over-game video before opening another one.');
   const steam = Router.WindowStore?.GamepadUIMainWindowInstance;
   if (!steam || steam.m_params?.bViaGamescope === false || typeof steam.CreateBrowserView !== 'function') {
     throw new Error('Steam’s over-game video view is unavailable.');
@@ -382,13 +390,13 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
   });
   if (typeof useComposition !== 'function') throw new Error('Steam’s overlay layer is unavailable.');
 
-  starting = true;
-  const run = ++revision;
+  pipState.starting = true;
+  const run = ++pipState.revision;
   let id: string | undefined;
   let view: SteamView | undefined;
   let managed = false;
   const checkActive = () => {
-    if (signal.aborted || revision !== run) throw new Error('Over-game picture-in-picture was canceled.');
+    if (signal.aborted || pipState.revision !== run) throw new Error('Over-game picture-in-picture was canceled.');
   };
   try {
     checkActive();
@@ -412,7 +420,7 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
       position: result.pip_position ?? defaultPipPosition, size: result.pip_size ?? 29,
       composed: false, bounds: '', busy: false, clock: 0, lastReport: 0, timeline: Promise.resolve(),
     };
-    overlay = current;
+    pipState.overlay = current;
     managed = true;
     publish();
     updateBounds(current, steam);
@@ -422,7 +430,7 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
     if (!request.episodes) loadEpisodeQueue(current);
     poll(current);
   } catch (error) {
-    if (id && overlay?.id === id) {
+    if (id && pipState.overlay?.id === id) {
       stopGamePip();
     } else if (!managed) {
       try { view?.Destroy(); } catch {}
@@ -430,19 +438,19 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
     }
     throw error;
   } finally {
-    starting = false;
+    pipState.starting = false;
   }
 }
 
 export function toggleGamePipPlayback() {
-  const current = overlay;
+  const current = pipState.overlay;
   if (current?.playback && !current.busy) {
     void control(current.id, 'playback', 0, current.playback.status !== 'playing').catch(() => {});
   }
 }
 
 export function seekGamePip(position: number) {
-  const current = overlay;
+  const current = pipState.overlay;
   if (current?.playback && !current.busy && Number.isFinite(position)) {
     const target = Math.max(0, Math.min(position, current.playback.duration));
     current.playback = { ...current.playback, position: target };
@@ -452,7 +460,7 @@ export function seekGamePip(position: number) {
 }
 
 export function setGamePipVolume(volume: number) {
-  const current = overlay;
+  const current = pipState.overlay;
   if (!current?.playback || current.busy) return;
   current.volume = volume;
   if (volume > 0) current.muted = false;
@@ -461,19 +469,19 @@ export function setGamePipVolume(volume: number) {
 }
 
 export function removeGamePipEpisode(id: string) {
-  if (!overlay || overlay.item.id === id) return;
-  overlay.episodes = overlay.episodes.filter(episode => episode.id !== id);
+  if (!pipState.overlay || pipState.overlay.item.id === id) return;
+  pipState.overlay.episodes = pipState.overlay.episodes.filter(episode => episode.id !== id);
   publish();
 }
 
 export function queueGamePipEpisodeNext(episode: VideoItem) {
-  if (!overlay || overlay.item.type !== 'episode') return;
-  overlay.episodes = insertNextEpisode(overlay.episodes, overlay.item.id, episode);
+  if (!pipState.overlay || pipState.overlay.item.type !== 'episode') return;
+  pipState.overlay.episodes = insertNextEpisode(pipState.overlay.episodes, pipState.overlay.item.id, episode);
   publish();
 }
 
 export async function playGamePipEpisode(itemId: string) {
-  const current = overlay;
+  const current = pipState.overlay;
   const item = current?.episodes.find(entry => entry.id === itemId);
   if (!current?.playback || current.busy || !item || current.item.id === item.id) return;
   current.busy = true;
@@ -486,7 +494,7 @@ export async function playGamePipEpisode(itemId: string) {
     const result = await call<unknown[], { id?: string; url?: string; error?: string }>(
       'start_game_pip', item.id, current.serverId, current.quality, initialPosition, current.volume, current.muted, current.id,
     );
-    if (overlay !== current) {
+    if (pipState.overlay !== current) {
       if (result.id) void call('stop_game_pip', result.id).catch(() => {});
       return;
     }
@@ -501,14 +509,14 @@ export async function playGamePipEpisode(itemId: string) {
     replaced = true;
     publish();
     await prepareView(current, result.url, () => {
-      if (overlay !== current) throw new Error('The over-game video has closed.');
+      if (pipState.overlay !== current) throw new Error('The over-game video has closed.');
     }, () => ({ position: initialPosition, playing: true }));
   } catch (error) {
-    if (overlay !== current) return;
+    if (pipState.overlay !== current) return;
     if (replaced || current.playback?.status === 'ended') stopGamePip();
     void toaster.toast({ title: 'DeckyPlex', body: error instanceof Error ? error.message : 'Could not open that episode.' });
   } finally {
-    if (overlay === current) {
+    if (pipState.overlay === current) {
       current.busy = false;
       publish();
       poll(current);
@@ -517,7 +525,7 @@ export async function playGamePipEpisode(itemId: string) {
 }
 
 export async function prepareGamePipFullscreen() {
-  const current = overlay;
+  const current = pipState.overlay;
   if (!current?.playback || current.busy) return false;
   current.busy = true;
   window.clearTimeout(current.clock);
@@ -526,22 +534,23 @@ export async function prepareGamePipFullscreen() {
     getStatus(current.id).catch(() => null),
     call<[string], ActiveVideoHls | null>('get_game_pip_resume_stream', current.id).catch(() => null),
   ]);
-  if (overlay !== current) return false;
+  if (pipState.overlay !== current) return false;
   const playback = latest?.status === 'playing' || latest?.status === 'paused' ? latest : current.playback;
-  fullscreenRequest = {
+  const fullscreenRequest: VideoResume = {
     item: current.item, serverId: current.serverId, position: playback.position, playing: playback.status === 'playing',
     quality: current.quality, volume: current.volume, muted: current.muted, episodes: current.episodes, mediaIndex: current.mediaIndex,
     activeHls: activeHls ?? undefined,
   };
   current.playback = playback;
   stopGamePip();
+  pipState.fullscreenRequest = fullscreenRequest;
   return true;
 }
 
 export function takeGamePipFullscreen(serverId: string) {
-  if (fullscreenRequest?.serverId !== serverId) return null;
-  const request = fullscreenRequest;
-  fullscreenRequest = null;
+  if (pipState.fullscreenRequest?.serverId !== serverId) return null;
+  const request = pipState.fullscreenRequest;
+  pipState.fullscreenRequest = null;
   return request;
 }
 
@@ -576,13 +585,19 @@ export function GamePipHost() {
   }, []);
   useEffect(() => {
     if (!current) return;
-    const refreshBounds = () => void call<[], { pip_position: PipPosition; pip_size: number; video_autoplay?: boolean }>('get_settings').then(settings => {
-      if (overlay !== current) return;
+    type PipSettings = { pip_position: PipPosition; pip_size: number; video_autoplay?: boolean };
+    const applyBoundsSettings = (settings: PipSettings) => {
+      if (pipState.overlay !== current) return;
       current.position = settings.pip_position;
       current.size = settings.pip_size;
       current.autoplay = settings.video_autoplay !== false;
       updateBounds(current, current.steam);
-    }).catch(() => {});
+    };
+    const refreshBounds = (event?: Event) => {
+      const settings = (event as CustomEvent<PipSettings> | undefined)?.detail;
+      if (settings?.pip_position && Number.isFinite(settings.pip_size)) applyBoundsSettings(settings);
+      else return call<[], PipSettings>('get_settings').then(applyBoundsSettings).catch(() => {});
+    };
     const timer = window.setInterval(() => {
       try { updateBounds(current, current.steam); } catch { /* The next playback poll handles a closed Steam view. */ }
     }, 150);
@@ -593,7 +608,7 @@ export function GamePipHost() {
     };
   }, [current]);
   return current && (
-    <OverlayBoundary key={current.viewKey} fail={() => { if (overlay === current) stopGamePip(); }}>
+    <OverlayBoundary key={current.viewKey} fail={() => { if (pipState.overlay === current) stopGamePip(); }}>
       <SteamNotificationLayer current={current} />
     </OverlayBoundary>
   );

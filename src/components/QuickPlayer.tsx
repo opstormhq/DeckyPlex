@@ -98,7 +98,10 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   const [relayedMusicArt, setRelayedMusicArt] = useState({ key: '', src: '' });
   const queueContainerRef = useRef<HTMLDivElement | null>(null);
   const queueToggleRef = useRef<HTMLDivElement | null>(null);
+  const queueCollapseFocusFrame = useRef(0);
   const headingRef = useRef<HTMLDivElement>(null);
+  const headingActionRef = useRef<HTMLDivElement>(null);
+  const headingNavigationRef = useRef<{ TakeFocus: () => void } | null>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
   const playPauseRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<HTMLDivElement>(null);
@@ -237,19 +240,30 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   useEffect(() => {
     let mounted = true;
     let requestId = 0;
+    const applySettings = (value: QuickPlayerSettings) => {
+      if (!mounted || typeof value?.has_plex_token !== 'boolean') return;
+      lastQuickSettings = value;
+      setSettings(value);
+    };
     const refreshConnection = async (validate = false) => {
       const id = ++requestId;
-      const apply = (value: QuickPlayerSettings) => {
-        if (!mounted || id !== requestId || !value) return;
-        lastQuickSettings = value;
-        setSettings(value);
-      };
       try {
-        apply(await call<[], QuickPlayerSettings>('get_settings'));
-        if (validate) apply(await call<[], QuickPlayerSettings>('get_quick_player_settings'));
+        const saved = await call<[], QuickPlayerSettings>('get_settings');
+        if (!mounted || id !== requestId) return;
+        applySettings(saved);
+        if (validate) {
+          const checked = await call<[], QuickPlayerSettings>('get_quick_player_settings');
+          if (id === requestId) applySettings(checked);
+        }
       } catch {}
     };
-    const refreshSaved = () => void refreshConnection();
+    const refreshSaved = (event: Event) => {
+      const saved = (event as CustomEvent<QuickPlayerSettings>).detail;
+      if (typeof saved?.has_plex_token === 'boolean') {
+        requestId++;
+        applySettings(saved);
+      } else void refreshConnection();
+    };
     void refreshConnection(true);
     const timer = setInterval(() => void refreshConnection(true), 10000);
     window.addEventListener('deckyplex-settings-change', refreshSaved);
@@ -304,7 +318,11 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
     event.stopImmediatePropagation();
     setShowQueue(false);
     if (activeQueue.length) {
-      window.requestAnimationFrame(() => queueToggleRef.current?.focus());
+      const ownerWindow = playerRef.current?.ownerDocument.defaultView;
+      if (ownerWindow) {
+        ownerWindow.cancelAnimationFrame(queueCollapseFocusFrame.current);
+        queueCollapseFocusFrame.current = ownerWindow.requestAnimationFrame(() => queueToggleRef.current?.focus());
+      }
     } else {
       restoreControls();
     }
@@ -411,15 +429,26 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       const active = event.target as HTMLElement | null;
       if (!active || !player.contains(active)) return;
       previousFocus.current = active;
-      const atControls = controlsRef.current?.contains(active);
       if (event.detail?.button !== GamepadButton.CANCEL) return;
       if (active.closest('[data-video-scrubbing]')) return;
-      if (!showQueue && (atControls || !hasUsableTransport)) return;
+      const inOpenQueue = showQueue && (queueContainerRef.current?.contains(active) || queueToggleRef.current?.contains(active));
+      const headingAction = headingActionRef.current;
+      const atHeadingAction = headingAction?.contains(active);
+      if (!inOpenQueue) {
+        if (atHeadingAction && !event.detail.is_repeat) return;
+        if (!headingAction && (controlsRef.current?.contains(active) || !hasUsableTransport)) return;
+      }
       event.preventDefault();
       event.stopImmediatePropagation();
       if (event.detail.is_repeat) return;
-      if (showQueue) {
+      if (inOpenQueue) {
         collapseQueue(event);
+      } else if (headingAction) {
+        player.ownerDocument.defaultView?.cancelAnimationFrame(queueCollapseFocusFrame.current);
+        const navigation = headingNavigationRef.current;
+        if (navigation?.TakeFocus) navigation.TakeFocus();
+        else headingAction.focus({ preventScroll: true });
+        showPlayerTop();
       } else {
         restoreControls();
       }
@@ -492,7 +521,8 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
         alignItems: 'center', gap: '0.4rem', minHeight: compactHeader ? '2.3rem' : undefined,
         scrollMarginTop: 'max(56px, 3.5rem)',
       }}>
-        {topAction && <Button {...quickButtonProps} data-quick-heading-action=""
+        {topAction && <Button {...quickButtonProps} ref={headingActionRef}
+          {...{ navRef: headingNavigationRef }} data-quick-heading-action=""
           style={compactHeader ? { ...wideButtonStyle, width: 'auto', paddingInline: '0.55rem', fontSize: '0.86rem' } : wideButtonStyle}
           onClick={topAction === 'login' ? onLogin : onBrowse}>
           <span style={compactHeader ? { ...actionLabelStyle, gap: '0.4rem', whiteSpace: 'nowrap' } : actionLabelStyle}>

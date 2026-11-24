@@ -142,8 +142,12 @@ function keepHomeCardVisible(card: HTMLElement) {
   else if (bounds.right > viewport.right) shelf.scrollLeft += (bounds.right - viewport.right) / scale;
 }
 
-function focusForDirection(target: HTMLElement, event: Event) {
-  target.focus({ preventScroll: true });
+type GamepadFocusHandle = { TakeFocus: (button: GamepadButton) => void };
+
+function focusForDirection(target: HTMLElement, event: Event, navigation?: GamepadFocusHandle | null) {
+  const button = (event as GamepadEvent).detail?.button;
+  if (navigation && button !== undefined) navigation.TakeFocus(button);
+  else target.focus({ preventScroll: true });
   // Manually handled moves don't pass through Steam's gamepad focus sound.
   playNavigationSound(event);
 }
@@ -238,6 +242,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const firstItemRef = useRef<HTMLDivElement | null>(null);
   const sortButtonRef = useRef<HTMLDivElement | null>(null);
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
+  const playCollectionNavRef = useRef<GamepadFocusHandle | null>(null);
+  const collectionItemNavRefs = useRef<Partial<Record<number, { current: GamepadFocusHandle | null }>>>({});
   const lastCollectionItem = useRef<HTMLElement | null>(null);
   const gridDialogRef = useRef<{ Close: () => void } | null>(null);
   const gridPromptShown = useRef(false);
@@ -347,25 +353,34 @@ const LibraryBrowser = memo(function LibraryBrowser({
   }, [selectTab, subView, invalidateTabLoad]);
 
   const keepFocusedElementVisible = (element: HTMLElement, sidebar = false) => {
+    const viewport = sidebar ? sidebarRef.current : contentRef.current;
+    if (!viewport?.contains(element) || !viewport.offsetHeight) return false;
     cancelContentScroll();
     hideAlphabetOverlay();
     window.cancelAnimationFrame(focusScrollFrame.current);
-    focusScrollFrame.current = window.requestAnimationFrame(() => {
-      const viewport = sidebar ? sidebarRef.current : contentRef.current;
-      if (!viewport || !viewport.contains(element) || element !== document.activeElement) return;
+    const scroll = () => {
       const itemRect = element.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
+      const scale = viewportRect.height / viewport.offsetHeight;
+      if (scale <= 0) return;
       // Steam overlays a footer on the bottom of routed plugin views. Keep a
       // safe area for the sidebar and header controls.
-      const visibleBottom = Math.min(viewportRect.bottom, window.innerHeight - (sidebar ? BROWSER_SIDEBAR_FOOTER_CLEARANCE : BROWSER_FOOTER_CLEARANCE));
-      const edgePadding = BROWSER_FOCUS_EDGE_PADDING;
+      const windowHeight = viewport.ownerDocument.defaultView?.innerHeight ?? window.innerHeight;
+      const footer = sidebar ? BROWSER_SIDEBAR_FOOTER_CLEARANCE : BROWSER_FOOTER_CLEARANCE;
+      const visibleBottom = Math.min(viewportRect.bottom, windowHeight - footer);
+      const edgePadding = BROWSER_FOCUS_EDGE_PADDING * scale;
       const bottomOverflow = itemRect.bottom - (visibleBottom - edgePadding);
       const topOverflow = viewportRect.top + edgePadding - itemRect.top;
-      const offset = bottomOverflow > 0 ? bottomOverflow : -Math.max(0, topOverflow);
+      const offset = (bottomOverflow > 0 ? bottomOverflow : -Math.max(0, topOverflow)) / scale;
       if (offset === 0) return;
       if (sidebar) viewport.scrollTop += offset;
       else viewport.scrollBy({ top: offset, behavior: 'smooth' });
+    };
+    if (sidebar) scroll();
+    else focusScrollFrame.current = window.requestAnimationFrame(() => {
+      if (viewport.contains(element) && element === viewport.ownerDocument.activeElement) scroll();
     });
+    return true;
   };
 
   useEffect(() => () => {
@@ -1724,6 +1739,17 @@ const LibraryBrowser = memo(function LibraryBrowser({
     viewport.scrollTo({ top: 0, behavior: 'instant' });
   }, [cancelContentScroll]);
 
+  const focusCollectionPosition = useCallback((target: HTMLElement, event: Event) => {
+    if (target === playCollectionRef.current) {
+      hideAlphabetOverlay();
+      scrollContentToTop();
+      focusForDirection(target, event, playCollectionNavRef.current);
+    } else {
+      const index = Number(target.dataset.browserItemIndex);
+      focusForDirection(target, event, collectionItemNavRefs.current[index]?.current);
+    }
+  }, [hideAlphabetOverlay, scrollContentToTop]);
+
   const moveBetweenItems = (event: GamepadEvent, index: number) => {
     const { button } = event.detail;
     if (button !== GamepadButton.DIR_UP && button !== GamepadButton.DIR_DOWN) return;
@@ -1733,11 +1759,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (target === playCollectionRef.current) {
-      hideAlphabetOverlay();
-      scrollContentToTop();
-    }
-    focusForDirection(target, event);
+    if (target === playCollectionRef.current) focusCollectionPosition(target, event);
+    else focusForDirection(target, event);
   };
 
   const jumpToListTop = (event: import('@decky/ui').GamepadEvent) => {
@@ -1749,6 +1772,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   };
 
   const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false, homeRow?: VideoHomeRow) => {
+    const collectionNavRef = hasCollectionAction && idx < (gridView ? gridColumns : 1)
+      ? collectionItemNavRefs.current[idx] ??= { current: null } : undefined;
     const sortTitle = alphabeticallySorted ? item.titleSort || item.title : undefined;
     const kind = item.type;
     const showPoster = homeView && kind === 'episode';
@@ -1810,6 +1835,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           data-browser-card=""
           data-browser-home-start={firstHomeRow || undefined}
           data-browser-home-row={homeRow}
+          {...{ navRef: collectionNavRef }}
           onFocus={focusItem}
           onGamepadFocus={focusItem}
           {...itemScroll}
@@ -1911,6 +1937,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
             data-browser-item-id={item.id}
             data-browser-item-index={idx}
             data-browser-sort-title={sortTitle}
+            {...{ navRef: collectionNavRef }}
             onFocus={focusItem}
             onGamepadFocus={focusItem}
             {...itemScroll}
@@ -1934,6 +1961,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     return (
       <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id} data-browser-item-index={idx}
         data-browser-sort-title={sortTitle}
+        {...{ navRef: collectionNavRef }}
         onFocus={focusItem} onGamepadFocus={focusItem} {...itemScroll}
         onActivate={event => selectWithSound(event, onClick)} onClick={onClick}
         onCancel={handleCancel} onGamepadDirection={(event) => moveBetweenItems(event, idx)}
@@ -1953,6 +1981,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         !pendingContinueRemovals.has(item.id) && (row.id === 'continue' ? !!item.viewOffset : !item.viewCount)) } };
     }) : [];
     const title = subView?.title || tabs.find(tab => tab.key === activeTab)?.title || 'Library';
+    const playCollection = videoCollection ? playVideoCollection : handlePlayCollection;
     const initialLoading = (
       <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minHeight: '2.5rem', paddingInline: '0.35rem' }}>
         <InlineSpinner />
@@ -1996,14 +2025,24 @@ const LibraryBrowser = memo(function LibraryBrowser({
             </DialogBodyText>
           )}
           {hasCollectionAction && subView && !loading && (
-            <Button key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef}
-              className="deckyplex-play-collection" noFocusRing
-              onClick={videoCollection ? playVideoCollection : handlePlayCollection} onCancelButton={handleCancel}
-              onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}>
-              <FaPlay /><span style={{ marginLeft: '0.3rem' }}>{videoCollection
+            <Focusable key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef}
+              {...focusOutlineProps} {...{ navRef: playCollectionNavRef }} data-browser-play-collection=""
+              role="button" tabIndex={0} onCancel={handleCancel}
+              onActivate={event => selectWithSound(event, playCollection)} onClick={playCollection}
+              onKeyDown={event => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                event.stopPropagation();
+                if (!event.repeat) void playCollection();
+              }}
+              onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0,
+                padding: '0.3rem 0.55rem', fontSize: '0.85rem', lineHeight: 1.2,
+                borderRadius: '4px', background: 'rgba(255, 255, 255, 0.10)' }}>
+              <FaPlay aria-hidden="true" /><span>{videoCollection
                 ? subView.mediaType === 'show' ? 'Play series' : 'Play season'
                 : remoteTargetSelected ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
-            </Button>
+            </Focusable>
           )}
         </div>
 
@@ -2221,11 +2260,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       const destination = target?.isConnected ? target
         : button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active) ? firstItemRef.current : null;
       if (destination && destination !== active) {
-        if (destination === playCollectionRef.current) {
-          hideAlphabetOverlay();
-          scrollContentToTop();
-        }
-        focusForDirection(destination, event);
+        if (destination === playCollectionRef.current || playCollectionRef.current?.contains(active)) {
+          focusCollectionPosition(destination, event);
+        } else focusForDirection(destination, event);
       }
     };
     let lastVerticalPress = -Infinity;
@@ -2306,7 +2343,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       endRepeat();
     };
   }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, openSortMenu, sortable, activeTab, sorting,
-    hideAlphabetOverlay, scrollContentToTop, updateAlphabetOverlay]);
+    focusCollectionPosition, hideAlphabetOverlay, updateAlphabetOverlay]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -2344,9 +2381,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
       <FocusOutlineStyles />
       <style>{`
         [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
-        .deckyplex-play-collection:is(.gpfocus, :focus) {
-          outline: 2px solid rgba(255, 255, 255, 0.6) !important;
-          outline-offset: -3px;
+        [data-browser-play-collection]:focus-visible {
+          outline: 2px solid rgba(255, 255, 255, 0.6);
+          outline-offset: -2px;
         }
         [data-browser-zone="sidebar"] {
           width: max-content; max-width: min(17rem, 30vw);
@@ -2372,17 +2409,21 @@ const LibraryBrowser = memo(function LibraryBrowser({
           scrollPaddingBottom: BROWSER_SIDEBAR_FOOTER_CLEARANCE, overflowY: 'auto' }}>
         <div style={browserHeaderStyle}><DialogLabel style={{ margin: 0 }}>DeckyPlex</DialogLabel></div>
         <Focusable flow-children="column" onCancel={handleCancel} style={{ display: 'flex', flexDirection: 'column' }}>
-          {tabs.map(({ key: tab, title, icon }) => (
+          {tabs.map(({ key: tab, title, icon }) => {
+            const focusCategory = () => {
+              focusZone.current = 'sidebar';
+              selectTab(tab);
+            };
+            return (
             <Fragment key={tab}>
             {tab === visibleVideo[0]?.key &&
               <div style={{ margin: '0.45rem 0.65rem 0.35rem', fontSize: '0.73rem', color: '#aeb9c5' }}>Video</div>}
             <Focusable
               data-browser-tab={tab}
               preferredFocus={tab === activeTab}
-              onFocus={() => {
-                focusZone.current = 'sidebar';
-                selectTab(tab);
-              }}
+              onFocus={focusCategory} onGamepadFocus={focusCategory}
+              {...{ fnScrollIntoViewHandler: ({ Element }: { Element?: HTMLElement }) =>
+                !!Element && keepFocusedElementVisible(Element, true) }}
               onActivate={event => selectWithSound(event, enterContent)}
               onClick={enterContent}
               style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0.35rem 0.65rem', paddingInlineEnd: '1.825rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px' }}
@@ -2401,7 +2442,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
               )}
             </Focusable>
             </Fragment>
-          ))}
+            );
+          })}
         </Focusable>
       </div>
       <div style={{ position: 'relative', flex: 1, minWidth: 0, minHeight: 0 }}>

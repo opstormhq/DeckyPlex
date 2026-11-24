@@ -10,7 +10,7 @@ import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDia
 import { InlineSpinner } from './InlineSpinner';
 import { showPlaybackStartDialog } from './PlaybackStartDialog';
 import { reportVideoProgress, startGamePip, type ActiveVideoHls, type VideoItem, type VideoResume } from './GamePip';
-import { finishPausedVideoResume, setViewerPlayback, suspendVideoPlayback } from './VideoPlayback';
+import { finishPausedVideoResume, refreshPausedViewer, setViewerPlayback, suspendVideoPlayback } from './VideoPlayback';
 import { VideoScrubber } from './VideoScrubber';
 import { episodeLabel, resumePosition } from './VideoQueue';
 import { VideoPlayerOptions, type VideoChapter, type VideoMarker, type VideoOption, type VideoOptionPage } from './VideoPlayerOptions';
@@ -277,7 +277,7 @@ export function MediaViewer({
     qualityAttempt.current = null;
     const changedTrack = trackAttempt.current;
     if (retryable && !startupRetried.current && (!currentPlayback.current.started || changedTrack)
-        && (localServer || initialPlayback || (item.type === 'episode' && initialPresentation))) {
+        && (localServer || initialPlayback || item.type === 'episode')) {
       startupRetried.current = true;
       setRetryingStart(true);
       log(workingQuality.current || 'auto', 'source', 'waiting',
@@ -311,7 +311,7 @@ export function MediaViewer({
     setRetryingStart(false);
     setLoading(false);
     setError(detail);
-  }, [initialPlayback, initialPresentation, item.type, itemId, log, reload]);
+  }, [initialPlayback, item.type, itemId, log, reload]);
 
   useEffect(() => () => window.clearTimeout(retryTimer.current), []);
 
@@ -387,6 +387,25 @@ export function MediaViewer({
   }, [controlsHidden, fullscreen, exitPromptOpen, minimized]);
 
   useEffect(() => {
+    const viewer = viewerRef.current;
+    const ownerDocument = viewer?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (!minimized || !viewer || !ownerDocument || !ownerWindow) return;
+    let frame = 0;
+    const refreshQuickPlayer = () => {
+      if (ownerDocument.fullscreenElement === viewer) return;
+      ownerWindow.cancelAnimationFrame(frame);
+      frame = ownerWindow.requestAnimationFrame(() => refreshPausedViewer(quickPlayerOwner.current));
+    };
+    ownerDocument.addEventListener('fullscreenchange', refreshQuickPlayer);
+    refreshQuickPlayer();
+    return () => {
+      ownerDocument.removeEventListener('fullscreenchange', refreshQuickPlayer);
+      ownerWindow.cancelAnimationFrame(frame);
+    };
+  }, [minimized]);
+
+  useEffect(() => {
     let active = true;
     let startDialog: ReturnType<typeof showPlaybackStartDialog> | undefined;
     const applySource = (result: MediaSource, startPosition?: number) => {
@@ -420,18 +439,19 @@ export function MediaViewer({
           });
           if (sameConnection) result = { ...result, streams: [{ kind: 'hls', ...activeHls }, ...result.streams] };
         }
-        const offerMovieResume = firstSource.current && item.type === 'movie' && !initialPlayback
-          && initialPosition === undefined;
-        const savedPosition = offerMovieResume
+        const episode = item.type === 'episode';
+        const offerResume = firstSource.current && (item.type === 'movie' || episode) && !initialPlayback
+          && !initialPresentation && initialPosition === undefined;
+        const savedPosition = offerResume
           ? resumePosition(result.resume_ms ?? item.viewOffset ?? 0, result.duration_ms || item.duration || 0, 1) : 0;
         if (!savedPosition) {
           applySource(result);
           return;
         }
-        log(result.quality || 'auto', 'source', 'waiting', 'movie-start-choice');
+        log(result.quality || 'auto', 'source', 'waiting', episode ? 'episode-start-choice' : 'movie-start-choice');
         startDialog = showPlaybackStartDialog({
           title,
-          actionTitle: 'Play movie',
+          actionTitle: episode ? 'Play episode' : 'Play movie',
           position: savedPosition,
           onClose: choice => {
             if (!active) return;
@@ -449,7 +469,8 @@ export function MediaViewer({
       active = false;
       startDialog?.Close();
     };
-  }, [itemId, item.type, item.duration, item.viewOffset, title, photo, retryCount, requestedQuality, mediaIndex, initialPlayback, initialPosition, failPlayback, log]);
+  }, [itemId, item.type, item.duration, item.viewOffset, title, photo, retryCount, requestedQuality, mediaIndex,
+    initialPlayback, initialPosition, initialPresentation, failPlayback, log]);
 
   useEffect(() => {
     if (photo || !playbackServerId) return;
@@ -663,7 +684,9 @@ export function MediaViewer({
         video.load();
       }
     };
-    const session = media?.local_connection && !stream.manifest && (stream.kind === 'hls' || stream.kind === 'http')
+    const resumedEpisode = item.type === 'episode' && initialPosition > 0;
+    const session = (media?.local_connection || resumedEpisode || proxyHls) && !stream.manifest
+      && (stream.kind === 'hls' || stream.kind === 'http')
       ? new URL(url).searchParams.get('transcodeSessionId') : null;
     if (session && media?.handoff_key) {
       // Keep playing even on older PMS versions that don't answer the decision endpoint.
@@ -686,7 +709,7 @@ export function MediaViewer({
       video.removeAttribute('src');
       video.load();
     };
-  }, [photo, media, stream, streamIndex, proxyHls, sourceName, requestedQuality, initialPlayback, log, failPlayback]);
+  }, [photo, media, stream, streamIndex, proxyHls, sourceName, requestedQuality, initialPlayback, item.type, log, failPlayback]);
 
   useEffect(() => {
     if (!videoRef.current) return;
@@ -884,7 +907,8 @@ export function MediaViewer({
     retainedStreamFailed.current = false;
     log(media?.quality || 'auto', 'source', 'ready', 'paused-in-quick-player');
     onMinimizedChange(true);
-    if (document.fullscreenElement === viewerRef.current) void document.exitFullscreen().catch(() => {});
+    const ownerDocument = viewerRef.current?.ownerDocument;
+    if (ownerDocument && ownerDocument.fullscreenElement === viewerRef.current) void ownerDocument.exitFullscreen().catch(() => {});
   };
   const handleBack = (event: Event) => {
     if (minimized) return;

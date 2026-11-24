@@ -3623,15 +3623,15 @@ class Plugin:
             return {"error": "Plex could not prepare this item for playback."}
 
     async def prepare_video_transcode(self, handoff_key: str, session_id: str) -> None:
-        """Ask PMS for a decision for one of the local viewer's generated streams."""
+        """Ask PMS for a playback decision for a stream generated for the current server."""
         if not isinstance(handoff_key, str) or not isinstance(session_id, str) or not session_id:
             return
         saved = (self._video_handoff_sources or {}).get(handoff_key)
         settings = _load_settings()
-        if not saved or not settings["local_server_enabled"] or settings["plex_token"]:
+        if not saved or not (settings["local_server_enabled"] or settings["plex_token"]):
             return
         identity, source = saved
-        if identity[:3] != (settings["selected_server_id"], "", self._get_plex_server_url(settings)):
+        if identity[:3] != (settings["selected_server_id"], settings["plex_token"], self._get_plex_server_url(settings)):
             return
         for stream in source["streams"]:
             for field in ("url", "fallback_url"):
@@ -3656,12 +3656,12 @@ class Plugin:
                     if response is not None:
                         codes = [response.get(key, "") for key in (
                             "generalDecisionCode", "transcodeDecisionCode", "directPlayDecisionCode")]
-                        logger.info("Plex local video decision item=%s general=%s transcode=%s direct=%s",
+                        logger.info("Plex video decision item=%s general=%s transcode=%s direct=%s",
                                     identity[3], *(code if code.isdecimal() else "-" for code in codes))
                 try:
                     await asyncio.to_thread(decide)
                 except Exception as error:
-                    logger.info("Plex local video decision unavailable for item %s (%s)", identity[3], _plex_error_code(error))
+                    logger.info("Plex video decision unavailable for item %s (%s)", identity[3], _plex_error_code(error))
                 return
 
     async def set_video_stream(self, rating_key: str, server_id: str, index: int, kind: str, stream_id: int) -> Dict[str, Any]:
