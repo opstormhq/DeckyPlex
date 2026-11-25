@@ -3,9 +3,9 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { call, getExternalResourceURL, toaster } from '@decky/api';
 import { Button, DialogBodyText, DialogLabel, Focusable, GamepadButton, Navigation, type GamepadEvent } from '@decky/ui';
 import Hls, { type LoaderCallbacks, type LoaderConfiguration, type LoaderContext } from 'hls.js';
-import { FaArrowLeft, FaBackward, FaClosedCaptioning, FaCog, FaCompress, FaExpand, FaEyeSlash, FaForward,
+import { FaArrowLeft, FaClosedCaptioning, FaCog, FaCompress, FaExpand, FaEyeSlash,
   FaPause, FaPlay, FaRedo, FaStepForward, FaStop, FaVolumeMute, FaVolumeUp } from 'react-icons/fa';
-import { MdPictureInPictureAlt } from 'react-icons/md';
+import { MdForward10, MdPictureInPictureAlt, MdReplay10 } from 'react-icons/md';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
 import { showPlaybackStartDialog } from './PlaybackStartDialog';
@@ -50,6 +50,115 @@ interface MediaSource {
 const mediaStyle: CSSProperties = {
   position: 'absolute', inset: 0, objectFit: 'contain', width: '100%', height: '100%',
 };
+
+const videoPlayerStyles = `
+  .deckyplex-video-heading {
+    position: absolute;
+    inset: 0 0 auto;
+    padding: clamp(1rem, 3vw, 2.5rem) clamp(1.25rem, 4vw, 3rem) 3rem;
+    background: linear-gradient(rgba(0, 0, 0, 0.78), rgba(0, 0, 0, 0));
+    pointer-events: none;
+    color: #fff;
+    text-shadow: 0 1px 4px #000;
+  }
+  .deckyplex-video-title {
+    font-size: clamp(1.15rem, 2.3vw, 1.75rem);
+    font-weight: 650;
+    line-height: 1.2;
+  }
+  .deckyplex-video-title, .deckyplex-video-subtitle {
+    max-width: min(48rem, 88vw);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .deckyplex-video-subtitle {
+    margin-top: 0.25rem;
+    font-size: 0.88rem;
+    color: #e0e6ef;
+  }
+  .deckyplex-video-dock {
+    position: absolute;
+    z-index: 2;
+    inset-inline: clamp(0.8rem, 3.25vw, 3rem);
+    bottom: clamp(0.8rem, 2.8vh, 2rem);
+    max-width: 60rem;
+    margin-inline: auto;
+    display: grid;
+    gap: 0.7rem;
+    pointer-events: none;
+  }
+  .deckyplex-video-dock > * { pointer-events: auto; }
+  .deckyplex-video-glass {
+    box-sizing: border-box;
+    background: rgba(16, 20, 27, 0.87);
+    border: 1px solid rgba(255, 255, 255, 0.19);
+    border-radius: 1rem;
+  }
+  @supports (backdrop-filter: blur(8px)) {
+    .deckyplex-video-glass {
+      background: rgba(16, 20, 27, 0.76);
+      backdrop-filter: blur(8px) saturate(1.15);
+    }
+  }
+  .deckyplex-video-transport { padding: 0.6rem clamp(0.55rem, 1.7vw, 1rem) 0.7rem; }
+  .deckyplex-video-buttons { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+  .deckyplex-video-dock > .deckyplex-video-marker { justify-self: end; }
+  .deckyplex-video-control,
+  .deckyplex-video-control::before,
+  .deckyplex-video-control::after {
+    box-shadow: none !important; text-shadow: none !important; filter: none !important;
+  }
+  button.deckyplex-video-control {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    margin: 0 !important;
+    flex: none;
+    width: auto;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0.35rem 0.6rem;
+    background: rgba(255, 255, 255, 0.10) !important;
+    color: #f3f6fa !important;
+    border: 1px solid rgba(255, 255, 255, 0.14) !important;
+    border-radius: 999px;
+    font-size: 0.85rem;
+  }
+  button.deckyplex-video-control[data-video-play] {
+    min-width: 46px;
+    min-height: 46px;
+    background: rgba(218, 236, 255, 0.24) !important;
+  }
+  button.deckyplex-video-control[data-video-utility-start] { margin-inline-start: auto !important; }
+  button.deckyplex-video-control[aria-pressed="true"] {
+    border-color: #a4d9ff !important;
+    color: #a4d9ff !important;
+  }
+  button.deckyplex-video-control:not(:disabled, .Disabled):hover {
+    background: rgba(255, 255, 255, 0.20) !important;
+  }
+  button.deckyplex-video-control.deckyplex-video-marker {
+    background: rgba(16, 20, 27, 0.82) !important;
+  }
+  button.deckyplex-video-control.deckyplex-video-marker:hover {
+    background: rgba(38, 47, 60, 0.9) !important;
+  }
+  button.deckyplex-video-control:not(:disabled, .Disabled):is(.gpfocus, :focus-visible, :active) {
+    background: #e9f2fc !important;
+    color: #121e2e !important;
+    outline: 2px solid #fff !important;
+    outline-offset: 2px;
+  }
+  button.deckyplex-video-control:is(:disabled, .Disabled) { opacity: 0.45; }
+  .deckyplex-video-control svg { flex-shrink: 0; vertical-align: middle; }
+  .deckyplex-video-notice { margin: 0.5rem 0 0; color: #f1f5fa; font-size: 0.85rem; }
+  @media (max-width: 540px) {
+    .deckyplex-video-buttons { gap: 0.3rem; }
+    button.deckyplex-video-control[data-video-utility-start] { margin-inline-start: 0 !important; }
+  }
+`;
 
 export interface VideoPresentation {
   volume: number;
@@ -1062,26 +1171,7 @@ export function MediaViewer({
             margin: 0, padding: 0, border: 0, maxWidth: 'none', maxHeight: 'none' }
         : { position: 'relative', width: '100%', height: 'calc(100% - 40px)', marginTop: '40px' }),
         display: minimized ? 'none' : undefined, background: '#000', color: '#f3f6fa', overflow: 'hidden' }}>
-      <style>{`
-        .deckyplex-video-control,
-        .deckyplex-video-control::before,
-        .deckyplex-video-control::after {
-          box-shadow: none !important; text-shadow: none !important; filter: none !important;
-        }
-        button.deckyplex-video-control {
-          background: #283441 !important;
-          color: #f3f6fa !important;
-          min-width: 44px;
-          min-height: 40px;
-          padding: 0.4rem 0.65rem;
-          border-radius: 5px;
-        }
-        button.deckyplex-video-control:is(.gpfocus, :focus-visible, :active) {
-          background: #e5edf5 !important;
-          color: #172433 !important;
-        }
-        button.deckyplex-video-control svg { vertical-align: middle; }
-      `}</style>
+      <style>{videoPlayerStyles}</style>
       {photo ? (stream && <img src={plexMediaUrl(stream.url, media?.local_connection)} alt={title} style={mediaStyle}
         onLoad={() => setLoading(false)} onError={() => {
           if (media?.streams?.[streamIndex + 1]) setStreamIndex(streamIndex + 1);
@@ -1127,16 +1217,16 @@ export function MediaViewer({
           }}
         />
       )}
-      {showControls && <div style={{ position: 'absolute', inset: '0 0 auto', padding: '0.9rem 1.25rem', background: 'linear-gradient(#0a0d11, transparent)' }}>
-        <DialogLabel style={{ margin: 0 }}>{title}</DialogLabel>
-        {subtitle && <DialogBodyText style={{ margin: '0.2rem 0 0', opacity: 0.75 }}>{subtitle}</DialogBodyText>}
+      {showControls && <div className="deckyplex-video-heading">
+        <div className="deckyplex-video-title">{title}</div>
+        {subtitle && <div className="deckyplex-video-subtitle">{subtitle}</div>}
       </div>}
       {controlsHidden && !showUpNext && !exitPromptOpen && <Button ref={hiddenControlsRef} onClick={revealControls} onCancelButton={handleBack}
         aria-label="Show controls" onCancelActionDescription={promptOnBack ? 'Leave full screen' : 'Show controls'} noFocusRing
         style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', zIndex: 1, opacity: 0 }} />}
       {((showControls && error) || loading || (buffering && !error)) && (
         <div role="status" style={{ position: 'absolute', inset: '30% 1rem 32%', display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: error ? 'auto' : 'none' }}>
-          <div style={{ borderRadius: '6px', padding: '0.8rem 1rem', background: 'rgba(10,13,17,0.9)', maxWidth: '85%' }}>
+          <div className="deckyplex-video-glass" style={{ padding: '0.8rem 1rem', maxWidth: '85%' }}>
             {error ? <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
               <DialogBodyText style={{ margin: 0 }}>{error}</DialogBodyText>
               <Button onClick={reload}>Try again</Button>
@@ -1147,13 +1237,8 @@ export function MediaViewer({
           </div>
         </div>
       )}
-      {activeMarker && !showUpNext && !exitPromptOpen && <Button ref={skipMarkerRef} className="deckyplex-video-control"
-        onClick={() => seek(activeMarker.end)}
-        style={{ position: 'absolute', zIndex: 2, right: '1.25rem', bottom: controlsHidden ? '2rem' : '8.75rem' }}>
-        <FaStepForward aria-hidden="true" /> <span style={{ marginLeft: '0.45rem' }}>{activeMarker.type === 'intro' ? 'Skip intro' : 'Skip credits'}</span>
-      </Button>}
-      {showUpNext && next && <Focusable flow-children="column" style={{ position: 'absolute', zIndex: 3, right: '1.25rem',
-        bottom: '2rem', width: 'min(24rem, 76vw)', padding: '0.9rem', background: '#16212e', borderRadius: 8 }}>
+      {showUpNext && next && <Focusable flow-children="column" className="deckyplex-video-glass"
+        style={{ position: 'absolute', zIndex: 3, right: '1.25rem', bottom: '2rem', width: 'min(24rem, 76vw)', padding: '0.9rem' }}>
         <DialogLabel style={{ margin: '0 0 0.35rem' }}>Up next in {countdown ?? 5}s</DialogLabel>
         <DialogBodyText style={{ margin: '0 0 0.65rem', color: '#e5edf5' }}>{episodeLabel(next)}</DialogBodyText>
         <Focusable flow-children="horizontal" style={{ display: 'flex', gap: '0.5rem' }}>
@@ -1161,58 +1246,62 @@ export function MediaViewer({
           <Button className="deckyplex-video-control" onClick={cancelUpNext}>Cancel</Button>
         </Focusable>
       </Focusable>}
-      {showControls && !optionsPage && !showUpNext && <div style={{ position: 'absolute', inset: 'auto 0 0', padding: '1rem 1.25rem 1.65rem', background: 'linear-gradient(transparent, #0a0d11 35%)' }}>
-        {!photo && duration > 0 && <div style={{ marginBottom: '0.55rem' }}>
-          <VideoScrubber key={`${itemId}:${mediaIndex}`} position={position} duration={duration} disabled={!canControl}
-            seek={seek} previewUrl={media?.preview_url} localConnection={media?.local_connection} />
+      {!optionsPage && !showUpNext && !exitPromptOpen && (showControls || activeMarker) && <div className="deckyplex-video-dock">
+        {activeMarker && <Button ref={skipMarkerRef} className="deckyplex-video-control deckyplex-video-marker deckyplex-video-glass"
+          onClick={() => seek(activeMarker.end)}>
+          <FaStepForward aria-hidden="true" /><span>{activeMarker.type === 'intro' ? 'Skip intro' : 'Skip credits'}</span>
+        </Button>}
+        {showControls && <div className="deckyplex-video-glass deckyplex-video-transport">
+          {!photo && duration > 0 && <VideoScrubber key={`${itemId}:${mediaIndex}`} overlay
+            position={position} duration={duration} disabled={!canControl}
+            seek={seek} previewUrl={media?.preview_url} localConnection={media?.local_connection} />}
+          <Focusable flow-children="horizontal" className="deckyplex-video-buttons">
+            {!photo && <>
+              <Button className="deckyplex-video-control" aria-label="Back 10 seconds" onOKActionDescription="Back 10 seconds"
+                disabled={!canControl || !duration} onClick={() => seek(position - 10)}><MdReplay10 aria-hidden="true" size="1.35em" /></Button>
+              <Button className="deckyplex-video-control" ref={playRef} data-video-play="" aria-label={playing ? 'Pause' : 'Play'}
+                onOKActionDescription={playing ? 'Pause' : 'Play'} disabled={!canControl} onClick={togglePlayback}>
+                {playing ? <FaPause aria-hidden="true" /> : <FaPlay aria-hidden="true" />}
+              </Button>
+              <Button className="deckyplex-video-control" aria-label="Forward 10 seconds" onOKActionDescription="Forward 10 seconds"
+                disabled={!canControl || !duration} onClick={() => seek(position + 10)}><MdForward10 aria-hidden="true" size="1.35em" /></Button>
+              {(initialPlayback?.position ?? initialPosition ?? (media?.resume_ms || 0) / 1000) >= 30 &&
+                <Button className="deckyplex-video-control" aria-label="Start over" onOKActionDescription="Start over"
+                  disabled={!canControl} onClick={() => seek(0)}><FaRedo aria-hidden="true" /></Button>}
+              <Button className="deckyplex-video-control" data-video-utility-start="" aria-label={muted ? 'Unmute' : 'Mute'}
+                onOKActionDescription={muted ? 'Unmute' : 'Mute'} disabled={!canControl} onClick={() => setMuted(value => !value)}>
+                {muted ? <FaVolumeMute aria-hidden="true" /> : <FaVolumeUp aria-hidden="true" />}
+              </Button>
+              {!!media?.subtitle_tracks?.length && <Button className="deckyplex-video-control" ref={captionsButtonRef}
+                aria-label="Captions" aria-pressed={!!media.subtitle_track} onOKActionDescription="Captions"
+                onClick={() => openOptions('subtitles', 'captions')}><FaClosedCaptioning aria-hidden="true" /></Button>}
+              <Button className="deckyplex-video-control" ref={settingsButtonRef} aria-label="Playback settings"
+                onOKActionDescription="Playback settings" disabled={!media} onClick={() => openOptions('main', 'settings')}>
+                <FaCog aria-hidden="true" />
+              </Button>
+            </>}
+            {(!fullscreen || photo) && <Button className="deckyplex-video-control" ref={fullscreenRef} disabled={!canFullscreen && !fullscreen}
+              aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
+              onOKActionDescription={fullscreen ? 'Exit full screen' : 'Full screen'}
+              onClick={() => fullscreen ? leaveFullscreen() : enterFullscreen()}>
+              {fullscreen ? <FaCompress aria-hidden="true" /> : <FaExpand aria-hidden="true" />}
+            </Button>}
+            {!photo && overGamePip && <Button className="deckyplex-video-control" ref={fullscreen ? fullscreenRef : undefined}
+              aria-label={pipLoading ? 'Opening picture-in-picture' : 'Pop out'}
+              onOKActionDescription="Pop out"
+              disabled={!canControl || pipLoading} onClick={() => void playOverGame()}>
+              {pipLoading ? <InlineSpinner /> : <MdPictureInPictureAlt aria-hidden="true" size="1.25em" />}
+            </Button>}
+            {fullscreen && <Button className="deckyplex-video-control" aria-label="Hide controls" onOKActionDescription="Hide controls"
+              onClick={() => setControlsHidden(true)}><FaEyeSlash aria-hidden="true" /></Button>}
+            {next && <Button className="deckyplex-video-control" aria-label="Next episode" onOKActionDescription="Next episode"
+              onClick={() => selectEpisode(next.id)}><FaStepForward aria-hidden="true" /></Button>}
+            <Button className="deckyplex-video-control" ref={closeRef} aria-label="Back to library" onOKActionDescription="Back to library"
+              onClick={close}><FaArrowLeft aria-hidden="true" /></Button>
+          </Focusable>
+          {pipError && <p role="status" className="deckyplex-video-notice">{pipError}</p>}
+          {qualityNotice && !loading && !error && <p role="status" className="deckyplex-video-notice">{qualityNotice}</p>}
         </div>}
-        <Focusable flow-children="horizontal" style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap' }}>
-          {!photo && <>
-            <Button className="deckyplex-video-control" aria-label="Back 10 seconds" onOKActionDescription="Back 10 seconds"
-              disabled={!canControl || !duration} onClick={() => seek(position - 10)}><FaBackward aria-hidden="true" /></Button>
-            <Button className="deckyplex-video-control" ref={playRef} aria-label={playing ? 'Pause' : 'Play'}
-              onOKActionDescription={playing ? 'Pause' : 'Play'} disabled={!canControl} onClick={togglePlayback}>
-              {playing ? <FaPause aria-hidden="true" /> : <FaPlay aria-hidden="true" />}
-            </Button>
-            <Button className="deckyplex-video-control" aria-label="Forward 10 seconds" onOKActionDescription="Forward 10 seconds"
-              disabled={!canControl || !duration} onClick={() => seek(position + 10)}><FaForward aria-hidden="true" /></Button>
-            {(initialPlayback?.position ?? initialPosition ?? (media?.resume_ms || 0) / 1000) >= 30 &&
-              <Button className="deckyplex-video-control" aria-label="Start over" onOKActionDescription="Start over"
-                disabled={!canControl} onClick={() => seek(0)}><FaRedo aria-hidden="true" /></Button>}
-            <Button className="deckyplex-video-control" aria-label={muted ? 'Unmute' : 'Mute'}
-              onOKActionDescription={muted ? 'Unmute' : 'Mute'} disabled={!canControl} onClick={() => setMuted(value => !value)}>
-              {muted ? <FaVolumeMute aria-hidden="true" /> : <FaVolumeUp aria-hidden="true" />}
-            </Button>
-            {!!media?.subtitle_tracks?.length && <Button className="deckyplex-video-control" ref={captionsButtonRef}
-              aria-label="Captions" aria-pressed={!!media.subtitle_track} onOKActionDescription="Captions"
-              style={{ borderBottom: media.subtitle_track ? '2px solid #63bcff' : '2px solid transparent' }}
-              onClick={() => openOptions('subtitles', 'captions')}><FaClosedCaptioning aria-hidden="true" /></Button>}
-            <Button className="deckyplex-video-control" ref={settingsButtonRef} aria-label="Playback settings"
-              onOKActionDescription="Playback settings" disabled={!media} onClick={() => openOptions('main', 'settings')}>
-              <FaCog aria-hidden="true" />
-            </Button>
-          </>}
-          {(!fullscreen || photo) && <Button className="deckyplex-video-control" ref={fullscreenRef} disabled={!canFullscreen && !fullscreen}
-            aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}
-            onOKActionDescription={fullscreen ? 'Exit full screen' : 'Full screen'}
-            onClick={() => fullscreen ? leaveFullscreen() : enterFullscreen()}>
-            {fullscreen ? <FaCompress aria-hidden="true" /> : <FaExpand aria-hidden="true" />}
-          </Button>}
-          {!photo && overGamePip && <Button className="deckyplex-video-control" ref={fullscreen ? fullscreenRef : undefined}
-            aria-label={pipLoading ? 'Opening picture-in-picture' : 'Pop out'}
-            onOKActionDescription="Pop out"
-            disabled={!canControl || pipLoading} onClick={() => void playOverGame()}>
-            {pipLoading ? <InlineSpinner /> : <MdPictureInPictureAlt aria-hidden="true" size="1.25em" />}
-          </Button>}
-          {fullscreen && <Button className="deckyplex-video-control" aria-label="Hide controls" onOKActionDescription="Hide controls"
-            onClick={() => setControlsHidden(true)}><FaEyeSlash aria-hidden="true" /></Button>}
-          {next && <Button className="deckyplex-video-control" aria-label="Next episode" onOKActionDescription="Next episode"
-            onClick={() => selectEpisode(next.id)}><FaStepForward aria-hidden="true" /></Button>}
-          <Button className="deckyplex-video-control" ref={closeRef} aria-label="Back to library" onOKActionDescription="Back to library"
-            onClick={close}><FaArrowLeft aria-hidden="true" /></Button>
-        </Focusable>
-        {pipError && <div role="status"><DialogBodyText style={{ margin: '0.4rem 0 0' }}>{pipError}</DialogBodyText></div>}
-        {qualityNotice && !loading && !error && <div role="status"><DialogBodyText style={{ margin: '0.4rem 0 0' }}>{qualityNotice}</DialogBodyText></div>}
       </div>}
       {optionsPage && !showUpNext && !exitPromptOpen && <VideoPlayerOptions page={optionsPage} onPage={setOptionsPage}
         busy={loading || pipLoading || changingTrack} error={optionsError} info={playbackInfo}
@@ -1227,8 +1316,8 @@ export function MediaViewer({
         }} />}
       {exitPromptOpen && <div role="dialog" aria-modal="true" aria-label="Leave full screen"
         style={{ position: 'absolute', inset: 0, zIndex: 4, display: 'grid', placeItems: 'center', background: 'rgba(0,0,0,0.65)' }}>
-        <Focusable onCancel={handleBack} onCancelActionDescription="Keep watching"
-          style={{ padding: '1rem', background: '#16212e', borderRadius: '0.65rem' }}>
+        <Focusable onCancel={handleBack} onCancelActionDescription="Keep watching" className="deckyplex-video-glass"
+          style={{ padding: '1rem' }}>
           <ChoiceDialogBody title="Leave full screen">
             <ChoiceDialogList>
               <ChoiceDialogRow title="Pause playback" detail="Resume from the Quick Player" preferredFocus rowRef={pauseChoiceRef}

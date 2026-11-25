@@ -11,9 +11,9 @@ export function formatVideoTime(seconds: number) {
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${remainder}` : `${minutes}:${remainder}`;
 }
 
-export function VideoScrubber({ position, duration, disabled, seek, previewUrl, localConnection, compact, steamStyle }: {
+export function VideoScrubber({ position, duration, disabled, seek, previewUrl, localConnection, compact, steamStyle, overlay }: {
   position: number; duration: number; disabled?: boolean; seek: (position: number) => void; previewUrl?: string;
-  localConnection?: boolean; compact?: boolean; steamStyle?: boolean;
+  localConnection?: boolean; compact?: boolean; steamStyle?: boolean; overlay?: boolean;
 }) {
   const [preview, setPreview] = useState<number | null>(null);
   const [thumbnail, setThumbnail] = useState('');
@@ -53,6 +53,7 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
   }, [previewUrl, thumbnailTime, localConnection]);
   const percent = duration > 0 ? 100 * displayed / duration : 0;
   return <div data-deckyplex-video-scrubber="" data-compact={compact || undefined} data-steam-style={steamStyle || undefined}
+    data-video-overlay={overlay || undefined}
     data-video-scrubbing={editing || undefined}
     style={{ width: '100%', position: 'relative' }}
     onBlur={() => { if (draft.current !== null) update(null); }}
@@ -99,6 +100,23 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
         --deckyplex-seek-rail: #788c9f;
         --deckyplex-seek-fill: #bce0ff;
       }
+      [data-deckyplex-video-scrubber][data-video-overlay] .deckyplex-video-position {
+        background: transparent !important;
+        color: #f1f5fa !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+        --deckyplex-seek-rail: rgba(230, 239, 249, 0.36);
+        --deckyplex-seek-fill: #a4dbff;
+      }
+      [data-deckyplex-video-scrubber][data-video-overlay] .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
+      [data-deckyplex-video-scrubber][data-video-overlay][data-video-scrubbing="true"] .deckyplex-video-position {
+        background: rgba(222, 239, 255, 0.15) !important;
+        color: #fff !important;
+        outline: 2px solid rgba(240, 248, 255, 0.88) !important;
+        outline-offset: -2px;
+        --deckyplex-seek-rail: rgba(230, 239, 249, 0.5);
+        --deckyplex-seek-fill: #c2e8ff;
+      }
     `}</style>
     <Button className="deckyplex-video-position" onClick={activate} disabled={disabled} focusable={!disabled}
       aria-label={`Playback position ${formatVideoTime(displayed)} of ${formatVideoTime(duration)}`}
@@ -117,7 +135,8 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
         event.stopImmediatePropagation();
         update(null);
       } : undefined}
-      style={{ display: 'block', width: '100%', padding: '0.4rem 0.65rem', boxSizing: 'border-box', borderRadius: 5 }}>
+      style={{ display: 'block', width: '100%', padding: overlay ? '0.35rem 0.55rem' : '0.4rem 0.65rem',
+        margin: overlay ? '0 0 0.5rem' : undefined, boxSizing: 'border-box', borderRadius: overlay ? 9 : 5 }}>
       <span style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem', fontSize: '0.8rem',
         fontVariantNumeric: 'tabular-nums', marginBottom: '0.15rem' }}>
         <span>{formatVideoTime(displayed)}</span>

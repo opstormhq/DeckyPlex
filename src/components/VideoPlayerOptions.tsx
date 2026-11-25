@@ -57,8 +57,8 @@ export function VideoPlayerOptions({ page, onPage, choices, chapters, seek, info
   const group = groups.find(group => group.key === page);
   const title = group?.title ?? (page === 'chapters' ? 'Chapters' : page === 'info' ? 'Playback info' : 'Playback settings');
   return (
-    <Focusable ref={panelRef} tabIndex={-1} flow-children="column" style={{ position: 'absolute', zIndex: 3, right: '1rem', bottom: '1rem',
-      padding: '0.85rem', background: '#16212e', borderRadius: 8, boxShadow: '0 5px 24px #000a' }}>
+    <Focusable ref={panelRef} tabIndex={-1} flow-children="column" className="deckyplex-video-glass"
+      style={{ position: 'absolute', zIndex: 3, right: '1rem', bottom: '1rem', padding: '0.85rem' }}>
       <ChoiceDialogBody title={title}>
         <ChoiceDialogList>
           {page === 'main' && <>
