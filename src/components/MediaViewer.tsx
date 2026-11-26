@@ -3,8 +3,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { call, getExternalResourceURL, toaster } from '@decky/api';
 import { Button, DialogBodyText, DialogLabel, Focusable, GamepadButton, Navigation, type GamepadEvent } from '@decky/ui';
 import Hls, { type LoaderCallbacks, type LoaderConfiguration, type LoaderContext } from 'hls.js';
-import { FaArrowLeft, FaClosedCaptioning, FaCog, FaCompress, FaExpand, FaEyeSlash,
-  FaPause, FaPlay, FaRedo, FaStepForward, FaStop, FaVolumeMute, FaVolumeUp } from 'react-icons/fa';
+import { FaClosedCaptioning, FaCog, FaCompress, FaExpand,
+  FaPause, FaPlay, FaStepForward, FaStop, FaVolumeMute, FaVolumeUp } from 'react-icons/fa';
 import { MdForward10, MdPictureInPictureAlt, MdReplay10 } from 'react-icons/md';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
@@ -13,7 +13,12 @@ import { reportVideoProgress, startGamePip, type ActiveVideoHls, type VideoItem,
 import { finishPausedVideoResume, refreshPausedViewer, setViewerPlayback, suspendVideoPlayback } from './VideoPlayback';
 import { VideoScrubber } from './VideoScrubber';
 import { episodeLabel, resumePosition } from './VideoQueue';
-import { VideoPlayerOptions, type VideoChapter, type VideoMarker, type VideoOption, type VideoOptionPage } from './VideoPlayerOptions';
+import { VideoPlayerOptions, type VideoChapter, type VideoMarker, type VideoOption, type VideoOptionPage,
+  type VideoPlaybackOption, type VideoPlaybackPreferences } from './VideoPlayerOptions';
+import { InterfaceThemeStyles } from './InterfaceTheme';
+import { videoQualityOptions } from './VideoQuality';
+import { PlaybackSlider } from './PlaybackSlider';
+import { ControllerHint } from './ControllerHint';
 
 interface MediaStream extends Partial<ActiveVideoHls> {
   kind: 'direct' | 'hls' | 'http' | 'image';
@@ -24,7 +29,7 @@ interface MediaStream extends Partial<ActiveVideoHls> {
 
 interface MediaSource {
   local_connection?: boolean;
-  streams?: MediaStream[];
+  streams: MediaStream[];
   resume_ms?: number;
   duration_ms?: number;
   server_id?: string;
@@ -37,6 +42,12 @@ interface MediaSource {
   subtitle_tracks?: VideoOption[];
   audio_track?: number;
   subtitle_track?: number;
+  playback_preferences?: VideoPlaybackPreferences;
+  caption_size_supported?: boolean;
+  caption_auto_sync_supported?: boolean;
+  caption_offset_ms?: number | null;
+  boost_dialog_supported?: boolean;
+  normalize_loudness_supported?: boolean;
   video_codec?: string;
   audio_codec?: string;
   channels?: number;
@@ -45,6 +56,12 @@ interface MediaSource {
   chapters?: VideoChapter[];
   preview_url?: string;
   error?: string;
+}
+
+async function fetchVideoSource(itemId: string, quality: string, mediaIndex: number): Promise<MediaSource> {
+  const result = await call<[string, string, number], Partial<MediaSource>>('get_media_source', itemId, quality, mediaIndex);
+  if (!result?.streams?.length) throw new Error(result?.error || 'Plex could not prepare this item for playback.');
+  return { ...result, streams: result.streams };
 }
 
 const mediaStyle: CSSProperties = {
@@ -131,7 +148,30 @@ const videoPlayerStyles = `
     min-height: 46px;
     background: rgba(218, 236, 255, 0.24) !important;
   }
-  button.deckyplex-video-control[data-video-utility-start] { margin-inline-start: auto !important; }
+  .deckyplex-video-volume-group {
+    --deckyplex-volume-button-width: 40px;
+    position: relative; display: flex; justify-content: flex-end; flex: none; margin-inline-start: auto;
+    block-size: var(--deckyplex-volume-button-width); inline-size: calc(var(--deckyplex-volume-button-width) + 7.25rem);
+  }
+  .deckyplex-video-volume-group > button { width: var(--deckyplex-volume-button-width); }
+  .deckyplex-video-volume {
+    width: 100%;
+  }
+  .deckyplex-video-volume [role="slider"]::after { border-radius: inherit; }
+  @media (prefers-reduced-motion: no-preference) {
+    .deckyplex-video-volume { animation: deckyplex-expand-volume 160ms ease-out; }
+    @keyframes deckyplex-expand-volume {
+      from { clip-path: inset(0 0 0 calc(100% - var(--deckyplex-volume-button-width)) round 999px); }
+      to { clip-path: inset(0 round 999px); }
+    }
+  }
+  .deckyplex-video-volume-hint {
+    position: absolute; inset-block-start: 50%; inset-inline-end: calc(var(--deckyplex-volume-button-width) + 0.5rem);
+    transform: translateY(-50%); width: max-content; z-index: 1;
+    visibility: hidden; padding: 0.35rem 0.55rem; border-radius: 999px; pointer-events: none;
+  }
+  .deckyplex-video-volume-group > button:not(:disabled, .Disabled):is(.gpfocus, :focus-visible, :hover)
+    + .deckyplex-video-volume-hint { visibility: visible; }
   button.deckyplex-video-control[aria-pressed="true"] {
     border-color: #a4d9ff !important;
     color: #a4d9ff !important;
@@ -154,9 +194,34 @@ const videoPlayerStyles = `
   button.deckyplex-video-control:is(:disabled, .Disabled) { opacity: 0.45; }
   .deckyplex-video-control svg { flex-shrink: 0; vertical-align: middle; }
   .deckyplex-video-notice { margin: 0.5rem 0 0; color: #f1f5fa; font-size: 0.85rem; }
+  [data-deckyplex-video][data-deckyplex-light] .deckyplex-video-glass {
+    background: rgba(242, 248, 255, 0.88);
+    border-color: rgba(78, 106, 134, 0.46);
+    color: var(--deckyplex-text);
+  }
+  [data-deckyplex-video][data-deckyplex-light] button.deckyplex-video-control {
+    background: rgba(42, 80, 122, 0.10) !important;
+    border-color: var(--deckyplex-border) !important;
+    color: var(--deckyplex-text) !important;
+  }
+  [data-deckyplex-video][data-deckyplex-light] button.deckyplex-video-control:is([data-video-play], [aria-pressed="true"]) {
+    background: var(--deckyplex-primary) !important;
+    border-color: var(--deckyplex-focus) !important;
+  }
+  [data-deckyplex-video][data-deckyplex-light] button.deckyplex-video-marker {
+    background: rgba(242, 248, 255, 0.88) !important;
+  }
+  [data-deckyplex-video][data-deckyplex-light] button.deckyplex-video-control:not(:disabled, .Disabled):hover {
+    background: var(--deckyplex-hover) !important;
+  }
+  [data-deckyplex-video][data-deckyplex-light] button.deckyplex-video-control:not(:disabled, .Disabled):is(.gpfocus, :focus-visible, :active) {
+    background: var(--deckyplex-hover) !important;
+    outline-color: var(--deckyplex-focus) !important;
+  }
+  [data-deckyplex-video][data-deckyplex-light] .deckyplex-video-notice { color: var(--deckyplex-text); }
   @media (max-width: 540px) {
     .deckyplex-video-buttons { gap: 0.3rem; }
-    button.deckyplex-video-control[data-video-utility-start] { margin-inline-start: 0 !important; }
+    .deckyplex-video-volume-group { margin-inline-start: 0; }
   }
 `;
 
@@ -166,12 +231,6 @@ export interface VideoPresentation {
   fullscreen: boolean;
   controlsHidden: boolean;
 }
-const streamingQualities = [
-  { label: 'Original when possible', data: 'auto' },
-  { label: '1080p · 8 Mbps', data: '1080p' },
-  { label: '720p · 4 Mbps', data: '720p' },
-  { label: '480p · 1.5 Mbps', data: '480p' },
-];
 
 function plexHlsLoader(manifest: URL, proxy: boolean, localConnection: boolean, cachedManifest: string | undefined,
   rememberManifest: (text: string) => void) {
@@ -218,14 +277,15 @@ function plexHlsLoader(manifest: URL, proxy: boolean, localConnection: boolean, 
 }
 
 export function MediaViewer({
-  item, subtitle, photo, initialVolume, initialPlayback, initialPosition, initialPresentation, close, minimized, onMinimizedChange, episodes, episodeQueueReady,
+  item, subtitle, photo, initialVolume, saveVolume, initialPlayback, initialPosition, initialPresentation, close, minimized, onMinimizedChange, episodes, episodeQueueReady,
   playEpisode, removeEpisode, onPlaying,
-  overGamePip, autoplay = true,
+  overGamePip, autoplay = true, lightTheme = false,
 }: {
   item: VideoItem;
   subtitle?: string;
   photo: boolean;
   initialVolume: number;
+  saveVolume: (volume: number, syncSlider?: boolean) => void;
   initialPlayback?: VideoResume | null;
   initialPosition?: number;
   initialPresentation?: VideoPresentation | null;
@@ -238,6 +298,7 @@ export function MediaViewer({
   removeEpisode: (itemId: string) => void;
   onPlaying: () => void;
   overGamePip: boolean;
+  lightTheme?: boolean;
   autoplay?: boolean;
 }) {
   const { id: itemId } = item;
@@ -250,7 +311,7 @@ export function MediaViewer({
   const nativeFullscreen = useRef<Promise<void> | null>(null);
   const restoreControlsFocus = useRef(false);
   const handoffManifest = useRef('');
-  const closeRef = useRef<HTMLDivElement>(null);
+  const retryButtonRef = useRef<HTMLDivElement>(null);
   const playRef = useRef<HTMLDivElement>(null);
   const settingsButtonRef = useRef<HTMLDivElement>(null);
   const captionsButtonRef = useRef<HTMLDivElement>(null);
@@ -273,6 +334,8 @@ export function MediaViewer({
   const switchingEpisode = useRef(false);
   const startupRetried = useRef(false);
   const trackAttempt = useRef<{ kind: 'audio' | 'subtitle'; previous: number; serverId: string; mediaIndex: number; position: number } | null>(null);
+  const tuningAttempt = useRef<{ restore: () => Promise<void>; position: number } | null>(null);
+  const preparedSource = useRef<MediaSource | null>(null);
   const retryTimer = useRef<number | undefined>(undefined);
   const hadNetworkFailure = useRef(false);
   const transferred = useRef(false);
@@ -299,7 +362,14 @@ export function MediaViewer({
   const [position, setPosition] = useState(offset.current);
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(initialPresentation?.volume ?? initialPlayback?.volume ?? initialVolume);
+  const latestLocalVolume = useRef(initialVolume);
+  const lightThemeRef = useRef(lightTheme);
+  lightThemeRef.current = lightTheme;
   const [muted, setMuted] = useState(initialPresentation?.muted ?? initialPlayback?.muted ?? false);
+  const [volumeOpen, setVolumeOpen] = useState(false);
+  const volumeButtonRef = useRef<HTMLDivElement>(null);
+  const volumeSliderRef = useRef<HTMLDivElement>(null);
+  const restoreVolumeButtonFocus = useRef(false);
   const [error, setError] = useState('');
   const [optionsPage, setOptionsPage] = useState<VideoOptionPage | null>(null);
   const [changingTrack, setChangingTrack] = useState(false);
@@ -352,7 +422,8 @@ export function MediaViewer({
     void call('log_video_event', itemId, quality, source, event, code).catch(() => {});
   }, [itemId]);
 
-  const reload = useCallback(() => {
+  const reload = useCallback((prepared?: MediaSource) => {
+    preparedSource.current = prepared ?? null;
     failedStreams.current = [];
     hadNetworkFailure.current = false;
     setStreamIndex(0);
@@ -417,6 +488,21 @@ export function MediaViewer({
       });
       return;
     }
+    const tuning = tuningAttempt.current;
+    if (tuning) {
+      tuningAttempt.current = null;
+      void tuning.restore().then(() => {
+        if (!viewerRef.current) return;
+        offset.current = tuning.position;
+        setOptionsError('Plex could not play with that option. The previous setting was restored.');
+        reload();
+      }).catch(() => {
+        if (!viewerRef.current) return;
+        setLoading(false);
+        setError(detail);
+      });
+      return;
+    }
     setRetryingStart(false);
     setLoading(false);
     setError(detail);
@@ -433,7 +519,7 @@ export function MediaViewer({
       viewer.setAttribute('popover', 'manual');
       try {
         viewer.showPopover();
-        (hiddenControlsRef.current ?? closeRef.current)?.focus({ preventScroll: true });
+        (hiddenControlsRef.current ?? playRef.current ?? fullscreenRef.current ?? viewer)?.focus({ preventScroll: true });
       } catch {
         viewer.removeAttribute('popover');
       }
@@ -450,7 +536,7 @@ export function MediaViewer({
   }, [fullscreen, minimized]);
 
   useEffect(() => {
-    closeRef.current?.focus();
+    viewerRef.current?.focus({ preventScroll: true });
     const pauseForMusic = () => videoRef.current?.pause();
     window.addEventListener('deckyplex-local-music-playing', pauseForMusic);
     return () => {
@@ -489,7 +575,7 @@ export function MediaViewer({
       else if (controlsHidden) hiddenControlsRef.current?.focus({ preventScroll: true });
       else if (restoreControlsFocus.current) {
         restoreControlsFocus.current = false;
-        (playRef.current ?? fullscreenRef.current ?? closeRef.current)?.focus({ preventScroll: true });
+        (playRef.current ?? fullscreenRef.current ?? viewerRef.current)?.focus({ preventScroll: true });
       }
     });
     return () => window.cancelAnimationFrame(frame);
@@ -533,10 +619,11 @@ export function MediaViewer({
       setMedia(result);
     };
     setLoading(true);
-    void call<[string, string, number], MediaSource>('get_media_source', itemId, requestedQuality, mediaIndex)
+    const prepared = preparedSource.current;
+    preparedSource.current = null;
+    void (prepared ? Promise.resolve(prepared) : fetchVideoSource(itemId, requestedQuality, mediaIndex))
       .then(result => {
         if (!active) return;
-        if (!result?.streams?.length) throw new Error('Plex could not prepare this item for playback.');
         const activeHls = firstSource.current ? initialPlayback?.activeHls : undefined;
         if (activeHls && result.server_id === initialPlayback?.serverId && result.quality === initialPlayback?.quality) {
           const saved = new URL(activeHls.url);
@@ -561,6 +648,7 @@ export function MediaViewer({
         startDialog = showPlaybackStartDialog({
           title,
           actionTitle: episode ? 'Play episode' : 'Play movie',
+          lightTheme: lightThemeRef.current,
           position: savedPosition,
           onClose: choice => {
             if (!active) return;
@@ -569,10 +657,10 @@ export function MediaViewer({
           },
         });
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         if (!active) return;
         log(requestedQuality || 'auto', 'source', 'failed', 'source-request');
-        failPlayback('Plex could not prepare this item for playback.', true);
+        failPlayback(error instanceof Error ? error.message : 'Plex could not prepare this item for playback.', true);
       });
     return () => {
       active = false;
@@ -593,8 +681,8 @@ export function MediaViewer({
   useEffect(() => {
     if (!stream || minimized) return;
     const frame = window.requestAnimationFrame(() => {
-      if (document.activeElement === closeRef.current || document.activeElement === document.body) {
-        playRef.current?.focus();
+      if (document.activeElement === viewerRef.current || document.activeElement === document.body) {
+        (playRef.current ?? fullscreenRef.current)?.focus({ preventScroll: true });
       }
     });
     return () => window.cancelAnimationFrame(frame);
@@ -732,12 +820,12 @@ export function MediaViewer({
       if (initialPlayback) finishPausedVideoResume(initialPlayback);
       setRetryingStart(false);
       trackAttempt.current = null;
+      tuningAttempt.current = null;
       workingQuality.current = quality;
       versionAttempt.current = null;
       log(quality, source, 'ready', video.videoWidth && video.videoHeight ? `${video.videoWidth}x${video.videoHeight}` : '');
       if (qualityAttempt.current?.requested === quality) {
         qualityAttempt.current = null;
-        void call('set_settings', { video_quality: quality }).catch(() => {});
       } else {
         setQualityNotice(message => message ? 'Restored the previous stream quality.' : '');
       }
@@ -826,6 +914,38 @@ export function MediaViewer({
     videoRef.current.muted = muted;
   }, [volume, muted]);
 
+  useEffect(() => {
+    if (latestLocalVolume.current === initialVolume) return;
+    latestLocalVolume.current = initialVolume;
+    if (volume !== initialVolume) setVolume(initialVolume);
+  }, [initialVolume, volume]);
+
+  const changeVolume = (value: number) => {
+    setVolume(value);
+    if (value > 0) setMuted(false);
+  };
+
+  const closeVolume = () => {
+    restoreVolumeButtonFocus.current = true;
+    setVolumeOpen(false);
+  };
+
+  const toggleMute = (event: GamepadEvent) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!event.detail?.is_repeat) setMuted(value => !value);
+  };
+
+  useEffect(() => {
+    if (volumeOpen) {
+      if (controlsHidden || minimized) setVolumeOpen(false);
+      else volumeSliderRef.current?.focus({ preventScroll: true });
+    } else if (restoreVolumeButtonFocus.current) {
+      restoreVolumeButtonFocus.current = false;
+      volumeButtonRef.current?.focus({ preventScroll: true });
+    }
+  }, [volumeOpen, controlsHidden, minimized]);
+
   const capturePlayback = () => {
     const video = videoRef.current;
     if (loading || !video || handoff.current) return false;
@@ -877,6 +997,59 @@ export function MediaViewer({
     }
   };
 
+  const applyTuning = async (apply: () => Promise<void>, restore: () => Promise<void>) => {
+    if (trackChangePending.current || !capturePlayback()) return;
+    trackChangePending.current = true;
+    setChangingTrack(true);
+    setOptionsError('');
+    let saved = false;
+    try {
+      await apply();
+      saved = true;
+      const source = await fetchVideoSource(itemId, media?.quality || requestedQuality, mediaIndex);
+      if (viewerRef.current && capturePlayback()) {
+        if (playbackServerId && source.server_id !== playbackServerId) throw new Error('The Plex server changed.');
+        tuningAttempt.current = { restore, position: offset.current };
+        setQualityNotice('');
+        reload(source);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Could not update the Plex playback option.';
+      if (saved) {
+        try {
+          await restore();
+          setOptionsError(`${detail} The previous setting was restored.`);
+        } catch {
+          setOptionsError(`${detail} The previous setting could not be restored.`);
+        }
+      } else setOptionsError(detail);
+    } finally {
+      trackChangePending.current = false;
+      setChangingTrack(false);
+    }
+  };
+
+  const changeTuning = <K extends VideoPlaybackOption>(key: K, value: VideoPlaybackPreferences[K]) => {
+    const previous = media?.playback_preferences?.[key];
+    if (previous === undefined || previous === value) return;
+    const save = async (next: VideoPlaybackPreferences[K]) => {
+      const result = await call<[Partial<VideoPlaybackPreferences>], { error?: string }>('set_settings', { [key]: next });
+      if (result?.error) throw new Error(result.error);
+    };
+    void applyTuning(() => save(value), () => save(previous));
+  };
+
+  const changeCaptionOffset = (value: number) => {
+    if (!media?.server_id || !media.subtitle_track || media.caption_offset_ms == null) return;
+    const { server_id: serverId, subtitle_track: track, caption_offset_ms: previous } = media;
+    const save = async (next: number) => {
+      const result = await call<[string, string, number, string, number, number], { error?: string }>(
+        'set_video_stream', itemId, serverId, mediaIndex, 'subtitle', track, next);
+      if (result?.error) throw new Error(result.error);
+    };
+    void applyTuning(() => save(value), () => save(previous));
+  };
+
   const seek = (target: number) => {
     const video = videoRef.current;
     if (!video || !duration || error) return;
@@ -903,7 +1076,7 @@ export function MediaViewer({
   const cancelUpNext = () => {
     setUpNextCanceled(true);
     revealControls();
-    window.requestAnimationFrame(() => (playRef.current ?? closeRef.current)?.focus({ preventScroll: true }));
+    window.requestAnimationFrame(() => (playRef.current ?? viewerRef.current)?.focus({ preventScroll: true }));
   };
 
   const openOptions = (page: VideoOptionPage, origin: 'settings' | 'captions') => {
@@ -914,6 +1087,10 @@ export function MediaViewer({
 
   const backFromOptions = () => {
     if (trackChangePending.current) return;
+    if (optionsPage === 'captionSize' || optionsPage === 'captionTiming') {
+      setOptionsPage('subtitles');
+      return;
+    }
     if (optionsPage !== 'main' && optionsOrigin.current === 'settings') {
       setOptionsPage('main');
       return;
@@ -1029,6 +1206,7 @@ export function MediaViewer({
       restoreControlsFocus.current = !controlsHidden;
       setExitPromptOpen(false);
     } else if (optionsPage) backFromOptions();
+    else if (volumeOpen) closeVolume();
     else if (showUpNext) cancelUpNext();
     else if (promptOnBack) {
       if (controlsHidden) setExitPromptOpen(true);
@@ -1050,6 +1228,11 @@ export function MediaViewer({
   useEffect(() => {
     if (error && controlsHidden) revealControls();
   }, [error, controlsHidden]);
+
+  useEffect(() => {
+    if (!error || controlsHidden || optionsPage || minimized) return;
+    retryButtonRef.current?.focus({ preventScroll: true });
+  }, [error, controlsHidden, optionsPage, minimized]);
 
   const canControl = !photo && !!stream && !loading && !error;
   const canFullscreen = !!stream && !error;
@@ -1075,23 +1258,28 @@ export function MediaViewer({
     const timer = window.setInterval(() => {
       const document = viewer.ownerDocument;
       const focus = document.activeElement;
-      if (!viewer.contains(focus) || focus?.closest('[data-video-scrubbing="true"]')) {
+      if (!viewer.contains(focus) || volumeOpen || focus?.closest('[data-video-scrubbing="true"]')) {
         lastInteraction.current = Date.now();
       } else if (Date.now() - lastInteraction.current >= 4000) {
         setControlsHidden(true);
       }
     }, 250);
     return () => window.clearInterval(timer);
-  }, [fullscreen, minimized, photo, playing, loading, controlsHidden, optionsPage, showUpNext, pipLoading, exitPromptOpen]);
+  }, [fullscreen, minimized, photo, playing, loading, controlsHidden, optionsPage, showUpNext, pipLoading, exitPromptOpen, volumeOpen]);
 
   useEffect(() => {
     const viewer = viewerRef.current;
     if (!viewer) return;
     const onActivity = (event: Event) => {
       lastInteraction.current = Date.now();
-      if (!controlsHidden || showUpNext || exitPromptOpen) return;
       const key = (event as KeyboardEvent).key;
       const gamepad = (event as GamepadEvent).detail;
+      if (canControl && !minimized && !optionsPage && !showUpNext && !exitPromptOpen
+          && gamepad?.button === GamepadButton.SECONDARY) {
+        toggleMute(event as GamepadEvent);
+        return;
+      }
+      if (!controlsHidden || showUpNext || exitPromptOpen) return;
       if (key === 'Escape') return;
       if (activeMarker && skipMarkerRef.current?.contains(event.target as Node | null)
           && (gamepad?.button === GamepadButton.OK || key === 'Enter' || key === ' ')) return;
@@ -1113,7 +1301,7 @@ export function MediaViewer({
       viewer.removeEventListener('keydown', onActivity, true);
       viewer.removeEventListener('pointermove', onPointerMove);
     };
-  }, [controlsHidden, showUpNext, activeMarker, exitPromptOpen, promptOnBack]);
+  }, [controlsHidden, showUpNext, activeMarker, exitPromptOpen, promptOnBack, canControl, minimized, optionsPage]);
 
   useEffect(() => {
     if (!controlsHidden || minimized || showUpNext || exitPromptOpen) return;
@@ -1129,12 +1317,10 @@ export function MediaViewer({
       return;
     }
     setViewerPlayback(quickPlayerOwner.current, {
-      item, episodes, playing, busy: loading || buffering || pipLoading, transferring: pipLoading, ready: canControl, error, position, duration, volume,
+      item, episodes, playing, busy: loading || buffering || pipLoading, transferring: pipLoading, ready: canControl, error, position, duration, volume, muted,
       toggle: togglePlayback, seek,
-      setVolume: value => {
-        setVolume(value);
-        if (value > 0) setMuted(false);
-      },
+      setVolume: changeVolume,
+      setMuted,
       stop: () => {
         if (initialPlayback) finishPausedVideoResume(initialPlayback);
         close();
@@ -1164,13 +1350,16 @@ export function MediaViewer({
   });
 
   return (
-    <Focusable ref={viewerRef} flow-children="geometric" onCancel={handleBack} inert={minimized}
-      onCancelActionDescription={!controlsHidden && promptOnBack && !optionsPage && !showUpNext ? 'Hide controls' : undefined}
+    <Focusable ref={viewerRef} tabIndex={-1} flow-children="geometric" onCancel={handleBack} inert={minimized}
+      data-deckyplex-video="" data-deckyplex-light={lightTheme || undefined}
+      onCancelActionDescription={volumeOpen ? 'Close volume'
+        : !controlsHidden && promptOnBack && !optionsPage && !showUpNext ? 'Hide controls' : undefined}
       style={{ ...(fullscreen
         ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', zIndex: 1000,
             margin: 0, padding: 0, border: 0, maxWidth: 'none', maxHeight: 'none' }
         : { position: 'relative', width: '100%', height: 'calc(100% - 40px)', marginTop: '40px' }),
         display: minimized ? 'none' : undefined, background: '#000', color: '#f3f6fa', overflow: 'hidden' }}>
+      <InterfaceThemeStyles />
       <style>{videoPlayerStyles}</style>
       {photo ? (stream && <img src={plexMediaUrl(stream.url, media?.local_connection)} alt={title} style={mediaStyle}
         onLoad={() => setLoading(false)} onError={() => {
@@ -1229,7 +1418,7 @@ export function MediaViewer({
           <div className="deckyplex-video-glass" style={{ padding: '0.8rem 1rem', maxWidth: '85%' }}>
             {error ? <Focusable flow-children="column" style={{ display: 'flex', flexDirection: 'column', gap: '0.65rem' }}>
               <DialogBodyText style={{ margin: 0 }}>{error}</DialogBodyText>
-              <Button onClick={reload}>Try again</Button>
+              <Button ref={retryButtonRef} className="deckyplex-video-control" onClick={() => reload()}>Try again</Button>
             </Focusable> : <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <InlineSpinner />{qualityNotice || (retryingStart ? 'Retrying playback…'
                 : buffering && !loading ? 'Buffering…' : `Loading ${photo ? 'photo' : 'video'}…`)}
@@ -1240,7 +1429,7 @@ export function MediaViewer({
       {showUpNext && next && <Focusable flow-children="column" className="deckyplex-video-glass"
         style={{ position: 'absolute', zIndex: 3, right: '1.25rem', bottom: '2rem', width: 'min(24rem, 76vw)', padding: '0.9rem' }}>
         <DialogLabel style={{ margin: '0 0 0.35rem' }}>Up next in {countdown ?? 5}s</DialogLabel>
-        <DialogBodyText style={{ margin: '0 0 0.65rem', color: '#e5edf5' }}>{episodeLabel(next)}</DialogBodyText>
+        <DialogBodyText style={{ margin: '0 0 0.65rem', color: 'var(--deckyplex-text, #e5edf5)' }}>{episodeLabel(next)}</DialogBodyText>
         <Focusable flow-children="horizontal" style={{ display: 'flex', gap: '0.5rem' }}>
           <Button ref={upNextRef} className="deckyplex-video-control" onClick={() => selectEpisode(next.id)}>Play now</Button>
           <Button className="deckyplex-video-control" onClick={cancelUpNext}>Cancel</Button>
@@ -1265,13 +1454,28 @@ export function MediaViewer({
               </Button>
               <Button className="deckyplex-video-control" aria-label="Forward 10 seconds" onOKActionDescription="Forward 10 seconds"
                 disabled={!canControl || !duration} onClick={() => seek(position + 10)}><MdForward10 aria-hidden="true" size="1.35em" /></Button>
-              {(initialPlayback?.position ?? initialPosition ?? (media?.resume_ms || 0) / 1000) >= 30 &&
-                <Button className="deckyplex-video-control" aria-label="Start over" onOKActionDescription="Start over"
-                  disabled={!canControl} onClick={() => seek(0)}><FaRedo aria-hidden="true" /></Button>}
-              <Button className="deckyplex-video-control" data-video-utility-start="" aria-label={muted ? 'Unmute' : 'Mute'}
-                onOKActionDescription={muted ? 'Unmute' : 'Mute'} disabled={!canControl} onClick={() => setMuted(value => !value)}>
-                {muted ? <FaVolumeMute aria-hidden="true" /> : <FaVolumeUp aria-hidden="true" />}
-              </Button>
+              <div className="deckyplex-video-volume-group" onBlur={event => {
+                if (volumeOpen && event.relatedTarget && !event.currentTarget.contains(event.relatedTarget)) setVolumeOpen(false);
+              }}>
+                {volumeOpen ? <div className="deckyplex-video-volume">
+                  <PlaybackSlider compact label={muted ? 'Volume (muted)' : 'Volume'} value={volume} min={0} max={100}
+                    sliderRef={volumeSliderRef} confirmLabel="Done" onConfirm={closeVolume} disabled={!canControl}
+                    secondaryLabel={muted ? 'Unmute' : 'Mute'} onSecondary={toggleMute} onChange={value => {
+                      changeVolume(value);
+                      saveVolume(value, true);
+                    }} />
+                </div> : <>
+                  <Button className="deckyplex-video-control" ref={volumeButtonRef} aria-label="Volume" aria-expanded={false}
+                    onOKActionDescription="Adjust volume"
+                    onSecondaryActionDescription={muted ? 'Unmute' : 'Mute'} onSecondaryButton={toggleMute}
+                    disabled={!canControl} onClick={() => setVolumeOpen(true)}>
+                    {muted ? <FaVolumeMute aria-hidden="true" /> : <FaVolumeUp aria-hidden="true" />}
+                  </Button>
+                  <div className="deckyplex-video-glass deckyplex-video-volume-hint" aria-hidden="true">
+                    <ControllerHint button="X">{muted ? 'to unmute' : 'to mute'}</ControllerHint>
+                  </div>
+                </>}
+              </div>
               {!!media?.subtitle_tracks?.length && <Button className="deckyplex-video-control" ref={captionsButtonRef}
                 aria-label="Captions" aria-pressed={!!media.subtitle_track} onOKActionDescription="Captions"
                 onClick={() => openOptions('subtitles', 'captions')}><FaClosedCaptioning aria-hidden="true" /></Button>}
@@ -1292,12 +1496,8 @@ export function MediaViewer({
               disabled={!canControl || pipLoading} onClick={() => void playOverGame()}>
               {pipLoading ? <InlineSpinner /> : <MdPictureInPictureAlt aria-hidden="true" size="1.25em" />}
             </Button>}
-            {fullscreen && <Button className="deckyplex-video-control" aria-label="Hide controls" onOKActionDescription="Hide controls"
-              onClick={() => setControlsHidden(true)}><FaEyeSlash aria-hidden="true" /></Button>}
             {next && <Button className="deckyplex-video-control" aria-label="Next episode" onOKActionDescription="Next episode"
               onClick={() => selectEpisode(next.id)}><FaStepForward aria-hidden="true" /></Button>}
-            <Button className="deckyplex-video-control" ref={closeRef} aria-label="Back to library" onOKActionDescription="Back to library"
-              onClick={close}><FaArrowLeft aria-hidden="true" /></Button>
           </Focusable>
           {pipError && <p role="status" className="deckyplex-video-notice">{pipError}</p>}
           {qualityNotice && !loading && !error && <p role="status" className="deckyplex-video-notice">{qualityNotice}</p>}
@@ -1305,10 +1505,14 @@ export function MediaViewer({
       </div>}
       {optionsPage && !showUpNext && !exitPromptOpen && <VideoPlayerOptions page={optionsPage} onPage={setOptionsPage}
         busy={loading || pipLoading || changingTrack} error={optionsError} info={playbackInfo}
+        tuning={{ preferences: media?.playback_preferences, captionSize: media?.caption_size_supported,
+          captionAutoSync: media?.caption_auto_sync_supported, captionOffset: media?.caption_offset_ms,
+          boostDialog: media?.boost_dialog_supported, normalizeLoudness: media?.normalize_loudness_supported,
+          change: changeTuning, changeOffset: changeCaptionOffset }}
         chapters={mediaIndex === 0 ? media?.chapters ?? [] : []}
         seek={time => { seek(time); backFromOptions(); }}
         choices={{
-          quality: { options: streamingQualities, selected: media?.quality || requestedQuality || 'auto', choose: changeQuality },
+          quality: { options: videoQualityOptions, selected: media?.quality || requestedQuality || 'auto', choose: changeQuality },
           audio: { options: media?.audio_tracks ?? [], selected: media?.audio_track, choose: value => void changeTrack('audio', value) },
           subtitles: { options: media?.subtitle_tracks?.length ? [{ data: 0, label: 'Captions off' }, ...media.subtitle_tracks] : [],
             selected: media?.subtitle_track ?? 0, choose: value => void changeTrack('subtitle', value) },

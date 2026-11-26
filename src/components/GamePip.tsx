@@ -468,6 +468,14 @@ export function setGamePipVolume(volume: number) {
   void control(current.id, 'volume', volume).catch(() => {});
 }
 
+export function setGamePipMuted(muted: boolean) {
+  const current = pipState.overlay;
+  if (!current?.playback || current.busy) return;
+  current.muted = muted;
+  publish();
+  void control(current.id, 'mute', muted ? 1 : 0).catch(() => {});
+}
+
 export function removeGamePipEpisode(id: string) {
   if (!pipState.overlay || pipState.overlay.item.id === id) return;
   pipState.overlay.episodes = pipState.overlay.episodes.filter(episode => episode.id !== id);

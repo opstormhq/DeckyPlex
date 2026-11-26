@@ -18,7 +18,7 @@ export function FocusOutlineStyles() {
       z-index: 1;
       pointer-events: none;
       border-radius: 4px;
-      outline: 2px solid rgba(255, 255, 255, 0.6);
+      outline: 2px solid var(--deckyplex-focus, rgba(255, 255, 255, 0.6));
       outline-offset: -2px;
       animation: ${focusRingClasses?.flash || 'none'} .5s ease, ${focusRingClasses?.blinker || 'none'} 1.2s ease-in-out .4s 20;
     }

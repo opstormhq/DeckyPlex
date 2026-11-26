@@ -1,4 +1,5 @@
 import { plexMediaUrl } from './PlexMediaUrl';
+import { InterfaceThemeStyles } from './InterfaceTheme';
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { call, useQuickAccessVisible } from '@decky/api';
 import {
@@ -23,11 +24,14 @@ import {
   FaSignInAlt,
   FaCog,
   FaExpand,
+  FaVolumeMute,
+  FaVolumeUp,
 } from 'react-icons/fa';
 import { MdPictureInPictureAlt } from 'react-icons/md';
 import { usePlayer } from '../context/PlayerContext';
 import { InlineSpinner } from './InlineSpinner';
-import { playGamePipEpisode, removeGamePipEpisode, seekGamePip, setGamePipVolume, stopGamePip, toggleGamePipPlayback, useGamePipPlayback } from './GamePip';
+import { playGamePipEpisode, removeGamePipEpisode, seekGamePip, setGamePipMuted, setGamePipVolume,
+  stopGamePip, toggleGamePipPlayback, useGamePipPlayback } from './GamePip';
 import { VideoScrubber } from './VideoScrubber';
 import { clearPausedVideo, updatePausedVideo, usePausedVideo, useViewerPlayback } from './VideoPlayback';
 import { episodeLabel } from './VideoQueue';
@@ -48,6 +52,7 @@ type QuickPlayerSettings = {
   selected_server_id?: string;
   selected_server_url?: string;
   browse_all_media?: boolean;
+  interface_theme?: 'dark' | 'light';
   hide_quick_login?: boolean;
   quick_player_maintain_x?: boolean;
   quick_player_show_idle?: boolean;
@@ -58,6 +63,7 @@ type ShuffleItem = { id: string; type: string; title?: string; grandparentTitle?
   parentTitle?: string; duration?: number; thumb?: string };
 type ShufflePage = { items?: ShuffleItem[]; error?: string };
 let lastQuickSettings: QuickPlayerSettings | null = null;
+const remoteVolumeBeforeMute = new Map<string, number>();
 
 async function shuffleRequest<T extends { error?: string }>(request: () => Promise<T>): Promise<T> {
   const result = await retryPlexRead(request);
@@ -113,11 +119,13 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
     track,
     volume: musicVolume,
     localVolume,
+    localMuted,
     volumeSliderRevision,
     error,
     progress: musicProgress,
     duration: musicDuration,
     remoteMode,
+    remotePlayerId,
     remoteQueueEditable,
     canLoadMoreQueue,
     loadMusicArtwork,
@@ -134,6 +142,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
     skipPrevious,
     setVolume,
     setLocalVolume,
+    setLocalMuted,
     seek,
     queue,
     queueIndex,
@@ -146,11 +155,12 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   const pausedViewer = pausedVideo ? {
     item: pausedVideo.resume.item, episodes: pausedVideo.resume.episodes ?? [],
     playing: false, ready: true, position: pausedVideo.resume.position, duration: pausedVideo.duration,
-    volume: pausedVideo.resume.volume, busy: false, transferring: false, error: undefined, popOut: undefined,
+    volume: pausedVideo.resume.volume, muted: pausedVideo.resume.muted, busy: false, transferring: false, error: undefined, popOut: undefined,
     toggle: () => onResumeVideo(true), expand: () => onResumeVideo(false),
     stop: () => { clearPausedVideo(); activeViewer?.stop(); },
     seek: (position: number) => updatePausedVideo(resume => ({ ...resume, position })),
     setVolume: (volume: number) => updatePausedVideo(resume => ({ ...resume, volume, muted: volume > 0 ? false : resume.muted })),
+    setMuted: (muted: boolean) => updatePausedVideo(resume => ({ ...resume, muted })),
     playEpisode: (id: string) => {
       const item = pausedVideo.resume.episodes?.find(episode => episode.id === id);
       if (!item) return;
@@ -173,7 +183,29 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   const canSelectEpisode = !!playEpisode && (pip ? !pip.busy : !viewer?.transferring);
   const progress = pip ? pip.playback?.position || 0 : viewer?.position ?? musicProgress;
   const duration = pip ? pip.playback?.duration || 0 : viewer?.duration ?? musicDuration;
-  const volume = pip?.volume ?? viewer?.volume ?? (remoteMode ? musicVolume : localVolume);
+  const rememberedRemoteVolume = remoteVolumeBeforeMute.get(remotePlayerId);
+  const remoteMuted = musicVolume === 0 && rememberedRemoteVolume !== undefined;
+  const volume = videoActive || !remoteMode ? localVolume : remoteMuted ? rememberedRemoteVolume : musicVolume;
+  const muted = pip?.muted ?? viewer?.muted ?? (remoteMode ? remoteMuted : localMuted);
+  const canMute = pip ? !pip.busy : viewer ? !viewer.transferring : !remoteMode || musicVolume > 0 || remoteMuted;
+  const muteLabel = muted ? 'Unmute' : 'Mute';
+  const toggleMute = () => {
+    if (pip) setGamePipMuted(!muted);
+    else if (viewer) viewer.setMuted(!muted);
+    else if (!remoteMode) setLocalMuted(!muted);
+    else if (remoteMuted) {
+      remoteVolumeBeforeMute.delete(remotePlayerId);
+      setVolume(rememberedRemoteVolume);
+    } else if (musicVolume > 0) {
+      remoteVolumeBeforeMute.set(remotePlayerId, musicVolume);
+      setVolume(0);
+    }
+  };
+  const handleMuteShortcut = (event: GamepadEvent) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!event.detail?.is_repeat) toggleMute();
+  };
   const volumeSource = pip ? 'pip' : viewer ? 'video' : remoteMode ? 'remote' : 'local';
   const playbackPending = pip?.busy ?? viewer?.busy ?? (musicPending || playbackState === 'starting');
   const seekPlayback = pip ? seekGamePip : viewer?.seek ?? seek;
@@ -429,6 +461,11 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       const active = event.target as HTMLElement | null;
       if (!active || !player.contains(active)) return;
       previousFocus.current = active;
+      if (event.detail?.button === GamepadButton.SECONDARY) {
+        if (!canMute || active.closest('[data-quick-queue-edit]')) return;
+        handleMuteShortcut(event);
+        return;
+      }
       if (event.detail?.button !== GamepadButton.CANCEL) return;
       if (active.closest('[data-video-scrubbing]')) return;
       const inOpenQueue = showQueue && (queueContainerRef.current?.contains(active) || queueToggleRef.current?.contains(active));
@@ -465,7 +502,8 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       ref={primary ? playPauseRef : undefined} preferredFocus={primary && !maintainControlPosition}
       data-quick-primary={primary || undefined} data-quick-skip={skip}
       onClick={enabled ? action : undefined} style={transportStyle}>{icon}</Button>
-      : <span aria-hidden="true" style={{ ...transportStyle, color: '#8394a9', background: '#212d3c' }}>{icon}</span>
+      : <span aria-hidden="true" style={{ ...transportStyle, color: 'var(--deckyplex-disabled, #8394a9)',
+        background: 'var(--deckyplex-button, #212d3c)' }}>{icon}</span>
   );
   const status = <div role="status" className="deckyplex-quick-status" style={{ ...metadataLine, marginInlineStart: 'auto' }}>
     <span style={singleLine}>{statusText}</span>
@@ -478,6 +516,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
 
   return (
     <div ref={playerRef} data-deckyplex-quick-player="" data-steam-style={nativeStyle || undefined}
+      data-deckyplex-light={settings?.interface_theme === 'light' || undefined}
       onFocusCapture={event => {
         previousFocus.current = event.target;
         const skip = event.target.closest<HTMLElement>('[data-quick-skip]')?.dataset.quickSkip;
@@ -486,6 +525,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       onBlurCapture={event => {
         if (!event.currentTarget.contains(event.relatedTarget)) setFocusedSkip(null);
       }}>
+      <InterfaceThemeStyles />
       <style>{`
         [data-deckyplex-quick-player] {
           display: grid; gap: 0.65rem; padding: 0.65rem 0.85rem 0.85rem;
@@ -497,23 +537,41 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
           box-shadow: none !important; text-shadow: none !important; filter: none !important;
         }
         [data-deckyplex-quick-player]:not([data-steam-style]) .deckyplex-quick-button {
-          background: #28374a !important; color: #edf3fd !important;
+          background: var(--deckyplex-button, #28374a) !important; color: var(--deckyplex-text, #edf3fd) !important;
           border-radius: 6px; box-sizing: border-box;
         }
         [data-deckyplex-quick-player]:not([data-steam-style]) .deckyplex-quick-button[data-quick-primary] {
-          background: #3b5674 !important;
+          background: var(--deckyplex-primary, #3b5674) !important;
         }
         [data-deckyplex-quick-player]:not([data-steam-style]) .deckyplex-quick-button:not(:disabled):is(:focus-visible, .gpfocus, :active) {
-          background: #cadff5 !important; color: #172536 !important;
+          background: var(--deckyplex-hover, #cadff5) !important; color: var(--deckyplex-text, #172536) !important;
+        }
+        [data-deckyplex-quick-player][data-deckyplex-light] .deckyplex-quick-button {
+          background: var(--deckyplex-button) !important; color: var(--deckyplex-text) !important;
+        }
+        [data-deckyplex-quick-player][data-deckyplex-light] .deckyplex-quick-button[data-quick-primary] {
+          background: var(--deckyplex-primary) !important;
+        }
+        [data-deckyplex-quick-player][data-deckyplex-light] .deckyplex-quick-button:not(:disabled):is(:focus-visible, .gpfocus, :active) {
+          background: var(--deckyplex-hover) !important; color: var(--deckyplex-focus-text) !important;
+          outline: 2px solid var(--deckyplex-focus) !important; outline-offset: -2px;
         }
         [data-deckyplex-quick-player] .deckyplex-quick-button[aria-disabled="true"] svg { opacity: 0.55; }
         .deckyplex-quick-status { display: flex; align-items: center; justify-content: end; gap: 0.4rem; min-width: 0; }
         [data-deckyplex-quick-player] .deckyplex-quick-button {
           appearance: none; border: 0 !important; margin: 0 !important;
         }
-        [data-deckyplex-quick-player]:not([data-steam-style]) .deckyplex-quick-button::before,
-        [data-deckyplex-quick-player]:not([data-steam-style]) .deckyplex-quick-button::after {
+        [data-deckyplex-quick-player]:is(:not([data-steam-style]), [data-deckyplex-light]) .deckyplex-quick-button::before,
+        [data-deckyplex-quick-player]:is(:not([data-steam-style]), [data-deckyplex-light]) .deckyplex-quick-button::after {
           content: none !important;
+        }
+        [data-deckyplex-quick-player][data-deckyplex-light] [data-quick-track-info]:is(.gpfocus, :focus-visible) {
+          background: var(--deckyplex-hover) !important; color: var(--deckyplex-focus-text) !important;
+          outline: 2px solid var(--deckyplex-focus); outline-offset: 2px; border-radius: 6px;
+        }
+        [data-deckyplex-quick-player][data-deckyplex-light] [data-deckyplex-playback-card] {
+          background-color: var(--deckyplex-surface) !important;
+          background-image: none !important; color: var(--deckyplex-text) !important;
         }
       `}</style>
       <div ref={headingRef} data-quick-heading="" onFocusCapture={showPlayerTop} style={{
@@ -546,23 +604,25 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       </div>
 
       {showPlayer && <div data-deckyplex-playback-card="" style={{
-        background: nativeStyle ? 'rgba(255,255,255,0.05)' : '#182433',
-        border: nativeStyle ? '1px solid rgba(255,255,255,0.15)' : '1px solid #304158', borderRadius: 9,
+        background: nativeStyle ? 'var(--deckyplex-surface, rgba(255,255,255,0.05))' : 'var(--deckyplex-surface, #182433)',
+        border: nativeStyle ? '1px solid var(--deckyplex-border, rgba(255,255,255,0.15))' : '1px solid var(--deckyplex-border, #304158)',
+        borderRadius: 9, color: 'var(--deckyplex-text, inherit)',
         padding: '0.7rem', display: 'grid', gap: '0.7rem', minWidth: 0 }}>
-        <TrackInfo tabIndex={trackInfoFocusable ? 0 : undefined}
+        <TrackInfo data-quick-track-info="" tabIndex={trackInfoFocusable ? 0 : undefined}
           onFocus={trackInfoFocusable ? showPlayerTop : undefined}
-          style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', minWidth: 0, minHeight: videoActive ? 81 : 60 }}>
-          <span style={{ width: portrait ? 54 : wideArt ? 79 : 60, height: portrait ? 81 : wideArt ? 46 : 60,
+          style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', minWidth: 0, minHeight: videoActive ? 81 : hasTrack ? 60 : undefined }}>
+          {hasTrack && <span data-quick-artwork="" style={{ width: portrait ? 54 : wideArt ? 79 : 60, height: portrait ? 81 : wideArt ? 46 : 60,
             display: 'grid', placeItems: 'center', overflow: 'hidden', flexShrink: 0, borderRadius: 6,
-            background: '#26374c', color: '#aec9e4' }}>
+            background: 'var(--deckyplex-button, #26374c)', color: 'var(--deckyplex-muted, #aec9e4)' }}>
             {artwork ? <img key={artwork} src={artwork} alt="" onError={() => {
               if (videoActive) setFailedVideoArt(artwork);
               else if (needsArtworkRelay) setRelayedMusicArt({ key: musicArtKey, src: '' });
               else setFailedMusicArt(musicArtKey);
             }} style={{ width: '100%', height: '100%', objectFit: 'cover', minHeight: 0 }} />
               : videoActive ? <FaFilm aria-hidden="true" /> : <FaMusic aria-hidden="true" />}
-          </span>
-          <div style={{ display: 'grid', flex: 1, alignContent: 'center', gap: '0.2rem', minWidth: 0, minHeight: '3.5rem' }}>
+          </span>}
+          <div style={{ display: 'grid', flex: 1, alignContent: 'center', gap: '0.2rem',
+            minWidth: 0, minHeight: hasTrack ? '3.5rem' : '1.6rem' }}>
             <div style={{ ...singleLine, fontWeight: 650, fontSize: '1rem', lineHeight: 1.2 }}>
               {video ? episodeLabel(video) : track?.title || (playbackPending ? 'Starting playback…' : 'Nothing playing')}
             </div>
@@ -582,16 +642,16 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
         {videoActive ? <VideoScrubber key={video?.id} compact steamStyle={nativeStyle}
           position={progress} duration={duration} disabled={!canSeek} seek={seekPlayback} /> : (
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.55rem', fontSize: '0.74rem',
-              fontVariantNumeric: 'tabular-nums', color: '#b9cbe0', paddingBlock: '0.15rem' }}>
+              fontVariantNumeric: 'tabular-nums', color: 'var(--deckyplex-muted, #b9cbe0)', paddingBlock: '0.15rem' }}>
               <span>{formatTime(progress)}</span>
-              <div style={{ flex: 1, height: 4, background: '#53657a', borderRadius: 3, cursor: canSeek ? 'pointer' : 'default' }}
+              <div style={{ flex: 1, height: 4, background: 'var(--deckyplex-border, #53657a)', borderRadius: 3, cursor: canSeek ? 'pointer' : 'default' }}
                 onClick={event => {
                   if (!canSeek) return;
                   const bounds = event.currentTarget.getBoundingClientRect();
                   if (bounds.width) seekPlayback(duration * Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)));
                 }}>
                 <div style={{ width: `${duration > 0 ? Math.min(100, Math.max(0, (progress / duration) * 100)) : 0}%`,
-                  height: '100%', background: '#9acfff', borderRadius: 3 }} />
+                  height: '100%', background: 'var(--deckyplex-accent, #9acfff)', borderRadius: 3 }} />
               </div>
               <span>{formatTime(duration)}</span>
             </div>
@@ -616,7 +676,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
           {transport(canStop, 'Stop', <FaStop />, pip ? stopGamePip : viewer?.stop ?? stop)}
         </Focusable>
 
-        {videoActions && <Focusable flow-children="horizontal" style={{ ...buttonRowStyle, borderTop: '1px solid #304158',
+        {videoActions && <Focusable flow-children="horizontal" style={{ ...buttonRowStyle, borderTop: '1px solid var(--deckyplex-border, #304158)',
           marginTop: '0.15rem', paddingTop: '0.65rem' }}>
           {(pip || viewer?.expand) && <Button {...quickButtonProps} onClick={pip ? onExpandPip : viewer?.expand}
             focusable={!playbackPending} disabled={playbackPending} style={videoActionStyle}>
@@ -657,6 +717,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
             const queueKey = videoActive ? queuedTrack.id
               : remoteMode && queuedTrack.playQueueItemID ? queuedTrack.playQueueItemID : `${queuedTrack.id}-${actualIndex}`;
             return <Button {...quickButtonProps} key={queueKey} ref={(element: HTMLDivElement | null) => { if (element) element.dataset.queueTrackId = queuedTrack.id; }}
+              data-quick-queue-edit={canEdit || undefined}
               disabled={!canPlayEntry && !canEdit} focusable={canPlayEntry || canEdit} onClick={canPlayEntry ? () => playQueueEntry(actualIndex) : undefined}
               onSecondaryActionDescription={canEdit ? 'Remove from queue' : undefined}
               onSecondaryButton={!canEdit ? undefined : event => {
@@ -670,17 +731,26 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
           })}
         </Focusable>
       </div>}
-      <SliderField key={`${volumeSource}:${volumeSliderRevision}`} label="Volume" layout="inline"
-        childrenContainerWidth="max" bottomSeparator="none" min={0} max={100} value={volume}
-        onChange={value => {
-          if (!videoActive) {
-            setVolume(value);
-            return;
-          }
-          setLocalVolume(value);
-          if (pip) setGamePipVolume(value);
-          else viewer?.setVolume(value);
-        }} />
+      <Focusable {...{ focusable: false }}
+        onSecondaryActionDescription={canMute ? muteLabel : undefined}
+        onSecondaryButton={canMute ? handleMuteShortcut : undefined}>
+        <SliderField key={`${volumeSource}:${volumeSliderRevision}`}
+          label={<span role="img" aria-label={muted ? 'Volume (muted)' : 'Volume'}
+            style={{ display: 'flex', alignItems: 'center' }}>
+            {muted ? <FaVolumeMute aria-hidden="true" /> : <FaVolumeUp aria-hidden="true" />}
+          </span>}
+          layout="inline" childrenContainerWidth="max" bottomSeparator="none" min={0} max={100} value={volume}
+          onChange={value => {
+            if (!videoActive) {
+              if (remoteMode) remoteVolumeBeforeMute.delete(remotePlayerId);
+              setVolume(value);
+              return;
+            }
+            setLocalVolume(value);
+            if (pip) setGamePipVolume(value);
+            else viewer?.setVolume(value);
+          }} />
+      </Focusable>
       <Button {...quickButtonProps} style={wideButtonStyle} onClick={onSettings}>
         <span style={actionLabelStyle}><FaCog aria-hidden="true" />Settings</span>
       </Button>

@@ -12,9 +12,11 @@ export interface ViewerPlayback {
   position: number;
   duration: number;
   volume: number;
+  muted: boolean;
   toggle: () => void;
   seek: (position: number) => void;
   setVolume: (volume: number) => void;
+  setMuted: (muted: boolean) => void;
   stop: () => void;
   playEpisode: (itemId: string) => void;
   removeEpisode: (itemId: string) => void;

@@ -1,6 +1,7 @@
-import { ModalRoot, showModal } from '@decky/ui';
+import { showModal } from '@decky/ui';
 import { FaPlay, FaStepBackward } from 'react-icons/fa';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
+import { DeckyPlexModal } from './InterfaceTheme';
 
 type PlaybackStart = 'resume' | 'beginning';
 
@@ -10,6 +11,7 @@ interface PlaybackStartOptions {
   position: number;
   resumeLabel?: string;
   firstLabel?: string;
+  lightTheme?: boolean;
   onClose: (choice?: PlaybackStart) => void;
 }
 
@@ -34,12 +36,13 @@ export function showPlaybackStartDialog({ actionTitle, onClose, ...options }: Pl
   return { Close: () => finish() };
 }
 
-function PlaybackStartDialog({ title, actionTitle, position, resumeLabel, firstLabel, onChoose, onCancel }: {
+function PlaybackStartDialog({ title, actionTitle, position, resumeLabel, firstLabel, lightTheme, onChoose, onCancel }: {
   title: string;
   actionTitle: string;
   position: number;
   resumeLabel?: string;
   firstLabel?: string;
+  lightTheme?: boolean;
   onChoose: (start: PlaybackStart) => void;
   onCancel: () => void;
 }) {
@@ -49,13 +52,13 @@ function PlaybackStartDialog({ title, actionTitle, position, resumeLabel, firstL
   const resumeTime = hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
   const resumeDetail = [resumeLabel, position > 0 ? `${resumeTime} in` : null].filter(Boolean).join(' · ');
   return (
-    <ModalRoot closeModal={onCancel} onCancel={onCancel} onOK={() => {}}>
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={onCancel} onCancel={onCancel} onOK={() => {}}>
       <ChoiceDialogBody title={actionTitle} subtitle={title}>
         <ChoiceDialogList>
           <ChoiceDialogRow title="Resume" detail={resumeDetail} icon={<FaPlay />} preferredFocus onChoose={() => onChoose('resume')} />
           <ChoiceDialogRow title="Start from beginning" detail={firstLabel} icon={<FaStepBackward />} onChoose={() => onChoose('beginning')} />
         </ChoiceDialogList>
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }

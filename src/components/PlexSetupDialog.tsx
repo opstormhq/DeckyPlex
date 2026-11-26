@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type Ref } from 'react';
-import { Button, DialogBodyText, ModalRoot, ToggleField } from '@decky/ui';
+import { Button, DialogBodyText, ToggleField } from '@decky/ui';
 import { FaArrowRight, FaServer } from 'react-icons/fa';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
+import { DeckyPlexModal } from './InterfaceTheme';
 
 export interface PlexServerOption {
   id: string;
@@ -38,12 +39,13 @@ export function LibraryRow({ library, included, disabled, onChange, rowRef }: {
   </div>;
 }
 
-export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, complete, close }: {
+export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, complete, close, lightTheme }: {
   servers: PlexServerOption[];
   defaultServerId: string;
   loadLibraries: (serverId: string) => Promise<LibraryCatalog>;
   complete: (serverId: string, selectedIds: string[]) => Promise<void>;
   close: () => void;
+  lightTheme?: boolean;
 }) {
   const [server, setServer] = useState<PlexServerOption | null>(servers.length === 1 ? servers[0] : null);
   const [catalog, setCatalog] = useState<LibraryChoice[] | null>(null);
@@ -118,7 +120,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
   };
   const defaultServer = servers.find(option => option.id === defaultServerId) || servers[0];
   return (
-    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}}
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={cancel} onCancel={cancel} onOK={() => {}}
       bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
       <ChoiceDialogBody title={server ? 'Choose Plex libraries' : 'Choose a Plex server'} subtitle={server?.name}>
       {!server ? (
@@ -160,6 +162,6 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
         </>
       )}
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }

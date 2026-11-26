@@ -227,6 +227,8 @@ class GameVideo:
                 next_control["volume"] = min(100, _seconds(position)) / 100
                 if next_control["volume"] > 0:
                     next_control["muted"] = False
+            if action == "mute":
+                next_control["muted"] = position == 1
             self.control = next_control
             return True
 

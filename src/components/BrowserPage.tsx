@@ -9,7 +9,6 @@ import {
   Focusable,
   TextField,
   Spinner,
-  ModalRoot,
   Navigation,
   GamepadButton,
   showModal,
@@ -32,11 +31,12 @@ import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
 import { collectionResumes, episodeLabel, insertNextEpisode, queueFromEpisode, resumeEpisode, resumePosition } from './VideoQueue';
 import { musicBrowserCategories, videoCategories, visibleCategories,
   type BrowserLayouts, type MusicTab, type VideoTab } from './BrowserCategories';
-import { VideoOptionsDialog, type VideoAction, type VideoActionResult } from './VideoOptionsDialog';
+import { VideoOptionsDialog, type VideoAction, type VideoActionResult, type VideoExtra } from './VideoOptionsDialog';
 import { VideoWatchIndicator } from './VideoWatchIndicator';
 import { clearPausedVideo, requestPausedVideo, resumePausedVideoEvent, takePausedVideo, updatePausedVideo, usePausedVideo } from './VideoPlayback';
 import { playNavigationSound, selectWithSound } from './GamepadSounds';
 import { retryPlexRead } from './PlexRead';
+import { DeckyPlexModal, InterfaceThemeStyles } from './InterfaceTheme';
 
 interface LibraryItem {
   id: string;
@@ -154,15 +154,16 @@ function focusForDirection(target: HTMLElement, event: Event, navigation?: Gamep
 
 export function BrowserPage() {
   const { playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteMode, remoteTargetSelected, remotePlayerName,
-    addToQueue, playbackState, pause, localVolume } = usePlayer();
+    addToQueue, playbackState, pause, localVolume, setLocalVolume } = usePlayer();
   return <LibraryBrowser {...{ playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteTargetSelected, remotePlayerName,
-    addToQueue, pause, localVolume }} localMusicPlaying={!remoteMode && playbackState === 'playing'} />;
+    addToQueue, pause, localVolume, setLocalVolume }} localMusicPlaying={!remoteMode && playbackState === 'playing'} />;
 }
 
 type BrowserPlayback = Pick<ReturnType<typeof usePlayer>, 'playTrack' | 'readMusicPlaybackTarget' | 'playRemoteQueue' | 'beginPlaybackRequest'
-  | 'remoteTargetSelected' | 'remotePlayerName' | 'addToQueue' | 'pause' | 'localVolume'> & { localMusicPlaying: boolean };
+  | 'remoteTargetSelected' | 'remotePlayerName' | 'addToQueue' | 'pause' | 'localVolume' | 'setLocalVolume'> & { localMusicPlaying: boolean };
 const LibraryBrowser = memo(function LibraryBrowser({
-  playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteTargetSelected, remotePlayerName, addToQueue, localMusicPlaying, pause, localVolume,
+  playTrack, readMusicPlaybackTarget, playRemoteQueue, beginPlaybackRequest, remoteTargetSelected, remotePlayerName, addToQueue,
+  localMusicPlaying, pause, localVolume, setLocalVolume,
 }: BrowserPlayback) {
   const pipEpisodeQueue = useGamePipEpisodeQueue();
   const [activeTab, setActiveTab] = useState<BrowserTab>('artists');
@@ -186,6 +187,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const [videoSorts, setVideoSorts] = useState<Record<string, string>>({});
   const [loadingLibraries, setLoadingLibraries] = useState(false);
   const [showAllMedia, setShowAllMedia] = useState(false);
+  const [showVideoExtras, setShowVideoExtras] = useState(false);
+  const [lightTheme, setLightTheme] = useState(false);
   const [overGamePip, setOverGamePip] = useState(false);
   const [videoAutoplay, setVideoAutoplay] = useState(true);
   const [librarySelectionKey, setLibrarySelectionKey] = useState('');
@@ -358,6 +361,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
     cancelContentScroll();
     hideAlphabetOverlay();
     window.cancelAnimationFrame(focusScrollFrame.current);
+    if (sidebar && element.closest('[data-browser-tab]') === viewport.querySelector('[data-browser-tab]')) {
+      viewport.scrollTop = 0;
+      return true;
+    }
     const scroll = () => {
       const itemRect = element.getBoundingClientRect();
       const viewportRect = viewport.getBoundingClientRect();
@@ -529,6 +536,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
           setGridColumns(validColumns ? savedColumns : DEFAULT_GRID_COLUMNS);
         }
         setShowAllMedia(Boolean(result.browse_all_media));
+        setShowVideoExtras(result.video_show_extras === true);
+        setLightTheme(result.interface_theme === 'light');
         setOverGamePip(result.over_game_pip === true);
         setVideoAutoplay(result.video_autoplay !== false);
         const layouts: BrowserLayouts = result.browser_layouts ?? {};
@@ -652,12 +661,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (gridDialogRef.current === dialog) gridDialogRef.current = null;
     };
     const close = () => { clearDialog(); dialog.Close(); };
-    const dialog = showModal(<GridColumnsDialog initialColumns={gridColumns}
+    const dialog = showModal(<GridColumnsDialog lightTheme={lightTheme} initialColumns={gridColumns}
       onPreview={setGridColumns} onConfirm={saveGridColumns} onClose={close} />,
       window, { strTitle: 'Browser layout', bNeverPopOut: true, fnOnClose: clearDialog });
     gridDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [gridColumns, saveGridColumns]);
+  }, [gridColumns, saveGridColumns, lightTheme]);
 
   const openTrackOptions = useCallback((track: {
     id: string; sectionId: string; title: string; artist: string; album: string; duration: number; thumb: string;
@@ -666,12 +675,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (actionDialogRef.current === dialog) actionDialogRef.current = null;
     };
     const close = () => { clearDialog(); dialog.Close(); };
-    const dialog = showModal(<TrackOptionsDialog track={{ ...track, sourceServerId: serverId }}
+    const dialog = showModal(<TrackOptionsDialog lightTheme={lightTheme} track={{ ...track, sourceServerId: serverId }}
       playlistId={playlistId} allowPlaylists={hasPlexAccount} addToQueue={addToQueue} onClose={close} />,
       window, { strTitle: track.title, bNeverPopOut: true, fnOnClose: clearDialog });
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [addToQueue, serverId, hasPlexAccount]);
+  }, [addToQueue, serverId, hasPlexAccount, lightTheme]);
 
   const openPlaylistOptions = useCallback((playlist: LibraryItem) => {
     const clearDialog = () => {
@@ -685,11 +694,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
       window.dispatchEvent(new CustomEvent('deckyplex-playlists-change', { detail: { playlistId } }));
       close();
     };
-    const dialog = showModal(<PlaylistOptionsDialog playlist={playlist} onDeleted={handleDeleted} onClose={close} />,
+    const dialog = showModal(<PlaylistOptionsDialog lightTheme={lightTheme} playlist={playlist} onDeleted={handleDeleted} onClose={close} />,
       window, { strTitle: playlist.title, bNeverPopOut: true, fnOnClose: clearDialog });
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [selectedSection]);
+  }, [selectedSection, lightTheme]);
 
   useEffect(() => {
     if (!connected || gridPreferenceSet || gridPromptShown.current) return;
@@ -838,7 +847,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       setRestoreFocusTick(value => value + 1);
     };
     const dialog = showModal(
-      <ModalRoot closeModal={() => close()} onCancel={() => close()} onOK={() => {}}>
+      <DeckyPlexModal lightTheme={lightTheme} closeModal={() => close()} onCancel={() => close()} onOK={() => {}}>
         <ChoiceDialogBody title="Sort by">
           <ChoiceDialogList>
             {VIDEO_SORTS.map(({ id, title, Icon }) => (
@@ -847,11 +856,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
             ))}
           </ChoiceDialogList>
         </ChoiceDialogBody>
-      </ModalRoot>, window, { strTitle: 'Sort library', bNeverPopOut: true, fnOnClose: clearDialog },
+      </DeckyPlexModal>, window, { strTitle: 'Sort library', bNeverPopOut: true, fnOnClose: clearDialog },
     );
     actionDialogRef.current = dialog;
     void dialog.ClosedPromise?.then(clearDialog, clearDialog);
-  }, [activeTab, invalidateTabLoad, shelf, sortable, sorting]);
+  }, [activeTab, invalidateTabLoad, shelf, sortable, sorting, lightTheme]);
 
   useEffect(() => {
     if (!connected || loadingLibraries || subView || activeTab !== 'videoHome') return;
@@ -1379,6 +1388,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         actionDialogRef.current = showPlaybackStartDialog({
           title: item.title,
           actionTitle: 'Play movie',
+          lightTheme,
           position,
           onClose: choice => {
             actionDialogRef.current = null;
@@ -1403,7 +1413,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     viewerOrigin.current = { itemId: collectionQueue ? focusedItemId.current : item.id, scrollTop: contentRef.current?.scrollTop || 0,
       homeRow: !subView && activeTabRef.current === 'videoHome' ? focusedHomeRow.current : undefined };
     setViewerItem(item);
-  }, [items, pausedVideo, serverId, subView?.mediaType]);
+  }, [items, pausedVideo, serverId, subView?.mediaType, lightTheme]);
 
   const patchVideoCards = useCallback((patch: (card: LibraryItem) => LibraryItem) => {
     const update = (cards: LibraryItem[]) => {
@@ -1561,8 +1571,16 @@ const LibraryBrowser = memo(function LibraryBrowser({
       }
     };
     const dialog = showModal(
-      <VideoOptionsDialog item={item} userRating={item.userRating} onWatchlist={onWatchlist}
+      <VideoOptionsDialog lightTheme={lightTheme} item={item} userRating={item.userRating} onWatchlist={onWatchlist}
         allowAccountActions={hasPlexAccount}
+        extras={showVideoExtras ? {
+          load: () => call<[string, string], { items?: VideoExtra[]; error?: string }>('get_video_extras', item.id, serverId),
+          play: extra => {
+            close();
+            openMedia(extra, undefined, 0);
+            viewerOrigin.current.itemId = item.id;
+          },
+        } : undefined}
         canRemoveContinue={homeRow === 'continue' || homeRow === 'next'}
         playFromBeginning={() => { close(); openMedia(item, undefined, 0); }}
         queueNext={queueNext ? () => { close(); queueNext(); } : undefined} apply={(action, rating) => void apply(action, rating)} close={close} />,
@@ -1624,6 +1642,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       actionDialogRef.current = showPlaybackStartDialog({
         title: subView.title,
         actionTitle: subView.mediaType === 'show' ? 'Play series' : 'Play season',
+        lightTheme,
         firstLabel: episodeLabel(first),
         resumeLabel: episodeLabel(resume),
         position,
@@ -1795,7 +1814,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (videoOptions) openVideoOptions(item, idx, homeRow, canQueueNext ? queueNext : undefined);
       else openPlaylistOptions(item);
     };
-    const secondaryAction = (videoOptions && (hasPlexAccount || canQueueNext)) || kind === 'playlist' ? options : undefined;
+    const secondaryAction = (videoOptions && (hasPlexAccount || canQueueNext || showVideoExtras))
+      || kind === 'playlist' ? options : undefined;
     const secondaryLabel = secondaryAction ? 'Options' : undefined;
     const title = episodeLabel(item);
     const subtitle = showPoster && item.grandparentTitle
@@ -1849,7 +1869,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
         >
           <div style={{ width: '100%', aspectRatio: portrait ? '2 / 3'
               : ['episode', 'clip'].includes(kind) ? '16 / 9' : '1 / 1',
-            position: 'relative', contain: 'paint', overflow: 'hidden', borderRadius: '4px', backgroundColor: 'rgba(255,255,255,0.1)',
+            position: 'relative', contain: 'paint', overflow: 'hidden', borderRadius: '4px',
+            backgroundColor: 'var(--deckyplex-button, rgba(255,255,255,0.1))',
             display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             {imageUrl ? <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
               style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <span style={{ opacity: 0.6, fontSize: '1.5rem' }}>{fallbackIcon}</span>}
@@ -1882,7 +1903,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 overflow: 'hidden',
                 position: 'relative',
                 flexShrink: 0,
-                backgroundColor: 'rgba(255,255,255,0.1)',
+                backgroundColor: 'var(--deckyplex-button, rgba(255,255,255,0.1))',
               }}>
                 {imageUrl ? <img src={imageUrl} alt="" loading="lazy" decoding="async" onError={restoreOriginalImage}
                   style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
@@ -1927,7 +1948,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       </div>
     );
     const rowStyle = { display: 'block', width: '100%', boxSizing: 'border-box' as const, padding: '0.2rem 0.35rem',
-      borderBottom: '1px solid rgba(255,255,255,0.08)', scrollMarginTop: idx === 0 ? browserHeaderScrollMargin : undefined };
+      borderBottom: '1px solid var(--deckyplex-border, rgba(255,255,255,0.08))',
+      scrollMarginTop: idx === 0 ? browserHeaderScrollMargin : undefined };
     if (item.type === 'track') {
       const trackInfo = { id: item.id, sectionId: item.sectionId || selectedSection, title: item.title, artist: item.grandparentTitle || item.artist || '', album: item.parentTitle || '', duration: item.duration || 0, thumb: item.thumb || '' };
       return (
@@ -2020,7 +2042,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
             </span>
           </Button>}
           {remoteTargetSelected && (
-            <DialogBodyText style={{ color: '#9fc8ff', fontSize: '0.8rem', margin: 0 }}>
+            <DialogBodyText style={{ color: 'var(--deckyplex-accent, #9fc8ff)', fontSize: '0.8rem', margin: 0 }}>
               Playback target: {remotePlayerName || 'remote Plex player'}
             </DialogBodyText>
           )}
@@ -2038,7 +2060,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
               onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0,
                 padding: '0.3rem 0.55rem', fontSize: '0.85rem', lineHeight: 1.2,
-                borderRadius: '4px', background: 'rgba(255, 255, 255, 0.10)' }}>
+                borderRadius: '4px', background: 'var(--deckyplex-button, rgba(255, 255, 255, 0.10))' }}>
               <FaPlay aria-hidden="true" /><span>{videoCollection
                 ? subView.mediaType === 'show' ? 'Play series' : 'Play season'
                 : remoteTargetSelected ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
@@ -2071,7 +2093,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
         {error && (
           <PanelSectionRow>
-            <DialogBodyText style={{ color: '#ff6b6b' }}>{error}</DialogBodyText>
+            <DialogBodyText style={{ color: 'var(--deckyplex-error, #ff6b6b)' }}>{error}</DialogBodyText>
           </PanelSectionRow>
         )}
 
@@ -2379,19 +2401,27 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const browser = !viewerExpanded && (
     <Focusable onCancel={handleCancel} style={{ display: 'contents' }}>
       <FocusOutlineStyles />
+      <InterfaceThemeStyles />
       <style>{`
         [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
         [data-browser-play-collection]:focus-visible {
-          outline: 2px solid rgba(255, 255, 255, 0.6);
+          outline: 2px solid var(--deckyplex-focus, rgba(255, 255, 255, 0.6));
           outline-offset: -2px;
         }
         [data-browser-zone="sidebar"] {
           width: max-content; max-width: min(17rem, 30vw);
         }
         [data-browser-alphabet]:not([hidden]) { display: grid; place-items: center; }
+        [data-deckyplex-browser][data-deckyplex-light] :is([data-browser-tab], [data-browser-item-id], [data-browser-play-collection]) {
+          color: var(--deckyplex-text); text-shadow: none;
+        }
+        [data-deckyplex-browser][data-deckyplex-light] [data-browser-tab]:is(.gpfocus, :focus-visible) {
+          outline: 2px solid var(--deckyplex-focus); outline-offset: -2px;
+        }
       `}</style>
     <div
       ref={browserRef}
+      data-deckyplex-browser="" data-deckyplex-light={lightTheme || undefined}
       onFocusCapture={(event) => {
         if (!(event.target instanceof HTMLElement)) return;
         const inSidebar = !!event.target.closest('[data-browser-zone="sidebar"]');
@@ -2401,10 +2431,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
         }
       }}
       style={{ display: 'flex', gap: '0.65rem', marginTop: '40px', height: 'calc(100% - 40px)', minHeight: 0,
-        overflow: 'hidden' }}
+        overflow: 'hidden', color: 'var(--deckyplex-text, inherit)', background: 'var(--deckyplex-bg, transparent)' }}
     >
       <div data-browser-zone="sidebar" ref={sidebarRef}
-        style={{ boxSizing: 'border-box', flexShrink: 0, borderRight: '1px solid rgba(255,255,255,0.1)',
+        style={{ boxSizing: 'border-box', flexShrink: 0, borderRight: '1px solid var(--deckyplex-border, rgba(255,255,255,0.1))',
+          background: 'var(--deckyplex-surface, transparent)',
           padding: `0.5rem 0.4rem ${BROWSER_SIDEBAR_FOOTER_CLEARANCE + BROWSER_FOCUS_EDGE_PADDING}px 0.2rem`,
           scrollPaddingBottom: BROWSER_SIDEBAR_FOOTER_CLEARANCE, overflowY: 'auto' }}>
         <div style={browserHeaderStyle}><DialogLabel style={{ margin: 0 }}>DeckyPlex</DialogLabel></div>
@@ -2412,12 +2443,14 @@ const LibraryBrowser = memo(function LibraryBrowser({
           {tabs.map(({ key: tab, title, icon }) => {
             const focusCategory = () => {
               focusZone.current = 'sidebar';
+              if (tab === tabs[0]?.key && sidebarRef.current) sidebarRef.current.scrollTop = 0;
               selectTab(tab);
             };
             return (
             <Fragment key={tab}>
             {tab === visibleVideo[0]?.key &&
-              <div style={{ margin: '0.45rem 0.65rem 0.35rem', fontSize: '0.73rem', color: '#aeb9c5' }}>Video</div>}
+              <div style={{ margin: '0.45rem 0.65rem 0.35rem', fontSize: '0.73rem',
+                color: 'var(--deckyplex-muted, #aeb9c5)' }}>Video</div>}
             <Focusable
               data-browser-tab={tab}
               preferredFocus={tab === activeTab}
@@ -2426,7 +2459,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 !!Element && keepFocusedElementVisible(Element, true) }}
               onActivate={event => selectWithSound(event, enterContent)}
               onClick={enterContent}
-              style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center', gap: '0.55rem', padding: '0.35rem 0.65rem', paddingInlineEnd: '1.825rem', marginBottom: '0.3rem', border: `1px solid ${activeTab === tab ? 'rgba(255,255,255,0.22)' : 'rgba(255,255,255,0.08)'}`, background: activeTab === tab ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.035)', borderRadius: '4px' }}
+              style={{ display: 'flex', alignSelf: 'stretch', minHeight: '42px', boxSizing: 'border-box', alignItems: 'center',
+                gap: '0.55rem', padding: '0.35rem 0.65rem', paddingInlineEnd: '1.825rem', marginBottom: '0.3rem',
+                border: activeTab === tab ? '1px solid var(--deckyplex-focus, rgba(255,255,255,0.22))'
+                  : '1px solid var(--deckyplex-border, rgba(255,255,255,0.08))',
+                background: activeTab === tab ? 'var(--deckyplex-primary, rgba(255,255,255,0.10))'
+                  : 'var(--deckyplex-button, rgba(255,255,255,0.035))', borderRadius: '4px' }}
             >
               <span style={{ display: 'inline-flex', width: '1.1rem', justifyContent: 'center', flexShrink: 0 }}>{icon}</span>
               <span title={neverWrapCategories ? title : undefined} style={{ minWidth: 0, fontWeight: 400, fontSize: '0.85rem',
@@ -2467,7 +2505,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       {browser}
       {viewerItem && <MediaViewer key={`${viewerItem.id}:${viewerSession}`} item={viewerItem}
         subtitle={viewerItem.grandparentTitle || viewerItem.parentTitle}
-        photo={viewerItem.type === 'photo'} initialVolume={localVolume} initialPlayback={viewerResume}
+        photo={viewerItem.type === 'photo'} initialVolume={localVolume} saveVolume={setLocalVolume} initialPlayback={viewerResume}
         initialPosition={viewerStartPosition}
         initialPresentation={viewerPresentation} close={closeMedia}
         minimized={viewerMinimized} onMinimizedChange={(minimized, queue) => {
@@ -2475,7 +2513,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           if (minimized) restoreBrowserFocus();
           else if (queue) setViewerQueue(queue.length ? queue : null);
         }}
-        overGamePip={overGamePip} autoplay={videoAutoplay}
+        overGamePip={overGamePip} autoplay={videoAutoplay} lightTheme={lightTheme}
         episodes={episodes} episodeQueueReady={!!viewerQueue} playEpisode={playEpisode}
         removeEpisode={id => {
           if (id !== viewerItem.id) setViewerQueue(queue => queue?.filter(episode => episode.id !== id) ?? null);
@@ -2485,11 +2523,12 @@ const LibraryBrowser = memo(function LibraryBrowser({
   );
 });
 
-function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
+function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose, lightTheme }: {
   initialColumns: number;
   onPreview: (columns: number) => void;
   onConfirm: (columns: number) => Promise<void>;
   onClose: () => void;
+  lightTheme: boolean;
 }) {
   const [columns, setColumns] = useState(initialColumns);
   const [saving, setSaving] = useState(false);
@@ -2532,7 +2571,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
     }
   };
   return (
-    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={confirm} bDisableBackgroundDismiss={saving}>
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={cancel} onCancel={cancel} onOK={confirm} bDisableBackgroundDismiss={saving}>
       <ChoiceDialogBody title="Choose grid width">
         <ChoiceDialogList>
           <Focusable
@@ -2558,14 +2597,16 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
               }
             }}
             style={{ boxSizing: 'border-box', padding: '0.65rem 0.8rem', borderRadius: '0.5rem',
-              border: '1px solid rgba(255,255,255,0.14)', background: 'rgba(255,255,255,0.06)' }}
+              border: '1px solid var(--deckyplex-border, rgba(255,255,255,0.14))',
+              background: 'var(--deckyplex-button, rgba(255,255,255,0.06))' }}
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.45rem' }}>
               <span>Grid columns</span><strong>{columns}</strong>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(9, 1fr)', gap: '0.28rem' }}>
               {Array.from({ length: 9 }, (_, index) => (
-                <div key={index} style={{ height: '0.45rem', borderRadius: '3px', background: index < columns ? '#66c0f4' : 'rgba(255,255,255,0.2)' }} />
+                <div key={index} style={{ height: '0.45rem', borderRadius: '3px',
+                  background: index < columns ? 'var(--deckyplex-accent, #66c0f4)' : 'var(--deckyplex-border, rgba(255,255,255,0.2))' }} />
               ))}
             </div>
           </Focusable>
@@ -2581,14 +2622,15 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose }: {
         </PanelSectionRow>
         {error && <PanelSectionRow><DialogBodyText>{error}</DialogBodyText></PanelSectionRow>}
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }
 
-function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
+function PlaylistOptionsDialog({ playlist, onDeleted, onClose, lightTheme }: {
   playlist: LibraryItem;
   onDeleted: (playlistId: string) => void;
   onClose: () => void;
+  lightTheme: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -2626,7 +2668,7 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
   };
 
   return (
-    <ModalRoot closeModal={cancel} onCancel={cancel} onOK={() => {}} bCancelDisabled={busy} bDisableBackgroundDismiss={busy}>
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={cancel} onCancel={cancel} onOK={() => {}} bCancelDisabled={busy} bDisableBackgroundDismiss={busy}>
       <ChoiceDialogBody title={confirming ? 'Delete Playlist' : playlist.title}
         subtitle={confirming ? `Permanently delete “${playlist.title}”?` : `${playlist.leafCount ?? 0} tracks`}>
         <ChoiceDialogList>
@@ -2644,16 +2686,17 @@ function PlaylistOptionsDialog({ playlist, onDeleted, onClose }: {
         </div>}
         {!!message && <DialogBodyText style={{ color: '#ff7777' }}>{message}</DialogBodyText>}
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }
 
-function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onClose }: {
+function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onClose, lightTheme }: {
   track: Parameters<ReturnType<typeof usePlayer>['addToQueue']>[0];
   playlistId?: string;
   allowPlaylists: boolean;
   addToQueue: ReturnType<typeof usePlayer>['addToQueue'];
   onClose: () => void;
+  lightTheme: boolean;
 }) {
   const [view, setView] = useState<'actions' | 'playlists' | 'new'>('actions');
   const [playlists, setPlaylists] = useState<LibraryItem[]>([]);
@@ -2780,7 +2823,7 @@ function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onC
   };
 
   return (
-    <ModalRoot closeModal={onClose} onCancel={handleDialogCancel} onOK={() => {}}>
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={onClose} onCancel={handleDialogCancel} onOK={() => {}}>
       <ChoiceDialogBody bodyRef={menuRef} key={view}
         title={view === 'actions' ? track.title : view === 'new' ? 'New Playlist' : 'Add to Playlist'}
         subtitle={view === 'actions' ? [track.artist, track.album].filter(Boolean).join(' · ') : track.title}>
@@ -2825,6 +2868,6 @@ function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onC
           <InlineSpinner /> {view === 'new' ? 'Creating playlist…' : 'Updating…'}
         </DialogBodyText></PanelSectionRow> : !!message && <PanelSectionRow><DialogBodyText style={{ color: /^(Added to|Created|Removed from)/.test(message) ? '#78d99a' : '#ff7777' }}>{message}</DialogBodyText></PanelSectionRow>}
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import {
   Dropdown,
+  DropdownItem,
   gamepadDialogClasses,
   DialogBodyText,
   ButtonItem,
@@ -21,6 +22,8 @@ import { BrowserCategoriesDialog } from './BrowserCategoriesDialog';
 import { defaultPipPosition, pipPositions, type PipPosition } from './PipPosition';
 import { PipPositionDialog } from './PipPositionDialog';
 import { FocusOutlineStyles } from './FocusOutline';
+import { InterfaceThemeStyles } from './InterfaceTheme';
+import { videoQualityOptions } from './VideoQuality';
 
 interface Settings {
   plexamp_url: string;
@@ -42,6 +45,7 @@ interface Settings {
   grid_columns: number;
   browser_layouts: BrowserLayouts;
   browser_never_wrap_categories: boolean;
+  interface_theme: 'light' | 'dark';
   companion_receiver_enabled: boolean;
   companion_device_name: string;
   allow_signed_out_companion: boolean;
@@ -52,6 +56,8 @@ interface Settings {
   quick_player_compact_header: boolean;
   over_game_pip: boolean;
   video_autoplay: boolean;
+  video_quality: string;
+  video_show_extras: boolean;
   pip_position: PipPosition;
   pip_size: number;
 }
@@ -84,6 +90,7 @@ const DEFAULT_SETTINGS: Settings = {
   grid_columns: 0,
   browser_layouts: {},
   browser_never_wrap_categories: false,
+  interface_theme: 'dark',
   companion_receiver_enabled: false,
   companion_device_name: 'DeckyPlex',
   allow_signed_out_companion: false,
@@ -94,6 +101,8 @@ const DEFAULT_SETTINGS: Settings = {
   quick_player_compact_header: true,
   over_game_pip: false,
   video_autoplay: true,
+  video_quality: 'auto',
+  video_show_extras: false,
   pip_position: defaultPipPosition,
   pip_size: 29,
 };
@@ -353,7 +362,8 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         setStatus(discoveredServers.length ? '' : 'Signed in to Plex. Check Server or Advanced to connect to a server.');
         if (discoveredServers.length) {
           const dialog = showModal(
-            <PlexSetupDialog servers={discoveredServers} defaultServerId={connectedSettings.selected_server_id}
+            <PlexSetupDialog lightTheme={connectedSettings.interface_theme === 'light'}
+              servers={discoveredServers} defaultServerId={connectedSettings.selected_server_id}
               loadLibraries={serverId => callWithTimeout('get_plex_setup_catalog', 30000, loginAttempt.id, serverId)}
               complete={async (serverId, selectedIds) => {
                 const saved: Settings & { error?: string } = await callWithTimeout('complete_plex_setup', 20000, loginAttempt.id, serverId, selectedIds);
@@ -521,7 +531,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
 
   const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
     | 'quick_player_native_style' | 'quick_player_compact_header' | 'over_game_pip' | 'video_autoplay'
-    | 'browser_never_wrap_categories'>(key: K, value: Settings[K]) => {
+    | 'browser_never_wrap_categories' | 'interface_theme' | 'video_show_extras' | 'video_quality'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
     try {
@@ -544,7 +554,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     const close = () => { clear(); dialog.Close(); };
     const position = settingsRef.current.pip_position;
     const dialog = showModal(
-      <PipPositionDialog selected={position} close={close} choose={next => {
+      <PipPositionDialog lightTheme={settingsRef.current.interface_theme === 'light'} selected={position} close={close} choose={next => {
         if (pipPositionDialog.current !== dialog) return;
         if (next !== position) updateSetting('pip_position', next);
         close();
@@ -560,7 +570,8 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       categoriesDialog.current = null;
     };
     const dialog = showModal(
-      <BrowserCategoriesDialog title={title} categories={categories} initialLayout={settingsRef.current.browser_layouts?.[scope]}
+      <BrowserCategoriesDialog lightTheme={settingsRef.current.interface_theme === 'light'}
+        title={title} categories={categories} initialLayout={settingsRef.current.browser_layouts?.[scope]}
         close={() => dialog.Close()} save={async (layout: CategoryLayout) => {
           const result = await saveSettings({ browser_layouts: { [scope]: layout } });
           if (result?.error) throw new Error(result.error);
@@ -617,7 +628,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           setSettingUpPlex(true);
           const server = { id: result.selected_server_id, name: result.selected_server_name };
           const dialog = showModal(
-            <PlexSetupDialog servers={[server]} defaultServerId={server.id}
+            <PlexSetupDialog lightTheme={settingsRef.current.interface_theme === 'light'} servers={[server]} defaultServerId={server.id}
               loadLibraries={async () => catalog}
               complete={async (serverId, selectedIds) => {
                 const saved: Settings & { error?: string } = await callWithTimeout('set_library_selection', 20000, serverId, selectedIds);
@@ -732,8 +743,16 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     </SettingsSection>
   );
 
+  const lightMenuOptions = settings.interface_theme === 'light' ? { strClassName: 'deckyplex-light-menu' } : undefined;
   const renderInterfacePage = () => (
     <>
+    <SettingsSection title="Appearance">
+      <SettingsRow>
+        <ToggleField label="Light mode" description="Use a light theme throughout DeckyPlex."
+          checked={settings.interface_theme === 'light'} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('interface_theme', enabled ? 'light' : 'dark')} />
+      </SettingsRow>
+    </SettingsSection>
     <SettingsSection title="Quick Player">
       <SettingsRow>
         <ToggleField label="Compact header" description="Put Log in or Browse beside the status."
@@ -769,6 +788,18 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       </SettingsRow>
     </SettingsSection>
     <SettingsSection title="Video">
+      <SettingsRow>
+        <DropdownItem label="Default streaming quality" selectedOption={settings.video_quality}
+          description="Applies when you start a video. Change quality for the current video in the player."
+          contextMenuPositionOptions={lightMenuOptions}
+          rgOptions={videoQualityOptions} disabled={!settingsAvailable || savingInterface}
+          onChange={({ data }) => saveInterfaceSetting('video_quality', data)} />
+      </SettingsRow>
+      <SettingsRow>
+        <ToggleField label="Show trailers and extras" description="List available extras in a video’s options menu."
+          checked={settings.video_show_extras === true} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('video_show_extras', enabled)} />
+      </SettingsRow>
       <SettingsRow>
         <ToggleField label="Autoplay next episode" checked={settings.video_autoplay !== false}
           disabled={!settingsAvailable || savingInterface}
@@ -814,6 +845,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           <div style={{ width: '100%' }}>
             <DialogBodyText style={{ marginBottom: '0.25rem' }}>Select Server</DialogBodyText>
             <Dropdown
+              contextMenuPositionOptions={lightMenuOptions}
               rgOptions={servers.map(s => ({ label: s.name, data: s.id }))}
               selectedOption={settings.selected_server_id}
               disabled={selectingServer}
@@ -878,6 +910,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         <div style={{ width: '100%' }}>
           <DialogBodyText style={{ marginBottom: '0.25rem' }}>Playback target</DialogBodyText>
           <Dropdown
+            contextMenuPositionOptions={lightMenuOptions}
             rgOptions={[
               { label: 'This Decky device', data: 'local' },
               ...players.map(player => ({
@@ -1084,7 +1117,10 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     content: <div className="deckyplex-settings-page">{page.content}</div>,
   }));
   return (
-    <div data-deckyplex-settings="" style={{ marginTop: 40, height: 'calc(100% - 40px)', width: '100%' }}>
+    <div data-deckyplex-settings="" data-deckyplex-light={settings.interface_theme === 'light' || undefined}
+      style={{ marginTop: 40, height: 'calc(100% - 40px)', width: '100%',
+        background: 'var(--deckyplex-bg, transparent)', color: 'var(--deckyplex-text, inherit)' }}>
+      <InterfaceThemeStyles />
       <FocusOutlineStyles />
       <style>{`
         @media (min-width: 501px) {
@@ -1098,21 +1134,21 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         .deckyplex-settings-page { display: grid; gap: 0.95rem; width: 100%; min-width: 0;
           box-sizing: border-box; padding: 0.75rem clamp(0.8rem, 1.8vw, 1.6rem) 3rem; }
         .deckyplex-settings-section > h2 { font-size: 0.92rem; font-weight: 650; line-height: 1.25;
-          margin: 0 0 0.4rem; color: #dce8f6; }
+          margin: 0 0 0.4rem; color: var(--deckyplex-text, #dce8f6); }
         .deckyplex-settings-fields { display: grid; gap: 0.25rem; align-items: start; padding: 0.48rem 0.7rem;
-          background: #1b2635; border: 1px solid #304057; border-radius: 7px; }
+          background: var(--deckyplex-surface, #1b2635); border: 1px solid var(--deckyplex-border, #304057); border-radius: 7px; }
         .deckyplex-settings-row { min-width: 0; padding-block: 0.08rem; }
         .deckyplex-settings-button { width: 100%; margin: 0 !important; box-sizing: border-box; }
         [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton) {
-          background: #29394d !important; color: #edf3fd !important; border: 0 !important;
+          background: var(--deckyplex-button, #29394d) !important; color: var(--deckyplex-text, #edf3fd) !important; border: 0 !important;
           border-radius: 5px;
         }
         [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton):is(.gpfocus, :focus-visible, :active) {
-          background: #416489 !important; color: #edf3fd !important;
-          outline: 2px solid #a0c9ef !important; outline-offset: -2px;
+          background: var(--deckyplex-hover, #416489) !important; color: var(--deckyplex-text, #edf3fd) !important;
+          outline: 2px solid var(--deckyplex-focus, #a0c9ef) !important; outline-offset: -2px;
         }
         [data-deckyplex-settings] .deckyplex-settings-fields :is(.deckyplex-settings-button, button.DialogButton):is(:disabled, .Disabled, [aria-disabled="true"]) {
-          background: #202c3b !important; color: #8b9caf !important; outline: none !important;
+          background: var(--deckyplex-bg, #202c3b) !important; color: var(--deckyplex-disabled, #8b9caf) !important; outline: none !important;
         }
         [data-deckyplex-settings] :is(button, [role="button"]),
         [data-deckyplex-settings] :is(button, [role="button"])::before,
@@ -1122,9 +1158,77 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         [data-deckyplex-settings] .${gamepadDialogClasses?.FieldLabel || 'deckyplex-no-match'} {
           font-size: 0.91rem; line-height: 1.28; }
         [data-deckyplex-settings] .${gamepadDialogClasses?.FieldDescription || 'deckyplex-no-match'} {
-          font-size: 0.79rem; line-height: 1.35; color: #bac9da; }
+          font-size: 0.79rem; line-height: 1.35; color: var(--deckyplex-muted, #bac9da); }
         [data-deckyplex-settings] .${gamepadDialogClasses?.Field || 'deckyplex-no-match'} {
           padding-block: 0.38rem; }
+        [data-deckyplex-settings][data-deckyplex-light] :is(.PageListColumn, [role="tabpanel"]) {
+          background: var(--deckyplex-bg); color: var(--deckyplex-text);
+        }
+        [data-deckyplex-settings][data-deckyplex-light] :is([role="tab"], .${gamepadDialogClasses?.FieldLabel || 'deckyplex-no-match'}) {
+          color: var(--deckyplex-text);
+        }
+        [data-deckyplex-settings][data-deckyplex-light] [role="tab"]:is(.gpfocus, :focus-visible, [aria-selected="true"]) {
+          background: var(--deckyplex-hover) !important; color: var(--deckyplex-focus-text) !important; text-shadow: none;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-fields :is(
+          .${gamepadDialogClasses?.Field || 'deckyplex-no-match'}, .${gamepadDialogClasses?.FieldClickTarget || 'deckyplex-no-match'},
+          .${gamepadDialogClasses?.FieldChildrenInner || 'deckyplex-no-match'}
+        ) {
+          background: transparent !important; border-color: var(--deckyplex-border) !important;
+          color: var(--deckyplex-text) !important; text-shadow: none;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-fields :is(
+          .${gamepadDialogClasses?.FieldClickTarget || 'deckyplex-no-match'}, .${gamepadDialogClasses?.HighlightOnFocus || 'deckyplex-no-match'}
+        ):is(.gpfocus, :focus-visible) {
+          background: transparent !important; outline: none !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-fields :is(
+          button, [role="button"], [role="combobox"], .${gamepadDialogClasses?.Button || 'deckyplex-no-match'},
+          .${gamepadDialogClasses?.DropDownControlButtonContents || 'deckyplex-no-match'}
+        ):not([role="switch"], .${gamepadDialogClasses?.FieldClickTarget || 'deckyplex-no-match'}) {
+          background: var(--deckyplex-button) !important; color: var(--deckyplex-text) !important;
+          border-color: var(--deckyplex-border) !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-fields :is(
+          button, [role="button"], [role="combobox"], [role="switch"], .${gamepadDialogClasses?.Toggle || 'deckyplex-no-match'}
+        ):not(:disabled, [aria-disabled="true"]):is(.gpfocus, :focus-visible) {
+          color: var(--deckyplex-focus-text) !important; outline: none !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-row {
+          border-radius: 5px; padding-inline: 0.4rem; margin-inline: -0.4rem;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-row:is(
+          :focus-within, :has(.gpfocus, :focus-visible)
+        ) {
+          background: var(--deckyplex-hover); color: var(--deckyplex-focus-text);
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-row
+          :is(.gpfocus, :focus-visible):not(:is(input, textarea)) {
+          outline: none !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-row
+          :is(.gpfocus, :focus-visible):not(:is(input, textarea))::after {
+          outline: none !important; box-shadow: none !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .deckyplex-settings-fields :is(
+          .${gamepadDialogClasses?.Field || 'deckyplex-no-match'}, .${gamepadDialogClasses?.FieldClickTarget || 'deckyplex-no-match'}
+        ):is(.gpfocus, :focus-visible, :focus-within) :is(
+          .${gamepadDialogClasses?.FieldLabel || 'deckyplex-no-match'}, .${gamepadDialogClasses?.FieldLabelValue || 'deckyplex-no-match'},
+          .${gamepadDialogClasses?.FieldDescription || 'deckyplex-no-match'}
+        ) {
+          color: var(--deckyplex-focus-text) !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .${gamepadDialogClasses?.ToggleRail || 'deckyplex-no-match'} {
+          background: var(--deckyplex-disabled) !important; box-shadow: none !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] :is([aria-checked="true"],
+          .${gamepadDialogClasses?.On || 'deckyplex-no-match'}) .${gamepadDialogClasses?.ToggleRail || 'deckyplex-no-match'},
+        [data-deckyplex-settings][data-deckyplex-light] .${gamepadDialogClasses?.ToggleRail || 'deckyplex-no-match'}.${gamepadDialogClasses?.On || 'deckyplex-no-match'} {
+          background: var(--deckyplex-accent) !important;
+        }
+        [data-deckyplex-settings][data-deckyplex-light] .${gamepadDialogClasses?.ToggleSwitch || 'deckyplex-no-match'} {
+          background: var(--deckyplex-surface) !important;
+        }
       `}</style>
       {loadingSettings
         ? <div className="deckyplex-settings-page"><SettingsSection><StatusLine busy text="Loading settings…" /></SettingsSection></div>

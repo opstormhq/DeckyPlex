@@ -45,6 +45,7 @@ interface PlayerContextType extends PlayerState {
   canLoadMoreQueue: boolean;
   loadMusicArtwork: (trackId: string, sourceServerId?: string) => Promise<string>;
   localVolume: number;
+  localMuted: boolean;
   volumeSliderRevision: number;
   playTrack: (streamUrl: string, trackInfo: TrackInfo, queue?: TrackInfo[], fallbackStreamUrl?: string, loadMore?: () => Promise<TrackInfo[]>, requestToken?: number, localConnection?: boolean) => void;
   beginPlaybackRequest: () => number;
@@ -59,7 +60,8 @@ interface PlayerContextType extends PlayerState {
   removeFromQueue: (index: number) => void;
   addToQueue: (track: TrackInfo, playNext?: boolean) => Promise<{ success: boolean; error?: string; warning?: string }>;
   setVolume: (volume: number) => void;
-  setLocalVolume: (volume: number) => void;
+  setLocalVolume: (volume: number, syncSlider?: boolean) => void;
+  setLocalMuted: (muted: boolean) => void;
   seek: (time: number) => void;
 }
 
@@ -102,6 +104,7 @@ export function startLocalVolumeSession() {
   cancelPendingSave();
   engine.volumeSession = session;
   engine.volumePreferenceLoaded = false;
+  sharedAudio.muted = false;
   setSharedVolume(DEFAULT_LOCAL_VOLUME, true);
 
   return () => {
@@ -796,6 +799,7 @@ startCompanionCommandPolling();
 export function PlayerProvider({ children }: { children: ReactNode }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [localVolume, setLocalVolumeState] = useState(() => Math.round(sharedAudio.volume * 100));
+  const [localMuted, setLocalMutedState] = useState(() => sharedAudio.muted);
   const [volumeSliderRevision, setVolumeSliderRevision] = useState(() => Number(engine.volumeSliderRevision) || 0);
   const [playbackPending, setPlaybackPending] = useState(isPlaybackPending);
   const [state, setState] = useState<PlayerState>({
@@ -917,6 +921,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       const volume = Number((event as CustomEvent<number>).detail);
       if (Number.isFinite(volume)) {
         setLocalVolumeState(volume);
+        setLocalMutedState(sharedAudio.muted);
         setVolumeSliderRevision(Number(engine.volumeSliderRevision) || 0);
         setState(s => s.remoteMode ? s : { ...s, volume });
       }
@@ -1491,10 +1496,10 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const setLocalVolume = useCallback((volume: number) => {
+  const setLocalVolume = useCallback((volume: number, syncSlider = false) => {
     const normalizedVolume = Math.max(0, Math.min(100, Math.round(volume)));
     engine.volumePreferenceLoaded = true;
-    setSharedVolume(normalizedVolume);
+    setSharedVolume(normalizedVolume, syncSlider);
     window.clearTimeout(engine.volumeSaveTimer);
     engine.volumeSaveTimer = window.setTimeout(() => {
       void call('set_settings', { volume: normalizedVolume }).catch(() => {});
@@ -1504,6 +1509,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
 
   const setVolume = useCallback((volume: number) => {
     if (!state.remoteMode) {
+      if (volume > 0) sharedAudio.muted = false;
       setLocalVolume(volume);
       return;
     }
@@ -1511,6 +1517,11 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
     setState(s => ({ ...s, volume: normalizedVolume }));
     void controlRemotePlayer('volume', normalizedVolume);
   }, [state.remoteMode, controlRemotePlayer, setLocalVolume]);
+
+  const setLocalMuted = useCallback((muted: boolean) => {
+    sharedAudio.muted = muted;
+    window.dispatchEvent(new CustomEvent('deckyplex-volume-change', { detail: Math.round(sharedAudio.volume * 100) }));
+  }, []);
 
   const seek = useCallback((time: number) => {
     if (state.remoteMode) {
@@ -1527,6 +1538,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
       value={{
         ...state,
         localVolume,
+        localMuted,
         volumeSliderRevision,
         playbackPending,
         remoteQueueEditable: state.remoteMode && !!engine.remoteQueueEditable,
@@ -1546,6 +1558,7 @@ export function PlayerProvider({ children }: { children: ReactNode }) {
         addToQueue,
         setVolume,
         setLocalVolume,
+        setLocalMuted,
         seek,
       }}
     >

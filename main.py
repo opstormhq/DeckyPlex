@@ -58,8 +58,14 @@ DEFAULT_SETTINGS = {
     "grid_columns": 0,
     "browser_layouts": {},
     "browser_never_wrap_categories": False,
+    "interface_theme": "dark",
     "library_selections": {},
     "video_quality": "auto",
+    "video_show_extras": False,
+    "video_caption_size": 100,
+    "video_caption_auto_sync": False,
+    "video_boost_dialog": False,
+    "video_normalize_loudness": False,
     "video_autoplay": True,
     "over_game_pip": False,
     "pip_position": "bottom-left",
@@ -92,10 +98,14 @@ VIDEO_SORTS = {
 }
 VIDEO_QUALITY = {
     "auto": (None, None),
+    "adaptive": (None, None),
     "1080p": ("1920x1080", 8000),
     "720p": ("1280x720", 4000),
     "480p": ("854x480", 1500),
 }
+VIDEO_CAPTION_SIZES = range(75, 226, 5)
+VIDEO_PLAYBACK_TOGGLES = ("video_caption_auto_sync", "video_boost_dialog", "video_normalize_loudness")
+VIDEO_PLAYBACK_PREFERENCES = ("video_caption_size", *VIDEO_PLAYBACK_TOGGLES)
 VIDEO_DIRECT_AUDIO = {"mp4": {"aac", "mp3"}, "m4v": {"aac", "mp3"}, "webm": {"opus", "vorbis"}}
 MUSIC_BROWSER_TABS = {"artists", "albums", "tracks", "recent", "recentlyAdded", "playlists"}
 
@@ -1713,7 +1723,30 @@ class PlexHTTP:
             options.append({"data": track.id, "label": title})
         return options
 
-    def get_media_source(self, rating_key: str, quality: str = "auto", media_index: int = 0) -> Dict[str, Any]:
+    def video_extras(self, rating_key: str) -> List[Dict[str, Any]]:
+        from plexapi.exceptions import NotFound
+
+        item = self.sdk.fetchItem(int(rating_key))
+        if item.type not in ("movie", "show", "season", "episode") or not hasattr(item, "extras"):
+            return []
+        try:
+            available = item.extras()
+        except NotFound:
+            return []
+        extras = []
+        for extra in available:
+            if not extra.ratingKey or not extra.key:
+                continue
+            extras.append({"id": str(extra.ratingKey), "key": extra.key, "type": "clip", "title": extra.title,
+                           "duration": extra.duration, "subtype": extra.subtype})
+        return extras
+
+    @staticmethod
+    def _external_text_subtitle(track):
+        return bool(track and track.key and track.codec in ("srt", "ass", "ssa", "vtt", "webvtt", "smi", "txt"))
+
+    def get_media_source(self, rating_key: str, quality: str = "auto", media_index: int = 0,
+                         preferences=None) -> Dict[str, Any]:
         item = self.sdk.fetchItem(int(rating_key), params={"includeChapters": 1})
         if item.type not in (*VIDEO_TYPES, "photo"):
             raise ValueError("This Plex item cannot be played directly")
@@ -1746,8 +1779,29 @@ class PlexHTTP:
         channels = getattr(audio, "channels", None) or getattr(primary_media, "audioChannels", None)
         container = str(getattr(part, "container", "") or "").lower()
         compatible_audio = not codec or (codec in VIDEO_DIRECT_AUDIO.get(container, ()) and (channels or 2) <= 2)
+        preferences = {key: (preferences or DEFAULT_SETTINGS).get(key, DEFAULT_SETTINGS[key])
+                       for key in VIDEO_PLAYBACK_PREFERENCES}
+        subtitle_is_text = bool(subtitle and subtitle.codec in ("srt", "ass", "ssa", "vtt", "webvtt", "smi", "txt", "mov_text", "tx3g"))
+        can_offset = self._external_text_subtitle(subtitle)
+        can_auto_sync = bool(can_offset and self.account_token and subtitle.canAutoSync)
+        server_version = tuple(int(part) for part in re.findall(r"\d+", getattr(self.sdk, "version", "") or "")[:3])
+        can_boost = bool(audio and self.account_token and server_version >= (1, 43, 4))
+        can_normalize = bool(can_boost and audio.canNormalizeLoudness)
+        video_options = {}
+        if subtitle_is_text and preferences["video_caption_size"] != 100:
+            video_options["subtitleSize"] = preferences["video_caption_size"]
+        if can_auto_sync and preferences["video_caption_auto_sync"]:
+            video_options["autoAdjustSubtitle"] = 1
+        audio_options = {}
+        if can_boost and preferences["video_boost_dialog"]:
+            audio_options["boostDialog"] = 1
+        if can_normalize and preferences["video_normalize_loudness"]:
+            audio_options["normalizeLoudness"] = 1
 
         def transcode(protocol, container, session_id, copy_video=False, copy_audio=False):
+            options = {**video_options, **audio_options}
+            if quality == "adaptive" and protocol == "hls":
+                options["autoAdjustQuality"] = 1
             return item.getStreamURL(protocol=protocol, mediaIndex=media_index, directPlay=0,
                                      directStream=int(copy_video), directStreamAudio=int(copy_audio),
                                      subtitles="burn" if subtitle else "none",
@@ -1757,6 +1811,7 @@ class PlexHTTP:
                                      videoBitrate=bitrate if not copy_video else None,
                                      # Older PMS releases use the session parameter sent by Plex for Kodi.
                                      transcodeSessionId=session_id, session=session_id,
+                                     **options,
                                      **{"X-Plex-Client-Identifier": self.sdk._headers()["X-Plex-Client-Identifier"],
                                         "X-Plex-Session-Identifier": session_id,
                                         "X-Plex-Client-Profile-Name": "Generic",
@@ -1772,18 +1827,19 @@ class PlexHTTP:
         streams = [{"kind": "hls", "url": hls_url, "fallback_url": transcode("hls", "mpegts", str(uuid.uuid4()))},
                    {"kind": "http", "url": mp4_url}]
         if quality == "auto" and len(parts) == 1 and not subtitle:
-            if container in VIDEO_DIRECT_AUDIO and compatible_audio and audio is default_audio:
+            if not audio_options and container in VIDEO_DIRECT_AUDIO and compatible_audio and audio is default_audio:
                 streams.insert(0, {"kind": "direct", "url": direct_url})
             elif video_codec == "h264":
                 # Preserve H.264 in the compatibility stream where Plex can copy it. Convert incompatible audio to AAC.
-                copy_audio = codec in ("aac", "mp3") and (channels or 2) <= 2
+                copy_audio = not audio_options and codec in ("aac", "mp3") and (channels or 2) <= 2
                 streams.insert(0, {"kind": "hls", "mode": "direct-stream" if copy_audio else "audio-conversion",
                                    "url": transcode("hls", "mpegts", str(uuid.uuid4()), copy_video=True, copy_audio=copy_audio)})
-        logger.info("Video source item=%d quality=%s container=%s video=%s audio=%s channels=%s candidates=%s",
+        logger.info("Video source item=%d quality=%s container=%s video=%s audio=%s channels=%s candidates=%s audio_options=%s",
                     int(rating_key), quality, re.sub(r"[^a-z0-9_-]", "", container)[:32] or "unknown",
                     re.sub(r"[^a-z0-9_-]", "", video_codec)[:32] or "unknown",
                     re.sub(r"[^a-z0-9_-]", "", codec)[:32] or "unknown", channels,
-                    ",".join(stream.get("mode", stream["kind"]) for stream in streams))
+                    ",".join(stream.get("mode", stream["kind"]) for stream in streams),
+                    ",".join(audio_options) or "-")
         chapters = [{"title": chapter.title or "", "start": chapter.start / 1000}
                     for chapter in getattr(item, "chapters", []) if chapter.start is not None and chapter.start >= 0]
         version_options = []
@@ -1799,11 +1855,16 @@ class PlexHTTP:
                 "audio_tracks": self._video_track_options(audio_tracks, "Audio"),
                 "subtitle_tracks": self._video_track_options(subtitle_tracks, "Subtitles"),
                 "audio_track": getattr(audio, "id", None), "subtitle_track": getattr(subtitle, "id", 0),
+                "playback_preferences": preferences,
+                "caption_size_supported": subtitle_is_text, "caption_auto_sync_supported": can_auto_sync,
+                "caption_offset_ms": int(subtitle._data.get("offset") or 0) if can_offset else None,
+                "boost_dialog_supported": can_boost, "normalize_loudness_supported": can_normalize,
                 "video_codec": video_codec, "audio_codec": codec, "channels": channels, "container": container,
                 "bitrate": getattr(primary_media, "bitrate", None), "chapters": chapters,
                 "preview_url": self.sdk.url(preview_path, includeToken=True) if preview_path else ""}
 
-    def set_video_stream(self, rating_key: str, media_index: int, kind: str, stream_id: int):
+    def set_video_stream(self, rating_key: str, media_index: int, kind: str, stream_id: int,
+                         offset_ms: Optional[int] = None):
         item = self.sdk.fetchItem(int(rating_key))
         if item.type not in VIDEO_TYPES or not 0 <= media_index < len(item.media or []):
             raise ValueError("Video version unavailable.")
@@ -1819,6 +1880,11 @@ class PlexHTTP:
             raise ValueError("Track unavailable for this video version.")
         if kind == "audio":
             part.setSelectedAudioStream(track)
+        elif offset_ms is not None:
+            if not track.selected or not self._external_text_subtitle(track):
+                raise ValueError("Select an external text subtitle to adjust its timing.")
+            self.sdk.query(f"/library/streams/{track.id}", method=self.sdk._session.put,
+                           params={"offset": offset_ms})
         else:
             part.setSelectedSubtitleStream(track)
 
@@ -2470,6 +2536,7 @@ class Plugin:
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
                         "quick_player_maintain_x", "quick_player_show_idle", "quick_player_native_style",
                         "quick_player_compact_header", "video_quality", "video_autoplay",
+                        "video_show_extras", "interface_theme", *VIDEO_PLAYBACK_PREFERENCES,
                         "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
                     merged[key] = settings[key]
@@ -2487,6 +2554,12 @@ class Plugin:
             merged["quick_player_compact_header"] = merged["quick_player_compact_header"] is True
             merged["over_game_pip"] = merged["over_game_pip"] is True
             merged["video_autoplay"] = merged["video_autoplay"] is not False
+            merged["video_show_extras"] = merged["video_show_extras"] is True
+            merged["interface_theme"] = "light" if merged["interface_theme"] == "light" else "dark"
+            if type(merged["video_caption_size"]) is not int or merged["video_caption_size"] not in VIDEO_CAPTION_SIZES:
+                merged["video_caption_size"] = DEFAULT_SETTINGS["video_caption_size"]
+            for key in VIDEO_PLAYBACK_TOGGLES:
+                merged[key] = merged[key] is True
             if merged["pip_position"] not in PIP_POSITIONS:
                 merged["pip_position"] = DEFAULT_SETTINGS["pip_position"]
             try:
@@ -2674,7 +2747,7 @@ class Plugin:
         settings = _load_settings()
         return self._plex_for_settings(settings) if settings["plex_token"] else None
 
-    def _plex_for_settings(self, settings: Dict[str, Any]) -> Optional[PlexHTTP]:
+    def _plex_for_settings(self, settings: Dict[str, Any], *, retry_connection=None) -> Optional[PlexHTTP]:
         global _plex_cache
         url = self._get_plex_server_url(settings)
         # Use server-specific access token if available, otherwise fall back to user token
@@ -2692,11 +2765,11 @@ class Plugin:
         cache_key = (url.rstrip("/"), token, account_token, timeout, verify_tls,
                      settings["selected_server_id"] if local else None)
         previous_key, previous_plex = _plex_cache
-        if previous_key == cache_key:
+        if previous_key == cache_key and previous_plex is not retry_connection:
             return previous_plex
         with _plex_connect_lock:
             previous_key, previous_plex = _plex_cache
-            if previous_key == cache_key:
+            if previous_key == cache_key and previous_plex is not retry_connection:
                 return previous_plex
             try:
                 # PlexServer validates the connection and retains the authenticated session.
@@ -3599,7 +3672,28 @@ class Plugin:
         cache[key] = (identity, source)
         return key
 
+    @staticmethod
+    def _video_source_identity(settings, server_url, rating_key, quality, media_index):
+        return (settings["selected_server_id"], settings["plex_token"], server_url, rating_key, quality, media_index,
+                tuple(settings[key] for key in VIDEO_PLAYBACK_PREFERENCES))
+
+    async def _read_video_source(self, plex, settings, rating_key, quality, media_index):
+        from requests.exceptions import ConnectionError, SSLError, Timeout
+
+        try:
+            return await asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index, settings)
+        except SSLError:
+            raise
+        except (ConnectionError, Timeout) as error:
+            logger.info("Retrying Plex video preparation with a fresh connection (%s)", type(error).__name__)
+            connected = await asyncio.to_thread(self._plex_for_settings, settings, retry_connection=plex)
+            if not connected:
+                raise
+            return await asyncio.to_thread(connected.get_media_source, rating_key, quality, media_index, settings)
+
     async def get_media_source(self, rating_key: str, requested_quality: str = "", media_index: int = 0) -> Dict[str, Any]:
+        from requests.exceptions import ConnectionError, Timeout
+
         settings = _load_settings()
         plex = await asyncio.to_thread(self._plex_for_settings, settings)
         if not plex:
@@ -3610,16 +3704,18 @@ class Plugin:
                 quality = "auto"
             if type(media_index) is not int or media_index < 0:
                 raise ValueError("Invalid video version.")
-            result = await asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index)
+            result = await self._read_video_source(plex, settings, rating_key, quality, media_index)
             if any(stream["kind"] == "hls" for stream in result.get("streams", [])):
-                identity = (settings["selected_server_id"], settings["plex_token"],
-                            self._get_plex_server_url(settings), rating_key, quality, media_index)
+                identity = self._video_source_identity(settings, self._get_plex_server_url(settings),
+                                                       rating_key, quality, media_index)
                 result = {**result, "handoff_key": self._remember_video_handoff(identity, result)}
             return {**result, "server_id": settings["selected_server_id"], "quality": quality,
                     "local_connection": plex.local_connection}
         except Exception as error:
             logger.warning("Could not prepare Plex video item=%s error=%s",
-                           rating_key if str(rating_key).isdigit() else "invalid", type(error).__name__)
+                           rating_key if str(rating_key).isdigit() else "invalid", _plex_error_code(error))
+            if isinstance(error, (ConnectionError, Timeout)):
+                return {"error": "Could not reach Plex to prepare this video. Try again."}
             return {"error": "Plex could not prepare this item for playback."}
 
     async def prepare_video_transcode(self, handoff_key: str, session_id: str) -> None:
@@ -3664,21 +3760,38 @@ class Plugin:
                     logger.info("Plex video decision unavailable for item %s (%s)", identity[3], _plex_error_code(error))
                 return
 
-    async def set_video_stream(self, rating_key: str, server_id: str, index: int, kind: str, stream_id: int) -> Dict[str, Any]:
+    async def set_video_stream(self, rating_key: str, server_id: str, index: int, kind: str, stream_id: int,
+                               offset_ms: Optional[int] = None) -> Dict[str, Any]:
         settings = _load_settings()
         if (not server_id or server_id != settings["selected_server_id"] or kind not in ("audio", "subtitle")
                 or not isinstance(rating_key, str) or not rating_key.isdecimal() or len(rating_key) > 20
-                or type(index) is not int or index < 0 or type(stream_id) is not int or stream_id < 0):
+                or type(index) is not int or index < 0 or type(stream_id) is not int or stream_id < 0
+                or offset_ms is not None and (kind != "subtitle" or not stream_id
+                                              or type(offset_ms) is not int or abs(offset_ms) > 30000)):
             return {"error": "The Plex video track is unavailable."}
         try:
             plex = await asyncio.to_thread(self._plex_for_settings, settings)
             if not plex:
                 return {"error": "Not connected to Plex server."}
-            await asyncio.to_thread(plex.set_video_stream, rating_key, index, kind, stream_id)
+            await asyncio.to_thread(plex.set_video_stream, rating_key, index, kind, stream_id, offset_ms)
             return {"success": True}
         except Exception as error:
             logger.warning("Could not select Plex %s track: %s", kind, type(error).__name__)
-            return {"error": "Plex could not change this track."}
+            return {"error": "Plex could not adjust subtitle timing." if offset_ms is not None
+                    else "Plex could not change this track."}
+
+    async def get_video_extras(self, rating_key: str, server_id: str) -> Dict[str, Any]:
+        settings = _load_settings()
+        if (not settings["video_show_extras"] or not server_id or server_id != settings["selected_server_id"]
+                or not isinstance(rating_key, str) or not rating_key.isdecimal() or len(rating_key) > 20):
+            return {"items": []}
+        try:
+            plex = await asyncio.to_thread(self._plex_for_settings, settings)
+            if plex:
+                return {"items": await asyncio.to_thread(plex.video_extras, rating_key)}
+        except Exception as error:
+            logger.debug("Could not load Plex extras: %s", _plex_error_code(error))
+        return {"error": "Could not load trailers and extras from Plex."}
 
     async def get_video_skip_markers(self, rating_key: str, server_id: str):
         settings = _load_settings()
@@ -3762,10 +3875,11 @@ class Plugin:
                 quality = "auto"
             if type(media_index) is not int or media_index < 0:
                 raise ValueError("Invalid video version.")
-            identity = (server_id, settings["plex_token"], self._get_plex_server_url(settings), rating_key, quality, media_index)
+            identity = self._video_source_identity(settings, self._get_plex_server_url(settings),
+                                                   rating_key, quality, media_index)
             source, manifest = self._find_video_handoff(reuse, identity, preferred_source)
             if source is None:
-                source = await asyncio.wait_for(asyncio.to_thread(plex.get_media_source, rating_key, quality, media_index), 18)
+                source = await asyncio.wait_for(self._read_video_source(plex, settings, rating_key, quality, media_index), 18)
             if revision != self._game_video_revision or self._game_video is not previous:
                 return {"error": "The over-game video request was canceled."}
             if not source.get("streams") or source["streams"][0]["kind"] == "image":
@@ -3805,7 +3919,7 @@ class Plugin:
 
     async def control_game_pip(self, video_id: str, action: str, position: float, playing: bool) -> bool:
         video = self._game_video
-        return bool(action in ("activate", "commit", "playback", "seek", "volume") and video and video.id == video_id
+        return bool(action in ("activate", "commit", "playback", "seek", "volume", "mute") and video and video.id == video_id
                     and video.command(action, position, playing))
 
     async def stop_game_pip(self, video_id: str = "") -> None:

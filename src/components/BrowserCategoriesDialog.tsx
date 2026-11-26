@@ -1,16 +1,18 @@
 import { useLayoutEffect, useRef, useState } from 'react';
-import { Button, DialogBodyText, Focusable, ModalRoot, ToggleField } from '@decky/ui';
+import { Button, DialogBodyText, Focusable, ToggleField } from '@decky/ui';
 import { FaArrowDown, FaArrowUp } from 'react-icons/fa';
 import { orderCategories, type CategoryLayout } from './BrowserCategories';
 import { ChoiceDialogBody, ChoiceDialogList } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
+import { DeckyPlexModal } from './InterfaceTheme';
 
-export function BrowserCategoriesDialog({ title, categories, initialLayout, close, save }: {
+export function BrowserCategoriesDialog({ title, categories, initialLayout, close, save, lightTheme }: {
   title: string;
   categories: readonly { key: string; title: string }[];
   initialLayout?: CategoryLayout;
   close: () => void;
   save: (layout: CategoryLayout) => Promise<void>;
+  lightTheme?: boolean;
 }) {
   const [layout, setLayout] = useState<CategoryLayout>(initialLayout ?? { order: [], hidden: [] });
   const [saving, setSaving] = useState(false);
@@ -52,7 +54,7 @@ export function BrowserCategoriesDialog({ title, categories, initialLayout, clos
   };
 
   return (
-    <ModalRoot closeModal={close} onCancel={close} onOK={() => {}}
+    <DeckyPlexModal lightTheme={lightTheme} closeModal={close} onCancel={close} onOK={() => {}}
       bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
       <ChoiceDialogBody title={title}>
         <ChoiceDialogList>
@@ -61,7 +63,7 @@ export function BrowserCategoriesDialog({ title, categories, initialLayout, clos
             return (
               <Focusable key={key} data-deckyplex-choice-row="" flow-children="horizontal" style={{ display: 'flex', alignItems: 'center',
                 gap: '0.4rem', padding: '0.15rem 0.5rem', flex: '0 0 auto', minWidth: 0,
-                borderRadius: '0.5rem', background: 'rgba(255,255,255,0.06)' }}>
+                borderRadius: '0.5rem', background: 'var(--deckyplex-button, rgba(255,255,255,0.06))' }}>
                 <div style={{ flex: 1, minWidth: 0, overflowWrap: 'anywhere' }}>
                   <ToggleField label={title} checked={checked} bottomSeparator="none"
                     onChange={show => void update({ ...layout,
@@ -86,6 +88,6 @@ export function BrowserCategoriesDialog({ title, categories, initialLayout, clos
           {error && <DialogBodyText style={{ margin: 0 }}>{error}</DialogBodyText>}
         </div>}
       </ChoiceDialogBody>
-    </ModalRoot>
+    </DeckyPlexModal>
   );
 }

@@ -68,7 +68,16 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
       }
     } : undefined}>
     <style>{`
+      [data-deckyplex-video-scrubber] .deckyplex-video-position {
+        box-shadow: inset 0 1px rgba(255,255,255,0.15), 0 2px 5px rgba(0,0,0,0.32) !important;
+      }
+      [data-deckyplex-video-scrubber] .deckyplex-video-position:not(:disabled, [aria-disabled="true"]):is(.gpfocus, :focus-visible) {
+        outline: 2px solid #a0c9ef; outline-offset: -2px;
+      }
+      [data-deckyplex-video-scrubber] .deckyplex-video-position:is(:disabled, [aria-disabled="true"]) { opacity: 0.55; }
       [data-deckyplex-video-scrubber][data-steam-style] .deckyplex-video-position {
+        background: rgba(255, 255, 255, 0.07);
+        color: #dae5f2;
         --deckyplex-seek-rail: rgba(138, 159, 182, 0.65);
         --deckyplex-seek-fill: currentColor;
       }
@@ -88,8 +97,6 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
       [data-deckyplex-video-scrubber][data-compact]:not([data-steam-style]) .deckyplex-video-position {
         background: transparent !important;
         color: #dae5f2 !important;
-        box-shadow: none !important;
-        text-shadow: none !important;
         --deckyplex-seek-rail: #52657b;
         --deckyplex-seek-fill: #9acfff;
       }
@@ -103,8 +110,6 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
       [data-deckyplex-video-scrubber][data-video-overlay] .deckyplex-video-position {
         background: transparent !important;
         color: #f1f5fa !important;
-        box-shadow: none !important;
-        text-shadow: none !important;
         --deckyplex-seek-rail: rgba(230, 239, 249, 0.36);
         --deckyplex-seek-fill: #a4dbff;
       }
@@ -117,8 +122,25 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
         --deckyplex-seek-rail: rgba(230, 239, 249, 0.5);
         --deckyplex-seek-fill: #c2e8ff;
       }
+      [data-deckyplex-light] [data-deckyplex-video-scrubber] .deckyplex-video-position {
+        background: var(--deckyplex-button) !important;
+        color: var(--deckyplex-text) !important;
+        --deckyplex-seek-rail: var(--deckyplex-border);
+        --deckyplex-seek-fill: var(--deckyplex-accent);
+      }
+      [data-deckyplex-light] [data-deckyplex-video-scrubber][data-video-overlay] .deckyplex-video-position {
+        background: transparent !important;
+      }
+      [data-deckyplex-light] [data-deckyplex-video-scrubber] .deckyplex-video-position:is(:focus-visible, :active, .gpfocus),
+      [data-deckyplex-light] [data-deckyplex-video-scrubber][data-video-scrubbing="true"] .deckyplex-video-position {
+        background: var(--deckyplex-hover) !important;
+        color: var(--deckyplex-focus-text) !important;
+        outline: 2px solid var(--deckyplex-focus) !important;
+        outline-offset: -2px;
+      }
     `}</style>
-    <Button className="deckyplex-video-position" onClick={activate} disabled={disabled} focusable={!disabled}
+    <Button className="deckyplex-video-position" noFocusRing disabled={disabled} focusable={!disabled}
+      onClick={activate}
       aria-label={`Playback position ${formatVideoTime(displayed)} of ${formatVideoTime(duration)}`}
       onOKActionDescription={editing ? 'Seek' : 'Choose position'}
       onCancelActionDescription={editing ? 'Cancel scrub' : undefined}
@@ -153,7 +175,7 @@ export function VideoScrubber({ position, duration, disabled, seek, previewUrl, 
           <span style={{ display: 'block', position: 'relative', height: '100%', width: `${percent}%`,
             background: 'var(--deckyplex-seek-fill)', borderRadius: 3 }}>
             <span style={{ position: 'absolute', right: -4, top: -2, width: 8, height: 8,
-              borderRadius: '50%', background: 'inherit', boxShadow: editing ? '0 0 0 2px currentColor' : undefined }} />
+              borderRadius: '50%', background: 'inherit', outline: editing ? '2px solid currentColor' : undefined }} />
           </span>
         </span>
       </span>
