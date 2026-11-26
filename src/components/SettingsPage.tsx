@@ -6,6 +6,7 @@ import {
   DialogBodyText,
   ButtonItem,
   Button,
+  Focusable,
   TextField,
   SliderField,
   ToggleField,
@@ -20,7 +21,7 @@ import { setGamepadSoundsMuted } from './GamepadSounds';
 import { LibraryRow, PlexSetupDialog, type LibraryCatalog, type PlexServerOption } from './PlexSetupDialog';
 import { musicBrowserCategories, videoCategories, type BrowserLayouts, type CategoryLayout } from './BrowserCategories';
 import { BrowserCategoriesDialog } from './BrowserCategoriesDialog';
-import { defaultPipPosition, pipPositions, type PipPosition } from './PipPosition';
+import { defaultPipPosition, defaultPipSize, pipPositions, type PipPosition } from './PipPosition';
 import { PipPositionDialog } from './PipPositionDialog';
 import { FocusOutlineStyles } from './FocusOutline';
 import { InterfaceThemeStyles } from './InterfaceTheme';
@@ -109,7 +110,7 @@ const DEFAULT_SETTINGS: Settings = {
   video_quality: 'auto',
   video_show_extras: false,
   pip_position: defaultPipPosition,
-  pip_size: 29,
+  pip_size: defaultPipSize,
 };
 
 function SettingsRow({ children }: { children: ReactNode }) {
@@ -187,6 +188,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   const setupDialog = useRef<ReturnType<typeof showModal> | null>(null);
   const categoriesDialog = useRef<ReturnType<typeof showModal> | null>(null);
   const pipPositionDialog = useRef<ReturnType<typeof showModal> | null>(null);
+  const playerRefreshRef = useRef<HTMLDivElement>(null);
   const settingsMounted = useRef(false);
 
   const saveSettings = useCallback((s: Partial<Settings>) => {
@@ -299,7 +301,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
 
   useEffect(() => {
     if (settings.local_server_enabled) setLocalAddress(settings.selected_server_url);
-  }, [settings.local_server_enabled, settings.selected_server_url]);
+    else if (settings.has_plex_token) {
+      setLocalAddress('');
+      setLocalConnectionStatus('');
+    }
+  }, [settings.has_plex_token, settings.local_server_enabled, settings.selected_server_url]);
 
   const handlePlexLogin = useCallback(async () => {
     if (requestingLoginCode.current || settingsRef.current.has_plex_token) return;
@@ -501,6 +507,17 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       setRefreshingPlayers(false);
     }
   }, []);
+
+  const revealPlayerRefresh = useCallback((focused?: { Element?: HTMLElement }) => {
+    const refresh = playerRefreshRef.current;
+    if (!refresh?.contains(focused?.Element ?? refresh.ownerDocument.activeElement)) return false;
+    refresh.scrollIntoView({ block: 'nearest', behavior: 'instant' });
+    return true;
+  }, []);
+
+  useEffect(() => {
+    revealPlayerRefresh();
+  }, [revealPlayerRefresh, players.length, playersStatus, refreshingPlayers, savingPlayerSettings]);
 
   const updateSetting = useCallback((key: keyof Settings, value: any) => {
     const updated = { ...settingsRef.current, [key]: value };
@@ -951,23 +968,27 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           />
         </div>
       </SettingsRow>
-      <SettingsRow>
-        <Button className="deckyplex-settings-button" onClick={handleRefreshPlayers} disabled={refreshingPlayers || savingPlayerSettings}>
-          Refresh players
-        </Button>
-      </SettingsRow>
-      {players.length === 0 && !refreshingPlayers && (
+      <Focusable className="deckyplex-settings-player-refresh" ref={playerRefreshRef}
+        {...{ focusable: false, scrollIntoViewWhenChildFocused: 'force', fnScrollIntoViewHandler: revealPlayerRefresh }}
+        onFocusCapture={() => revealPlayerRefresh()}>
         <SettingsRow>
-          <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>
+          <Button className="deckyplex-settings-button" onClick={handleRefreshPlayers} disabled={refreshingPlayers || savingPlayerSettings}>
+            Refresh players
+          </Button>
         </SettingsRow>
-      )}
-      {!settings.has_plex_token && !settings.local_server_enabled && (
-        <SettingsRow><DialogBodyText style={{ opacity: 0.7 }}>
-          Connect a Plex server in Advanced to send music from your library.
-        </DialogBodyText></SettingsRow>
-      )}
-      {(refreshingPlayers || savingPlayerSettings || playersStatus) && <StatusLine busy={refreshingPlayers || savingPlayerSettings}
-        text={savingPlayerSettings ? 'Saving player settings…' : refreshingPlayers ? 'Finding Plex players…' : playersStatus} />}
+        {players.length === 0 && !refreshingPlayers && (
+          <SettingsRow>
+            <DialogBodyText style={{ opacity: 0.5 }}>No players found. Open a Plex player, then refresh this list.</DialogBodyText>
+          </SettingsRow>
+        )}
+        {!settings.has_plex_token && !settings.local_server_enabled && (
+          <SettingsRow><DialogBodyText style={{ opacity: 0.7 }}>
+            Connect a Plex server in Advanced to send music from your library.
+          </DialogBodyText></SettingsRow>
+        )}
+        {(refreshingPlayers || savingPlayerSettings || playersStatus) && <StatusLine busy={refreshingPlayers || savingPlayerSettings}
+          text={savingPlayerSettings ? 'Saving player settings…' : refreshingPlayers ? 'Finding Plex players…' : playersStatus} />}
+      </Focusable>
     </SettingsSection>
     </>
   );
@@ -1016,23 +1037,21 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
     );
   };
 
-  const canConnectLocal = !changingLocalConnection && !!localAddress.trim()
+  const showConnectLocal = !!localAddress.trim()
     && (!settings.local_server_enabled || localAddress.trim() !== settings.selected_server_url);
   const submitServerAddress = () => {
     if (settings.has_plex_token) void testServerConnection();
-    else if (canConnectLocal) void changeLocalConnection();
+    else if (showConnectLocal && !changingLocalConnection) void changeLocalConnection();
   };
 
   const renderAdvancedPage = () => (
     <SettingsSection>
-      {settings.has_plex_token && <SettingsRow>
-        <DialogBodyText>Use a server address override when Plex discovery picks an unreachable address.</DialogBodyText>
-      </SettingsRow>}
       <SettingsRow>
         <TextField
-          label={settings.has_plex_token ? 'Plex server IP or URL' : 'Local Plex server address'}
+          label={settings.has_plex_token ? 'Plex server address override' : 'Local Plex server address'}
           value={settings.has_plex_token ? settings.manual_server_url : localAddress}
-          description={settings.has_plex_token ? undefined : 'Connect directly to a server that already allows access from this device.'}
+          description={settings.has_plex_token ? 'Leave blank to use the address discovered by Plex.'
+            : 'Connect directly to a server that already allows access from this device.'}
           placeholder="192.168.1.20:32400"
           disabled={changingLocalConnection}
           {...{
@@ -1054,11 +1073,16 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           }}
         />
       </SettingsRow>
-      {!settings.has_plex_token && <>
-        {(!settings.local_server_enabled || localAddress.trim() !== settings.selected_server_url) && (
+      {settings.has_plex_token ? (
+        <SettingsRow>
+          <Button className="deckyplex-settings-button" onClick={testServerConnection}
+            disabled={advancedStatus === 'Testing Plex server connection…'}>Test connection</Button>
+        </SettingsRow>
+      ) : <>
+        {showConnectLocal && (
           <SettingsRow>
             <Button className="deckyplex-settings-button" onClick={submitServerAddress}
-              disabled={!canConnectLocal}>
+              disabled={changingLocalConnection} focusable={!changingLocalConnection}>
               Connect
             </Button>
           </SettingsRow>
@@ -1088,10 +1112,6 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           onChange={(checked: boolean) => updateSetting('verify_tls', checked)}
         />
       </SettingsRow>
-      {settings.has_plex_token && <SettingsRow>
-        <Button className="deckyplex-settings-button" onClick={testServerConnection}
-          disabled={advancedStatus === 'Testing Plex server connection…'}>Test connection</Button>
-      </SettingsRow>}
       {advancedStatus && <StatusLine busy={advancedStatus === 'Saving…' || advancedStatus === 'Testing Plex server connection…'} text={advancedStatus} />}
     </SettingsSection>
   );
@@ -1145,6 +1165,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       <InterfaceThemeStyles />
       <FocusOutlineStyles />
       <style>{`
+        [data-deckyplex-settings] { --deckyplex-settings-footer-clearance: 5rem; }
         @media (min-width: 501px) {
           [data-deckyplex-settings] .PageListColumn {
             flex: 0 0 clamp(10rem, 19vw, 13rem); width: clamp(10rem, 19vw, 13rem); min-width: 0;
@@ -1154,7 +1175,9 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           width: 100%; max-width: none; box-sizing: border-box;
         }
         .deckyplex-settings-page { display: grid; gap: 0.95rem; width: 100%; min-width: 0;
-          box-sizing: border-box; padding: 0.75rem clamp(0.8rem, 1.8vw, 1.6rem) 3rem; }
+          box-sizing: border-box; padding: 0.75rem clamp(0.8rem, 1.8vw, 1.6rem) var(--deckyplex-settings-footer-clearance); }
+        .deckyplex-settings-player-refresh { display: grid; gap: 0.25rem;
+          scroll-margin-bottom: var(--deckyplex-settings-footer-clearance); }
         .deckyplex-settings-section > h2 { font-size: 0.92rem; font-weight: 650; line-height: 1.25;
           margin: 0 0 0.4rem; color: var(--deckyplex-text, #dce8f6); }
         .deckyplex-settings-fields { display: grid; gap: 0.25rem; align-items: start; padding: 0.48rem 0.7rem;

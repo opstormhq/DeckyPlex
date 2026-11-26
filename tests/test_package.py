@@ -134,14 +134,16 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         defaults = await self.plugin.get_settings()
         self.assertIs(defaults["quick_player_close_tray_on_back"], True)
         self.assertIs(defaults["over_game_pip"], True)
+        self.assertEqual(defaults["pip_size"], 30)
         self.assertIs(defaults["mute_ui_sounds"], False)
         self.assertIs(defaults["video_show_extras"], False)
         await self.plugin.set_settings({
-            "quick_player_close_tray_on_back": False, "over_game_pip": False, "mute_ui_sounds": True,
+            "quick_player_close_tray_on_back": False, "over_game_pip": False, "mute_ui_sounds": True, "pip_size": 29,
         })
         reloaded = await self.backend.Plugin().get_settings()
         self.assertIs(reloaded["quick_player_close_tray_on_back"], False)
         self.assertIs(reloaded["over_game_pip"], False)
+        self.assertEqual(reloaded["pip_size"], 29)
         self.assertIs(reloaded["mute_ui_sounds"], True)
 
     async def test_packaged_plex_sdk_connects_and_prepares_tokenless_music(self):
@@ -156,7 +158,10 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         self.plex_transport()
         settings = await self.plugin.connect_local_server("test.invalid")
         self.assertIs(settings["has_plex_token"], False)
-        self.assertEqual(settings["library_selection_ids"], ["1", "2"])
+        self.assertEqual(settings["library_selection_ids"], ["1"])
+        self.assertEqual(settings["catalog"]["selected_ids"], ["1"])
+        self.assertEqual([library["id"] for library in settings["catalog"]["libraries"]], ["1", "2"])
+        self.assertIs(settings["browse_all_media"], False)
         self.assertIs(settings["video_show_extras"], False)
         music_only = await self.plugin.set_library_selection("test-server", ["1"], True)
         self.assertIs(music_only["video_show_extras"], False)
@@ -267,10 +272,22 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         first = await self.plugin.set_library_selection("test-server", ["1"])
         self.assertEqual(first["library_selection_ids"], ["1"])
         second = await self.plugin.connect_local_server("source.invalid")
-        self.assertEqual(second["library_selection_ids"], ["1", "2"])
+        self.assertEqual(second["library_selection_ids"], ["1"])
         await self.plugin.set_library_selection("source-server", ["2"])
         self.assertEqual((await self.plugin.connect_local_server("test.invalid"))["library_selection_ids"], ["1"])
         self.assertEqual((await self.plugin.connect_local_server("source.invalid"))["library_selection_ids"], ["2"])
+
+    async def test_local_video_only_server_waits_for_a_library_choice(self):
+        self.plex_transport(lambda _req, url: (
+            (200, container('<Directory key="2" title="Movies" type="movie"/>'))
+            if url.path == "/library/sections" else None
+        ))
+        connected = await self.plugin.connect_local_server("test.invalid")
+        self.assertEqual(connected["catalog"]["selected_ids"], [])
+        self.assertEqual([library["id"] for library in connected["catalog"]["libraries"]], ["2"])
+        chosen = await self.plugin.set_library_selection("test-server", ["2"])
+        self.assertEqual(chosen["library_selection_ids"], ["2"])
+        self.assertIs(chosen["browse_all_media"], True)
 
     async def test_video_retries_a_connection_reset_with_a_fresh_session_only_once(self):
         import requests

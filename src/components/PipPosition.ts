@@ -12,6 +12,7 @@ export const pipPositions = [
 
 export type PipPosition = typeof pipPositions[number]['id'];
 export const defaultPipPosition: PipPosition = 'bottom-left';
+export const defaultPipSize = 30;
 
 export function getPipBounds(width: number, height: number, sizePercent: number, position: PipPosition, trayLeft = width) {
   const margin = Math.round(Math.min(width * 0.018, height * 0.05));

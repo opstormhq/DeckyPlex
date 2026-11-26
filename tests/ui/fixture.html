@@ -17,6 +17,11 @@
   .fixture-slider { height: 2.5rem; display: flex; align-items: center; gap: .8rem; padding-inline: .3rem; }
   .fixture-slider input { flex: 1; min-width: 0; accent-color: #8fcbff; }
   .fixture-scrubber { width: min(90%, 32rem); margin: 3rem auto; display: grid; gap: 1rem; }
+  .fixture-settings-sidebar { display: flex; height: 100%; }
+  .fixture-settings-sidebar [role="tablist"] { display: grid; align-content: start; gap: 0.3rem; }
+  .fixture-settings-panel { flex: 1; overflow-y: auto; min-width: 0; }
+  .fixture-field { display: grid; gap: .35rem; padding-block: .4rem; }
+  [role="dialog"] { position: absolute; inset: 1.5rem auto auto 50%; transform: translateX(-50%); padding: 1rem; background: #212f3f; }
 </style>
 <div id="app"></div>
 <script src="/app.js" defer></script>

@@ -75,7 +75,7 @@ DEFAULT_SETTINGS = {
     "video_autoplay": True,
     "over_game_pip": True,
     "pip_position": "bottom-left",
-    "pip_size": 29,
+    "pip_size": 30,
     "volume": 50,
     "manual_server_url": "",
     "manual_server_id": "",
@@ -2727,10 +2727,8 @@ class Plugin:
             "selected_server_name": identity["friendlyName"] or "Plex Media Server", "selected_server_url": url,
             "server_access_token": "",
         })
-        choice = _library_choice(settings)
-        selected_ids = {entry["id"] for entry in choice} if isinstance(choice, list) else set()
-        selected = [library for library in libraries if library["id"] in selected_ids]
-        _set_library_choice(settings, server_id, selected or libraries)
+        selected = self._visible_libraries(libraries, settings, True)
+        _set_library_choice(settings, server_id, selected)
         try:
             _save_settings(settings)
         except OSError:
@@ -2740,7 +2738,7 @@ class Plugin:
         self._video_handoff_sources = None
         await self.stop_game_pip()
         return {**self._public_settings(_load_settings()), "catalog": {
-            "server_id": server_id, "libraries": libraries, "selected_ids": [entry["id"] for entry in selected or libraries],
+            "server_id": server_id, "libraries": libraries, "selected_ids": [entry["id"] for entry in selected],
         }}
 
     async def disconnect_local_server(self) -> Dict[str, Any]:

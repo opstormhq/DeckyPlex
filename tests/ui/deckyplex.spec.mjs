@@ -196,3 +196,68 @@ test('the scrubber moves a visible draft and sends one seek after confirmation',
   await expect(scrubber).toHaveAccessibleName('Playback position 1:45 of 10:00');
   expect(errors).toEqual([]);
 });
+
+test('Players scrolls the help and discovery status above the footer when Refresh players has focus', async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 340 });
+  const errors = await openFixture(page, 'settings', { account: 'signed-out' });
+  await page.getByRole('tab', { name: 'Players' }).click();
+  const refresh = page.getByRole('button', { name: 'Refresh players' });
+  const help = page.getByText('Connect a Plex server in Advanced to send music from your library.');
+  await expect(refresh).toBeEnabled();
+  await refresh.focus();
+  await expect(refresh).toBeFocused();
+  const bottomClearance = locator => locator.evaluate(element => {
+    const panel = element.closest('[role="tabpanel"]');
+    return panel.getBoundingClientRect().bottom - element.getBoundingClientRect().bottom;
+  });
+  await expect.poll(() => bottomClearance(help)).toBeGreaterThan(65);
+  await refresh.press('Enter');
+  const status = page.getByRole('status').filter({ hasText: 'No Plex players found.' });
+  await expect.poll(() => bottomClearance(status)).toBeGreaterThan(65);
+  expect(errors).toEqual([]);
+});
+
+test('Advanced skips Connect until a local address exists and opens a music-first library picker', async ({ page }) => {
+  const errors = await openFixture(page, 'settings', { account: 'signed-out' });
+  await page.getByRole('tab', { name: 'Advanced' }).click();
+  const address = page.getByRole('textbox', { name: /Local Plex server address/ });
+  const connect = page.getByRole('button', { name: 'Connect', exact: true });
+  await expect(connect).toHaveCount(0);
+  await address.press('Tab');
+  await expect(page.getByRole('slider', { name: 'Connection timeout: 8s' })).toBeFocused();
+  await address.fill('   ');
+  await expect(connect).toHaveCount(0);
+  await address.fill('test.invalid:32400');
+  await address.press('Tab');
+  await expect(connect).toBeFocused();
+  await address.press('Enter');
+
+  const dialog = page.getByRole('dialog');
+  await expect(dialog.getByText('Choose Plex libraries')).toBeVisible();
+  await expect(dialog.getByRole('switch', { name: /Music/ })).toBeChecked();
+  await expect(dialog.getByRole('switch', { name: /Movies/ })).not.toBeChecked();
+  await dialog.getByText('Continue', { exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(await actions(page)).toEqual(expect.arrayContaining([
+    ['connect_local_server', 'test.invalid:32400'],
+    ['set_library_selection', 'fixture', ['1'], false],
+  ]));
+  await expect(connect).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Disconnect' })).toBeEnabled();
+  expect(errors).toEqual([]);
+});
+
+test('Advanced places Test connection directly after the signed-in address override', async ({ page }) => {
+  const override = 'http://test.invalid:32400';
+  const errors = await openFixture(page, 'settings', { override });
+  await page.getByRole('tab', { name: 'Advanced' }).click();
+  const address = page.getByRole('textbox', { name: /Plex server address override/ });
+  const check = page.getByRole('button', { name: 'Test connection' });
+  await expect(address).toHaveValue(override);
+  await address.press('Tab');
+  await expect(check).toBeFocused();
+  await check.press('Enter');
+  await expect(page.getByRole('status').filter({ hasText: 'Connected to Test Plex.' })).toBeVisible();
+  expect(await actions(page)).toContainEqual(['validate_connection']);
+  expect(errors).toEqual([]);
+});

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserPage } from '../../src/components/BrowserPage';
 import { QuickPlayer } from '../../src/components/QuickPlayer';
+import { SettingsPage } from '../../src/components/SettingsPage';
 import { VideoScrubber } from '../../src/components/VideoScrubber';
 import { resumePausedVideoEvent, setViewerPlayback } from '../../src/components/VideoPlayback';
 import { GamepadButton, HostContext } from './decky-host';
@@ -16,6 +17,14 @@ const settings = {
   grid_columns: 6, interface_theme: params.get('theme') || 'dark', quick_player_show_idle: true,
 };
 const libraries = [{ id: '1', type: 'artist', name: 'Music' }, { id: '2', type: 'movie', name: 'Movies' }];
+if (screen === 'settings') {
+  Object.assign(settings, {
+    companion_device_name: 'DeckyPlex', playback_target: 'local', connection_timeout: 8, verify_tls: false,
+    manual_server_url: params.get('override') || '', local_server_enabled: false,
+    selected_server_id: settings.has_plex_token ? 'fixture' : '',
+  });
+}
+const catalog = () => ({ libraries, server_id: 'fixture', selected_ids: settings.library_selection_ids });
 const art = [
   ['#183153', '#ed9a4c'], ['#3c1852', '#d199c4'], ['#073935', '#75d4c0'],
   ['#28264e', '#547fe4'], ['#4c2320', '#ec7570'], ['#344211', '#e5bb61'],
@@ -73,6 +82,19 @@ window.fixture = {
     switch (method) {
       case 'get_settings':
       case 'get_quick_player_settings': return { ...settings };
+      case 'get_companion_status': return { active: false };
+      case 'discover_players': return { players: [] };
+      case 'discover_servers': return { servers: [{ id: 'fixture', name: 'Test Plex' }] };
+      case 'get_library_catalog': return catalog();
+      case 'set_settings': return { ...Object.assign(settings, args[0]) };
+      case 'validate_connection': return { valid: true, serverName: 'Test Plex' };
+      case 'connect_local_server':
+        Object.assign(settings, { local_server_enabled: true, selected_server_id: 'fixture', selected_server_name: 'Test Plex',
+          selected_server_url: `http://${args[0]}`, library_selection_ids: ['1'] });
+        return { ...settings, catalog: catalog() };
+      case 'set_library_selection':
+        settings.library_selection_ids = args[1];
+        return { ...settings };
       case 'get_library_sections': return { sections: libraries };
       case 'get_metadata_children': return { items: args[0]?.startsWith('artist-') ? albums : tracks };
       case 'get_section_contents':
@@ -117,7 +139,7 @@ function App() {
     loadMusicArtwork: async () => '',
   };
   return <HostContext.Provider value={player}>
-    {screen === 'browser' ? <BrowserPage /> : screen === 'scrubber' ? (
+    {screen === 'settings' ? <SettingsPage /> : screen === 'browser' ? <BrowserPage /> : screen === 'scrubber' ? (
       <main className="fixture-scrubber">
         <VideoScrubber position={position} duration={600} seek={value => { actions.push(['seek', value]); setPosition(value); }} />
         <button>Next control</button>

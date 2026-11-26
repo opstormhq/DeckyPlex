@@ -2,7 +2,7 @@ import { Component, useEffect, useSyncExternalStore, type ReactNode } from 'reac
 import { call, toaster } from '@decky/api';
 import { Router, findModuleExport, getGamepadNavigationTrees, quickAccessMenuClasses } from '@decky/ui';
 import { insertNextEpisode, queueFromEpisode, resumePosition } from './VideoQueue';
-import { defaultPipPosition, getPipBounds, type PipPosition } from './PipPosition';
+import { defaultPipPosition, defaultPipSize, getPipBounds, type PipPosition } from './PipPosition';
 
 type SteamWindow = NonNullable<typeof Router.WindowStore.GamepadUIMainWindowInstance>;
 type SteamView = ReturnType<SteamWindow['CreateBrowserView']>;
@@ -417,7 +417,7 @@ export async function startGamePip(request: PipRequest, signal: AbortSignal,
       id, viewKey: id, steam, view, useComposition, item: request.item, serverId: request.serverId,
       quality: request.quality, volume: request.volume, muted: request.muted, episodes: request.episodes || [],
       mediaIndex: request.mediaIndex ?? 0, autoplay: result.video_autoplay !== false,
-      position: result.pip_position ?? defaultPipPosition, size: result.pip_size ?? 29,
+      position: result.pip_position ?? defaultPipPosition, size: result.pip_size ?? defaultPipSize,
       composed: false, bounds: '', busy: false, clock: 0, lastReport: 0, timeline: Promise.resolve(),
     };
     pipState.overlay = current;
