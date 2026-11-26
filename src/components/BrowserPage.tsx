@@ -211,6 +211,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
         : category.type === 'photo' ? <FaImage /> : <FaFilm /> })),
     { key: 'search', title: 'Search', icon: <FaSearch /> },
   ], [visibleMusic, visibleVideo]);
+  const firstTabId = tabs[0]?.key;
   const [checkingConnection, setCheckingConnection] = useState(true);
   const connected = !!serverId;
   const [subView, setSubView] = useState<BrowserSubView>(null);
@@ -254,6 +255,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const focusZone = useRef<'sidebar' | 'content'>('sidebar');
   const browserRef = useRef<HTMLDivElement | null>(null);
   const sidebarRef = useRef<HTMLDivElement | null>(null);
+  const firstTabNavRef = useRef<GamepadFocusHandle | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const moreItemsRef = useRef<HTMLDivElement | null>(null);
   const focusScrollFrame = useRef(0);
@@ -488,28 +490,35 @@ const LibraryBrowser = memo(function LibraryBrowser({
   };
 
   const handleCancel = useCallback((event: Event) => {
-    if (history.length === 0 && focusZone.current === 'content') {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    if ((event as GamepadEvent).detail?.is_repeat || (event as KeyboardEvent).repeat) return;
+
+    if (history.length) {
+      goBack();
+      return;
+    }
+    if (focusZone.current === 'content') {
       window.setTimeout(() => {
         Array.from(sidebarRef.current?.querySelectorAll<HTMLElement>('[data-browser-tab]') || [])
           .find(tab => tab.dataset.browserTab === activeTab)?.focus();
       }, 0);
       return;
     }
-    if (history.length === 0 && focusZone.current === 'sidebar') {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      Navigation.NavigateBack();
+
+    const sidebar = sidebarRef.current;
+    const firstTab = sidebar?.querySelector<HTMLElement>('[data-browser-tab]');
+    const focusedTab = (event.target as Element | null)?.closest?.<HTMLElement>('[data-browser-tab]');
+    const currentTab = focusedTab?.dataset.browserTab ?? activeTabRef.current;
+    if (sidebar && firstTab && firstTabId && currentTab !== firstTabId) {
+      sidebar.scrollTop = 0;
+      selectTab(firstTabId);
+      focusForDirection(firstTab, event, firstTabNavRef.current);
       return;
     }
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    if (history.length > 0) goBack();
-  }, [history.length, goBack, activeTab]);
+    Navigation.NavigateBack();
+  }, [history.length, goBack, activeTab, firstTabId, selectTab]);
 
   useEffect(() => {
     const onBackKey = (event: KeyboardEvent) => {
@@ -2443,7 +2452,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           {tabs.map(({ key: tab, title, icon }) => {
             const focusCategory = () => {
               focusZone.current = 'sidebar';
-              if (tab === tabs[0]?.key && sidebarRef.current) sidebarRef.current.scrollTop = 0;
+              if (tab === firstTabId && sidebarRef.current) sidebarRef.current.scrollTop = 0;
               selectTab(tab);
             };
             return (
@@ -2453,6 +2462,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 color: 'var(--deckyplex-muted, #aeb9c5)' }}>Video</div>}
             <Focusable
               data-browser-tab={tab}
+              {...{ navRef: tab === firstTabId ? firstTabNavRef : undefined }}
               preferredFocus={tab === activeTab}
               onFocus={focusCategory} onGamepadFocus={focusCategory}
               {...{ fnScrollIntoViewHandler: ({ Element }: { Element?: HTMLElement }) =>

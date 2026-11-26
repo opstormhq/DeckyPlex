@@ -54,6 +54,7 @@ interface Settings {
   quick_player_show_idle: boolean;
   quick_player_native_style: boolean;
   quick_player_compact_header: boolean;
+  quick_player_close_tray_on_back: boolean;
   over_game_pip: boolean;
   video_autoplay: boolean;
   video_quality: string;
@@ -99,6 +100,7 @@ const DEFAULT_SETTINGS: Settings = {
   quick_player_show_idle: true,
   quick_player_native_style: false,
   quick_player_compact_header: true,
+  quick_player_close_tray_on_back: true,
   over_game_pip: false,
   video_autoplay: true,
   video_quality: 'auto',
@@ -530,7 +532,8 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
   }, [saveSettings]);
 
   const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
-    | 'quick_player_native_style' | 'quick_player_compact_header' | 'over_game_pip' | 'video_autoplay'
+    | 'quick_player_native_style' | 'quick_player_compact_header' | 'quick_player_close_tray_on_back'
+    | 'over_game_pip' | 'video_autoplay'
     | 'browser_never_wrap_categories' | 'interface_theme' | 'video_show_extras' | 'video_quality'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
@@ -768,6 +771,12 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         <ToggleField label="Show idle player" description="Keep the playback controls visible when nothing is playing."
           checked={settings.quick_player_show_idle !== false} disabled={!settingsAvailable || savingInterface}
           onChange={enabled => saveInterfaceSetting('quick_player_show_idle', enabled)} />
+      </SettingsRow>
+      <SettingsRow>
+        <ToggleField label="Close Quick Access on Back during playback"
+          description="Use the back arrow to return to the Decky plugin list while media is playing."
+          checked={settings.quick_player_close_tray_on_back !== false} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('quick_player_close_tray_on_back', enabled)} />
       </SettingsRow>
       <SettingsRow>
         <ToggleField

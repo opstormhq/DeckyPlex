@@ -87,6 +87,7 @@ DEFAULT_SETTINGS = {
     "quick_player_show_idle": True,
     "quick_player_native_style": False,
     "quick_player_compact_header": True,
+    "quick_player_close_tray_on_back": True,
 }
 
 LIBRARY_TYPES = ("artist", "movie", "show", "photo")
@@ -2535,7 +2536,7 @@ class Plugin:
                         "playback_target", "connection_timeout", "verify_tls", "companion_receiver_enabled",
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
                         "quick_player_maintain_x", "quick_player_show_idle", "quick_player_native_style",
-                        "quick_player_compact_header", "video_quality", "video_autoplay",
+                        "quick_player_compact_header", "quick_player_close_tray_on_back", "video_quality", "video_autoplay",
                         "video_show_extras", "interface_theme", *VIDEO_PLAYBACK_PREFERENCES,
                         "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
@@ -2552,6 +2553,7 @@ class Plugin:
             merged["quick_player_show_idle"] = merged["quick_player_show_idle"] is not False
             merged["quick_player_native_style"] = merged["quick_player_native_style"] is True
             merged["quick_player_compact_header"] = merged["quick_player_compact_header"] is True
+            merged["quick_player_close_tray_on_back"] = merged["quick_player_close_tray_on_back"] is not False
             merged["over_game_pip"] = merged["over_game_pip"] is True
             merged["video_autoplay"] = merged["video_autoplay"] is not False
             merged["video_show_extras"] = merged["video_show_extras"] is True

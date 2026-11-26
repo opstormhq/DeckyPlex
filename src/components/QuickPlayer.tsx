@@ -7,6 +7,7 @@ import {
   SliderField,
   Focusable,
   GamepadButton,
+  Navigation,
   NavEntryPositionPreferences,
   type GamepadEvent,
 } from '@decky/ui';
@@ -58,6 +59,7 @@ type QuickPlayerSettings = {
   quick_player_show_idle?: boolean;
   quick_player_native_style?: boolean;
   quick_player_compact_header?: boolean;
+  quick_player_close_tray_on_back?: boolean;
 };
 type ShuffleItem = { id: string; type: string; title?: string; grandparentTitle?: string; artist?: string;
   parentTitle?: string; duration?: number; thumb?: string };
@@ -307,6 +309,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
   }, []);
 
   const isPlaying = pip ? pip.playback?.status === 'playing' : viewer?.playing ?? (playbackState === 'playing');
+  const closeTrayOnBack = isPlaying && settings?.quick_player_close_tray_on_back !== false;
   const isPaused = videoActive ? !isPlaying : playbackState === 'paused';
   const isStopped = playbackState === 'stopped';
 
@@ -470,10 +473,15 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       if (active.closest('[data-video-scrubbing]')) return;
       const inOpenQueue = showQueue && (queueContainerRef.current?.contains(active) || queueToggleRef.current?.contains(active));
       const headingAction = headingActionRef.current;
-      const atHeadingAction = headingAction?.contains(active);
-      if (!inOpenQueue) {
-        if (atHeadingAction && !event.detail.is_repeat) return;
-        if (!headingAction && (controlsRef.current?.contains(active) || !hasUsableTransport)) return;
+      const atBackBoundary = headingAction
+        ? headingAction.contains(active)
+        : controlsRef.current?.contains(active) || !hasUsableTransport;
+      if (!inOpenQueue && atBackBoundary) {
+        if (!closeTrayOnBack && (!headingAction || !event.detail.is_repeat)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (!event.detail.is_repeat) Navigation.CloseSideMenus();
+        return;
       }
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -581,6 +589,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
       }}>
         {topAction && <Button {...quickButtonProps} ref={headingActionRef}
           {...{ navRef: headingNavigationRef }} data-quick-heading-action=""
+          onCancelActionDescription={closeTrayOnBack ? 'Close tray' : undefined}
           style={compactHeader ? { ...wideButtonStyle, width: 'auto', paddingInline: '0.55rem', fontSize: '0.86rem' } : wideButtonStyle}
           onClick={topAction === 'login' ? onLogin : onBrowse}>
           <span style={compactHeader ? { ...actionLabelStyle, gap: '0.4rem', whiteSpace: 'nowrap' } : actionLabelStyle}>
