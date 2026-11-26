@@ -120,6 +120,8 @@ jobs:
       pull-requests: write
     concurrency:
       group: release-${{ github.ref }}
+    env:
+      RELEASE_ZIP: DeckyPlex-${{ github.ref_name }}.zip
     steps:
       - name: Download and verify the install ZIP
         env:
@@ -128,9 +130,9 @@ jobs:
           ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact-digest }}
         run: |
-          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > DeckyPlex.zip
-          printf '%s  %s\n' "${ARTIFACT_DIGEST#sha256:}" DeckyPlex.zip | sha256sum --check
-          unzip -tq DeckyPlex.zip
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > "$RELEASE_ZIP"
+          printf '%s  %s\n' "${ARTIFACT_DIGEST#sha256:}" "$RELEASE_ZIP" | sha256sum -c -
+          unzip -tq "$RELEASE_ZIP"
       - name: Attach ZIP to draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,12 +140,12 @@ jobs:
         run: |
           if draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"; then
             if [[ "$draft" == true ]]; then
-              gh release upload "$GITHUB_REF_NAME" DeckyPlex.zip --clobber
+              gh release upload "$GITHUB_REF_NAME" "$RELEASE_ZIP" --clobber
             else
               echo "$GITHUB_REF_NAME is already published."
             fi
           else
-            gh release create "$GITHUB_REF_NAME" DeckyPlex.zip --draft --verify-tag --generate-notes
+            gh release create "$GITHUB_REF_NAME" "$RELEASE_ZIP" --draft --verify-tag --generate-notes
           fi
       - name: Clear the release PR's pending label
         env:

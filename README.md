@@ -24,7 +24,7 @@ Play Plex music, movies, and TV in Steam Gaming Mode. Browse your libraries with
 
 You’ll need a SteamOS device with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) and access to a Plex Media Server.
 
-1. Download `DeckyPlex.zip` from the [latest GitHub release](https://github.com/opstormhq/DeckyPlex/releases/latest) and install the ZIP through Decky Loader’s developer settings. The ZIP includes the Python dependencies.
+1. Download the versioned ZIP, such as `DeckyPlex-v1.0.0.zip`, from the [latest GitHub release](https://github.com/opstormhq/DeckyPlex/releases/latest) and install the ZIP through Decky Loader’s developer settings. The ZIP includes the Python dependencies.
 2. Open **DeckyPlex → Settings → Account** and choose **Sign in with a code**. Enter the code at [plex.tv/link](https://plex.tv/link).
 3. Choose a server and its libraries. DeckyPlex starts with music libraries selected on a new server and remembers your choices per server. Change them later under **Settings → Server**.
 4. Open **Browse Music** or **Browse Media** in Quick Player. Pick a track to listen, or select a movie or episode to watch.
