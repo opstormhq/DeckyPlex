@@ -1,18 +1,8 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { runInNewContext } from 'node:vm';
-import ts from 'typescript';
+import { loadModule as loadSourceModule } from './fixtures/frontend.mjs';
 
-function loadModule(path, globals) {
-  const source = readFileSync(new URL(path, import.meta.url), 'utf8');
-  const { outputText } = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
-  });
-  const sandbox = { exports: {}, ...globals };
-  runInNewContext(outputText, sandbox, { filename: path });
-  return sandbox.exports;
-}
+const loadModule = (path, globals) => loadSourceModule(new URL(path, import.meta.url), globals);
 
 function fixture(useAudioOutput = false) {
   const patcher = loadModule('../node_modules/@decky/ui/dist/utils/patcher.js', { console: { debug() {} } });

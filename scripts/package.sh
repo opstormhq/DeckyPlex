@@ -15,6 +15,8 @@ cp node_modules/hls.js/LICENSE "$plugin_dir/LICENSE-hls.js"
 
 "${PYTHON:-python3}" -m pip install --require-hashes --only-binary=:all: --platform any \
     --no-compile --target "$plugin_dir/py_modules" -r requirements.txt
+# Keep the PlexAPI queue fixes used by the Deck builds with the pinned wheel.
+patch -s -f "$plugin_dir/py_modules/plexapi/playqueue.py" "$repo_dir/scripts/patches/plexapi-playqueue.patch"
 cp -R py_modules/xml "$plugin_dir/py_modules/"
 
 cd "$staging_dir"

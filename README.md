@@ -11,6 +11,14 @@ A Plex player for Steam Gaming Mode through [Decky Loader](https://github.com/St
 - **Plex Companion receiver**: Opt in to local Plexamp playback and set a distinct receiver name for each device.
 - **Advanced connection settings**: Override automatic discovery with a local server IP, set a connection timeout, and configure HTTPS certificate verification.
 
+## Screenshots
+
+The browser tests capture DeckyPlex with sample libraries and a simulated Decky host.
+
+![DeckyPlex library browser showing the Artists grid](docs/screenshots/library-browser.png)
+
+<img src="docs/screenshots/quick-player.png" alt="DeckyPlex Quick Player with a track playing and the queue open" width="320">
+
 ## Prerequisites
 
 - A SteamOS device with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) installed
@@ -53,21 +61,29 @@ With the receiver enabled, DeckyPlex publishes the current song and upcoming mus
 
 ## Development
 
-The GitHub runner uses Node.js 24 and Python 3.13. Local packaging also uses `pip` and `zip`.
+The GitHub runner uses Node.js 24 and Python 3.13. Local packaging also uses `pip`, `patch`, and `zip`.
 
 ```bash
 npm ci
 npm run check
 npm test
+npx playwright install --only-shell chromium
+npm run test:ui
 npm run package
 python3 -m unittest discover -s tests
 ```
 
-The package build installs the pinned dependencies in `requirements.txt` into the ZIP and keeps Decky's bundled XML fallback in `py_modules/xml`. Set `PYTHON` to a virtual environment's interpreter if needed. The tests use synthetic Plex responses and run without signing in or connecting to a live server. Install the ZIP on SteamOS to verify gamepad navigation, real playback, and in-game picture-in-picture.
+The package build installs the pinned dependencies in `requirements.txt`, applies the PlexAPI queue compatibility patch, and includes Decky's XML fallback. Set `PYTHON` to a virtual environment's interpreter if needed.
+
+- **Frontend** tests cover playback state, seeking, preference updates, and UI sounds. Playwright also drives the actual browser and Quick Player components in headless Chromium, including focus, search, pagination, and queue controls.
+- **Backend and ZIP** tests load the packaged plugin and use the bundled Plex SDK with fixture HTTP responses. They cover code sign-in, direct server connections, library choices, shared queues, video preparation, and upgrades. The PiP relay test uses a temporary loopback port.
+- **Screenshots** and browser failure traces are uploaded as the `ui-test-results` artifact. To refresh the README images, copy the successful test captures from `test-results/ui` to `docs/screenshots`.
+
+Verify native Steam focus and sounds, live Plexamp casting, and over-game PiP on a Deck or Steam Machine before publishing.
 
 ### Releases
 
-Use `main` for development and version tags for releases. In GitHub Actions, the **Test and package** job runs the TypeScript check, frontend tests, and backend and package tests. It uploads an installable `DeckyPlex.zip` for pushes and pull requests to `main`, and for version tags.
+Use `main` for development and version tags for releases. In GitHub Actions, the **Test and package** job runs the TypeScript check, frontend tests, browser tests, and backend and package tests. It uploads an installable `DeckyPlex.zip` for pushes and pull requests to `main`, and for version tags.
 
 #### First release
 

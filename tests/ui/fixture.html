@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>DeckyPlex UI test</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body, #app { margin: 0; height: 100%; }
+  body { background: #19242f; color: #eaeef4; font: 16px Arial, sans-serif; }
+  button, input { font: inherit; color: inherit; }
+  button { padding: 0.45rem 0.65rem; border: 0; border-radius: 4px; background: #354351; cursor: pointer; }
+  button:disabled { cursor: default; }
+  input:not([type="range"]) { border: 1px solid #61758c; border-radius: 4px; background: #263441; padding: 0.45rem; }
+  :focus-visible { outline: 2px solid #aad2ff; outline-offset: 1px; }
+  .fixture-label { font-weight: 650; letter-spacing: .02em; }
+  .fixture-tray { height: 100%; overflow-y: auto; max-width: 440px; margin: auto; }
+  .fixture-tray header { padding: 0.9rem 1rem 0.65rem; font-weight: 700; background: #171f2a; }
+  .fixture-slider { height: 2.5rem; display: flex; align-items: center; gap: .8rem; padding-inline: .3rem; }
+  .fixture-slider input { flex: 1; min-width: 0; accent-color: #8fcbff; }
+  .fixture-scrubber { width: min(90%, 32rem); margin: 3rem auto; display: grid; gap: 1rem; }
+</style>
+<div id="app"></div>
+<script src="/app.js" defer></script>
+</html>
