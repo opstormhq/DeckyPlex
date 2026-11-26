@@ -1,11 +1,11 @@
 {
   "name": "DeckyPlex",
-  "author": "Brandon Garner",
+  "author": "OpStorm",
   "flags": [],
   "api_version": 1,
   "publish": {
     "tags": ["music", "video", "plex", "plexamp", "streaming"],
     "description": "Play Plex music, movies, and TV in Steam Gaming Mode and control playback with Plexamp.",
-    "image": "https://opengraph.githubassets.com/1/brandonkgarner/DeckyPlex"
+    "image": "https://opengraph.githubassets.com/1/opstormhq/DeckyPlex"
   }
 }
