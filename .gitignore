@@ -1,20 +1,22 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build output
 dist/
+DeckyPlex.zip
 
 # Python
 .venv/
 __pycache__/
 *.pyc
 
-# Bundled Python dependencies — console scripts not needed at runtime
-defaults/bin/
+# Python dependencies are installed when packaging. Keep Decky's XML fallback.
+/py_modules/*
+!/py_modules/xml/
 
 # IDE
 .idea/
+.junie/
 *.swp
 *.swo
 

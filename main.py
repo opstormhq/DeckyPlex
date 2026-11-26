@@ -18,10 +18,16 @@ from copy import copy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
-# Add py_modules to Python path so bundled dependencies (plexapi, requests) are available
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
+try:
+    with open(os.path.join(_plugin_dir, "package.json"), encoding="utf-8") as package_file:
+        APP_VERSION = json.load(package_file)["version"]
+except (OSError, ValueError, KeyError):
+    APP_VERSION = "0.0.0"
+
 if _plugin_dir not in sys.path:
     sys.path.insert(0, _plugin_dir)
+# Make the packaged PlexAPI and Requests available to Decky's Python runtime.
 _py_modules_dir = os.path.join(_plugin_dir, "py_modules")
 if os.path.isdir(_py_modules_dir):
     if _py_modules_dir in sys.path:
@@ -404,7 +410,7 @@ class PlexCompanionReceiver:
                 "Protocol-Capabilities: timeline,playback,playqueues\r\n"
                 f"Resource-Identifier: {self.machine_id}\r\n"
                 "Device-Class: stb\r\n"
-                "Version: 1.0.0\r\n\r\n").encode("utf-8")
+                f"Version: {APP_VERSION}\r\n\r\n").encode("utf-8")
 
     def enqueue(self, name: str, params: Dict[str, Any], client_host: str = "", client_id: str = "") -> None:
         try:
@@ -692,7 +698,7 @@ class PlexCompanionReceiver:
                     name = html.escape(receiver.device_name, quote=True)
                     root = (f'<MediaContainer friendlyName="{name}" machineIdentifier="{receiver.machine_id}">'
                             f'<Player title="{name}" machineIdentifier="{receiver.machine_id}" '
-                            'product="DeckyPlex" version="1.0.0" platform="SteamOS" '
+                            f'product="DeckyPlex" version="{APP_VERSION}" platform="SteamOS" '
                             'protocolVersion="1" protocolCapabilities="timeline,playback,playqueues" deviceClass="stb">'
                             f'<Connection protocol="http" address="{local_address}" port="{receiver.HTTP_PORT}" '
                             f'uri="http://{local_address}:{receiver.HTTP_PORT}" />'
@@ -2017,7 +2023,7 @@ class PlexHTTP:
             "X-Plex-Client-Profile-Extra": profile_extra,
             "X-Plex-Platform": "Chrome",
             "X-Plex-Product": "DeckyPlex",
-            "X-Plex-Version": "1.0.0",
+            "X-Plex-Version": APP_VERSION,
         })
         transcode_url = sdk.url(f"/music/:/transcode/universal/start.m4a?{params}", includeToken=True)
         if direct_url and codec in ("mp3", "flac"):
@@ -4073,7 +4079,7 @@ class Plugin:
             headers = {
                 "X-Plex-Client-Identifier": login_id,
                 "X-Plex-Product": "DeckyPlex",
-                "X-Plex-Version": "1.0.0",
+                "X-Plex-Version": APP_VERSION,
                 "X-Plex-Platform": "SteamOS",
                 "X-Plex-Device": "Steam Machine",
                 "X-Plex-Device-Name": "DeckyPlex",

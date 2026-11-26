@@ -1,6 +1,6 @@
 # DeckyPlex
 
-A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) music player for SteamOS. It connects to Plex Media Server, browses music libraries through the bundled Python PlexAPI SDK, and plays tracks in the Decky webview.
+A Plex player for Steam Gaming Mode through [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader). Browse and play music, movies, and TV from your Plex libraries, or use Plexamp to control music on the Deck.
 
 ## Features
 
@@ -13,17 +13,13 @@ A [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) music player
 
 ## Prerequisites
 
-- Steam Machine with [Decky Loader](https://github.com/583531/DeckyLoader) installed
+- A SteamOS device with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) installed
 - Access to a Plex Media Server
 
 ## Installation
 
-1. Build the plugin:
-   ```bash
-   npm install
-   npm run package
-   ```
-2. Install the generated `DeckyPlex.zip` through Decky Loader's developer settings.
+1. Download `DeckyPlex.zip` from [GitHub Releases](https://github.com/brandonkgarner/DeckyPlex/releases).
+2. Install the ZIP through Decky Loader's developer settings.
 
 No additional Python dependencies are needed — `plexapi` is bundled with the plugin.
 
@@ -33,13 +29,14 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 2. Choose **Sign in with a code** and enter the code at `plex.tv/link`.
 3. Choose a server if Plex finds more than one, then choose its libraries. Cancel to keep the default server. Each server starts with its music libraries selected and remembers its own choices. Later changes under **Settings > Server** save automatically.
 4. To play on another Plex client, open **Settings > Players**, refresh the list, select a connected player, and choose it as the playback target.
-5. If automatic discovery selected an unreachable server address, open **Settings > Advanced** and enter the server's local IP address.
+5. If automatic discovery selected an unreachable server address, open **Settings > Advanced** and enter the server's local IP address. You can also use **Local Plex server address** there while signed out if your server already allows local access without authentication.
 6. Enable **Plexamp receiver** in **Settings > Players** to receive music from a device on the same LAN. Set the **Receiver device name** there to distinguish your devices in Plexamp.
 
 ## Usage
 
-- Open **Browse Music** to browse and play tracks, or **Browse Media** to include your selected movie, TV, and photo libraries. Under **Video**, **Home** shows Continue Watching, Watch Next, Recently Added Movies and TV, and Watchlist matches from your selected libraries. Press **X** in a movie or TV library to sort it.
+- Open **Browse Music** to browse and play tracks, or **Browse Media** to include your selected movie, TV, and photo libraries. Under **Video**, **Home** shows Continue Watching, Watch Next, Recently Added Movies and TV, and Watchlist matches from your selected libraries. Press **Select** in a movie or TV library to sort it.
 - Press **Start** in the Library Browser to focus the Search box.
+- During playback, press **B** to return focus to Browse in Quick Player. Press **B** again to close Quick Access, or use the back arrow to return to the Decky plugin list. You can change the tray behavior in **Settings > Interface > Quick Player**.
 - Videos resume from your Plex watch position when available. Choose **Full screen**, then press **B** to show the controls. Press **A** on the timeline to scrub, move left or right to preview a position, and press **A** again to seek or **B** to cancel. **Original when possible** prefers direct playback and uses Plex conversion for incompatible media. The player shows the active playback mode and decoded resolution. A failed quality switch reloads the previous quality at the same position.
 - To keep the picture over a game in Steam Gaming Mode, turn on **Settings > Interface > Video > Allow picture-in-picture over games** and choose **Pop out** from the video player or Quick Player. You can choose the corner and width under **Video**. A right-corner overlay moves left while Steam Quick Access is open. Use **Full screen** in Quick Player to return to the video at its current position. Starting local music closes the overlay. The setting is off by default.
 - Partially watched movies and the **Play series** and **Play season** actions offer **Resume** or **Start from beginning** when Plex has a saved starting point. Opening a single episode queues it through the end of its season. The next queued episode plays automatically in fullscreen and PiP. Press **X** on an upcoming episode in the Quick Player queue to remove it, or on an episode in the browser while a show is playing to play it next.
@@ -55,16 +52,21 @@ With the receiver enabled, DeckyPlex publishes the current song and upcoming mus
 
 ## Development
 
-```bash
-npm install
-npm run watch  # Watch mode for development
-```
-
-To rebuild bundled Python dependencies:
+The GitHub runner uses Node.js 24 and Python 3.13. Local packaging also uses `pip` and `zip`.
 
 ```bash
-pip install -r requirements.txt --target defaults/
+npm ci
+npm run check
+npm test
+npm run package
+python3 -m unittest discover -s tests
 ```
+
+The package build installs the pinned dependencies in `requirements.txt` into the ZIP and keeps Decky's bundled XML fallback in `py_modules/xml`. Set `PYTHON` to a virtual environment's interpreter if needed. The tests use synthetic Plex responses and run without signing in or connecting to a live server. Install the ZIP on SteamOS to verify gamepad navigation, real playback, and in-game picture-in-picture.
+
+### Releases
+
+Pushes and pull requests to `main` run the checks and build an installable `DeckyPlex.zip` in the Actions run's artifacts. To prepare a release, use `npm version <major|minor|patch> --no-git-tag-version` to update the version and lockfile together when needed. Tag the release commit with the matching version, such as `v1.0.0`, and push that tag. After a passing build, GitHub Actions attaches the ZIP to a draft release for review and publication.
 
 ## License
 

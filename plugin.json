@@ -1,11 +1,11 @@
 {
   "name": "DeckyPlex",
-  "author": "Junie",
+  "author": "Brandon Garner",
   "flags": [],
   "api_version": 1,
   "publish": {
-    "tags": ["music", "plexamp", "streaming"],
-    "description": "Integrates Plexamp music streaming into Steam Machine via Decky Loader.",
-    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-plugin-template"
+    "tags": ["music", "video", "plex", "plexamp", "streaming"],
+    "description": "Play Plex music, movies, and TV in Steam Gaming Mode and control playback with Plexamp.",
+    "image": "https://opengraph.githubassets.com/1/brandonkgarner/DeckyPlex"
   }
 }

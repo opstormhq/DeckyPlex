@@ -1,0 +1,77 @@
+name: Build and test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Check release version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::The release tag must match the stable version in package.json (v$version)"
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run package
+      - run: node --check dist/index.js
+      - run: python -m unittest discover -s tests
+      - uses: actions/upload-artifact@v7
+        with:
+          path: DeckyPlex.zip
+          archive: false
+          if-no-files-found: error
+
+  draft-release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: DeckyPlex.zip
+      - name: Attach ZIP to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if draft="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)"; then
+            if [[ "$draft" == true ]]; then
+              gh release upload "$GITHUB_REF_NAME" DeckyPlex.zip --clobber
+            else
+              echo "$GITHUB_REF_NAME is already published."
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" DeckyPlex.zip --draft --verify-tag --generate-notes
+          fi

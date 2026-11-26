@@ -6,8 +6,10 @@
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.mjs",
     "clean": "rm -rf dist DeckyPlex.zip",
-    "package": "npm run clean && npm run build && mkdir -p package/DeckyPlex/dist package/DeckyPlex/assets && cp dist/index.js package/DeckyPlex/dist/ && cp main.py video_pip.py plugin.json package.json LICENSE README.md package/DeckyPlex/ && cp assets/game-pip.js node_modules/hls.js/dist/hls.min.js package/DeckyPlex/assets/ && cp node_modules/hls.js/LICENSE package/DeckyPlex/LICENSE-hls.js && cp -r py_modules package/DeckyPlex/ && cd package && zip -r ../DeckyPlex.zip DeckyPlex/ && cd .. && rm -rf package"
+    "package": "npm run build && bash scripts/package.sh"
   },
   "devDependencies": {
     "@decky/rollup": "^1.0.2",
