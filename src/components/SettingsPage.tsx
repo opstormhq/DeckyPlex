@@ -16,6 +16,7 @@ import { call } from '@decky/api';
 import { FaUser, FaServer, FaMusic, FaCog, FaSlidersH } from 'react-icons/fa';
 import { InlineSpinner } from './InlineSpinner';
 import { stopGamePip } from './GamePip';
+import { setGamepadSoundsMuted } from './GamepadSounds';
 import { LibraryRow, PlexSetupDialog, type LibraryCatalog, type PlexServerOption } from './PlexSetupDialog';
 import { musicBrowserCategories, videoCategories, type BrowserLayouts, type CategoryLayout } from './BrowserCategories';
 import { BrowserCategoriesDialog } from './BrowserCategoriesDialog';
@@ -55,6 +56,7 @@ interface Settings {
   quick_player_native_style: boolean;
   quick_player_compact_header: boolean;
   quick_player_close_tray_on_back: boolean;
+  mute_ui_sounds: boolean;
   over_game_pip: boolean;
   video_autoplay: boolean;
   video_quality: string;
@@ -101,7 +103,8 @@ const DEFAULT_SETTINGS: Settings = {
   quick_player_native_style: false,
   quick_player_compact_header: true,
   quick_player_close_tray_on_back: true,
-  over_game_pip: false,
+  mute_ui_sounds: false,
+  over_game_pip: true,
   video_autoplay: true,
   video_quality: 'auto',
   video_show_extras: false,
@@ -365,10 +368,12 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         if (discoveredServers.length) {
           const dialog = showModal(
             <PlexSetupDialog lightTheme={connectedSettings.interface_theme === 'light'}
+              videoExtrasEnabled={connectedSettings.video_show_extras === true}
               servers={discoveredServers} defaultServerId={connectedSettings.selected_server_id}
               loadLibraries={serverId => callWithTimeout('get_plex_setup_catalog', 30000, loginAttempt.id, serverId)}
-              complete={async (serverId, selectedIds) => {
-                const saved: Settings & { error?: string } = await callWithTimeout('complete_plex_setup', 20000, loginAttempt.id, serverId, selectedIds);
+              complete={async (serverId, selectedIds, enableVideoExtras) => {
+                const saved: Settings & { error?: string } = await callWithTimeout(
+                  'complete_plex_setup', 20000, loginAttempt.id, serverId, selectedIds, enableVideoExtras);
                 if (saved.error) throw new Error(saved.error);
                 if (settingsMounted.current) applySettings(saved);
               }}
@@ -533,7 +538,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
 
   const saveInterfaceSetting = async <K extends 'hide_quick_login' | 'quick_player_maintain_x' | 'quick_player_show_idle'
     | 'quick_player_native_style' | 'quick_player_compact_header' | 'quick_player_close_tray_on_back'
-    | 'over_game_pip' | 'video_autoplay'
+    | 'over_game_pip' | 'video_autoplay' | 'mute_ui_sounds'
     | 'browser_never_wrap_categories' | 'interface_theme' | 'video_show_extras' | 'video_quality'>(key: K, value: Settings[K]) => {
     setSavingInterface(true);
     setInterfaceStatus('');
@@ -544,6 +549,7 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
       settingsRef.current = updated;
       setSettings(updated);
       if (key === 'over_game_pip' && !value) stopGamePip();
+      if (key === 'mute_ui_sounds') setGamepadSoundsMuted(value === true);
     } catch (error) {
       setInterfaceStatus(error instanceof Error ? error.message : 'Could not save interface settings.');
     } finally {
@@ -632,9 +638,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
           const server = { id: result.selected_server_id, name: result.selected_server_name };
           const dialog = showModal(
             <PlexSetupDialog lightTheme={settingsRef.current.interface_theme === 'light'} servers={[server]} defaultServerId={server.id}
+              videoExtrasEnabled={result.video_show_extras === true}
               loadLibraries={async () => catalog}
-              complete={async (serverId, selectedIds) => {
-                const saved: Settings & { error?: string } = await callWithTimeout('set_library_selection', 20000, serverId, selectedIds);
+              complete={async (serverId, selectedIds, enableVideoExtras) => {
+                const saved: Settings & { error?: string } = await callWithTimeout(
+                  'set_library_selection', 20000, serverId, selectedIds, enableVideoExtras);
                 if (saved.error) throw new Error(saved.error);
                 if (settingsMounted.current) {
                   settingsRef.current = saved;
@@ -754,6 +762,11 @@ export function SettingsPage({ startLogin = false }: { startLogin?: boolean }) {
         <ToggleField label="Light mode" description="Use a light theme throughout DeckyPlex."
           checked={settings.interface_theme === 'light'} disabled={!settingsAvailable || savingInterface}
           onChange={enabled => saveInterfaceSetting('interface_theme', enabled ? 'light' : 'dark')} />
+      </SettingsRow>
+      <SettingsRow>
+        <ToggleField label="Mute UI sounds" description="Silence DeckyPlex’s navigation and selection sounds."
+          checked={settings.mute_ui_sounds === true} disabled={!settingsAvailable || savingInterface}
+          onChange={enabled => saveInterfaceSetting('mute_ui_sounds', enabled)} />
       </SettingsRow>
     </SettingsSection>
     <SettingsSection title="Quick Player">

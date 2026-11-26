@@ -102,8 +102,9 @@ export function InterfaceThemeStyles() {
 }
 
 export function DeckyPlexModal({ lightTheme, className, children, ...props }: ModalRootProps & { lightTheme?: boolean }) {
-  if (!lightTheme) return <ModalRoot {...props} className={className}>{children}</ModalRoot>;
-  return <ModalRoot {...props} className={['deckyplex-light-modal', className].filter(Boolean).join(' ')}>
+  const classes = ['deckyplex-modal', lightTheme && 'deckyplex-light-modal', className].filter(Boolean).join(' ');
+  if (!lightTheme) return <ModalRoot {...props} className={classes}>{children}</ModalRoot>;
+  return <ModalRoot {...props} className={classes}>
     <div data-deckyplex-modal="" data-deckyplex-light="">
       <InterfaceThemeStyles />
       {children}

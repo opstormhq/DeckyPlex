@@ -1,5 +1,6 @@
 import { plexMediaUrl } from './PlexMediaUrl';
 import { InterfaceThemeStyles } from './InterfaceTheme';
+import { setGamepadSoundsMuted } from './GamepadSounds';
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react';
 import { call, useQuickAccessVisible } from '@decky/api';
 import {
@@ -60,6 +61,7 @@ type QuickPlayerSettings = {
   quick_player_native_style?: boolean;
   quick_player_compact_header?: boolean;
   quick_player_close_tray_on_back?: boolean;
+  mute_ui_sounds?: boolean;
 };
 type ShuffleItem = { id: string; type: string; title?: string; grandparentTitle?: string; artist?: string;
   parentTitle?: string; duration?: number; thumb?: string };
@@ -277,6 +279,7 @@ export function QuickPlayer({ onLogin, onBrowse, onSettings, onExpandPip, onResu
     const applySettings = (value: QuickPlayerSettings) => {
       if (!mounted || typeof value?.has_plex_token !== 'boolean') return;
       lastQuickSettings = value;
+      setGamepadSoundsMuted(value.mute_ui_sounds === true);
       setSettings(value);
     };
     const refreshConnection = async (validate = false) => {

@@ -34,7 +34,7 @@ import { musicBrowserCategories, videoCategories, visibleCategories,
 import { VideoOptionsDialog, type VideoAction, type VideoActionResult, type VideoExtra } from './VideoOptionsDialog';
 import { VideoWatchIndicator } from './VideoWatchIndicator';
 import { clearPausedVideo, requestPausedVideo, resumePausedVideoEvent, takePausedVideo, updatePausedVideo, usePausedVideo } from './VideoPlayback';
-import { playNavigationSound, selectWithSound } from './GamepadSounds';
+import { gamepadNavigationSoundProps, playNavigationSound, selectWithSound, setGamepadSoundsMuted } from './GamepadSounds';
 import { retryPlexRead } from './PlexRead';
 import { DeckyPlexModal, InterfaceThemeStyles } from './InterfaceTheme';
 
@@ -94,6 +94,11 @@ interface TabFocusPosition { itemId: string; scrollTop: number; homeRow?: VideoH
 const browserHeaderStyle: CSSProperties = {
   display: 'flex', alignItems: 'center', gap: '0.5rem', height: '2.65rem',
   paddingInline: '0.35rem', marginBottom: '0.5rem', boxSizing: 'border-box',
+};
+const browserHeaderActionStyle: CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0,
+  padding: '0.3rem 0.55rem', fontSize: '0.85rem', lineHeight: 1.2,
+  borderRadius: '4px', background: 'var(--deckyplex-button, rgba(255, 255, 255, 0.10))',
 };
 const browserHeaderScrollMargin = `calc(${browserHeaderStyle.height} + ${browserHeaderStyle.marginBottom} + 0.5rem)`;
 const DEFAULT_GRID_COLUMNS = 6;
@@ -189,7 +194,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const [showAllMedia, setShowAllMedia] = useState(false);
   const [showVideoExtras, setShowVideoExtras] = useState(false);
   const [lightTheme, setLightTheme] = useState(false);
-  const [overGamePip, setOverGamePip] = useState(false);
+  const [muteUiSounds, setMuteUiSounds] = useState(false);
+  const [overGamePip, setOverGamePip] = useState(true);
   const [videoAutoplay, setVideoAutoplay] = useState(true);
   const [librarySelectionKey, setLibrarySelectionKey] = useState('');
   const [serverId, setServerId] = useState('');
@@ -245,10 +251,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
   const watchlistMembership = useRef(new Map<string, boolean>());
   const firstItemRef = useRef<HTMLDivElement | null>(null);
   const sortButtonRef = useRef<HTMLDivElement | null>(null);
+  const sortButtonNavRef = useRef<GamepadFocusHandle | null>(null);
   const playCollectionRef = useRef<HTMLDivElement | null>(null);
   const playCollectionNavRef = useRef<GamepadFocusHandle | null>(null);
-  const collectionItemNavRefs = useRef<Partial<Record<number, { current: GamepadFocusHandle | null }>>>({});
-  const lastCollectionItem = useRef<HTMLElement | null>(null);
+  const firstRowNavRefs = useRef<Partial<Record<number, { current: GamepadFocusHandle | null }>>>({});
+  const lastHeaderItem = useRef<HTMLElement | null>(null);
   const gridDialogRef = useRef<{ Close: () => void } | null>(null);
   const gridPromptShown = useRef(false);
   const actionDialogRef = useRef<{ Close: () => void } | null>(null);
@@ -313,7 +320,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     cancelContentScroll();
     hideAlphabetOverlay();
     loadingMoreRef.current = false;
-    lastCollectionItem.current = null;
+    lastHeaderItem.current = null;
     setLoadingMore(false);
     setPaginationError('');
     return ++tabLoadRequestId.current;
@@ -547,7 +554,9 @@ const LibraryBrowser = memo(function LibraryBrowser({
         setShowAllMedia(Boolean(result.browse_all_media));
         setShowVideoExtras(result.video_show_extras === true);
         setLightTheme(result.interface_theme === 'light');
-        setOverGamePip(result.over_game_pip === true);
+        setMuteUiSounds(result.mute_ui_sounds === true);
+        setGamepadSoundsMuted(result.mute_ui_sounds === true);
+        setOverGamePip(result.over_game_pip !== false);
         setVideoAutoplay(result.video_autoplay !== false);
         const layouts: BrowserLayouts = result.browser_layouts ?? {};
         const snapshot = JSON.stringify(layouts);
@@ -578,6 +587,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
 
   const shelf = sectionForTab(activeTab);
   const sorting = videoSorts[shelf] || VIDEO_SORTS[0].id;
+  const sortTitle = VIDEO_SORTS.find(sort => sort.id === sorting)?.title ?? VIDEO_SORTS[0].title;
   const sortable = !subView && libraries.some(library => library.id === shelf
     && (library.type === 'movie' || library.type === 'show'));
 
@@ -1767,14 +1777,14 @@ const LibraryBrowser = memo(function LibraryBrowser({
     viewport.scrollTo({ top: 0, behavior: 'instant' });
   }, [cancelContentScroll]);
 
-  const focusCollectionPosition = useCallback((target: HTMLElement, event: Event) => {
-    if (target === playCollectionRef.current) {
+  const focusHeaderPosition = useCallback((target: HTMLElement, event: Event) => {
+    if (target === playCollectionRef.current || target === sortButtonRef.current) {
       hideAlphabetOverlay();
       scrollContentToTop();
-      focusForDirection(target, event, playCollectionNavRef.current);
+      focusForDirection(target, event, target === sortButtonRef.current ? sortButtonNavRef.current : playCollectionNavRef.current);
     } else {
       const index = Number(target.dataset.browserItemIndex);
-      focusForDirection(target, event, collectionItemNavRefs.current[index]?.current);
+      focusForDirection(target, event, firstRowNavRefs.current[index]?.current);
     }
   }, [hideAlphabetOverlay, scrollContentToTop]);
 
@@ -1787,7 +1797,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
     if (!target) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    if (target === playCollectionRef.current) focusCollectionPosition(target, event);
+    if (target === playCollectionRef.current) focusHeaderPosition(target, event);
     else focusForDirection(target, event);
   };
 
@@ -1799,9 +1809,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
     firstItemRef.current?.focus({ preventScroll: true });
   };
 
+  // Steam checks this on the destination node, including when it moves focus itself.
+  const navigationSounds = gamepadNavigationSoundProps(muteUiSounds);
   const renderItemRow = (item: LibraryItem, idx: number, onClick: () => void, firstHomeRow = false, homeRow?: VideoHomeRow) => {
-    const collectionNavRef = hasCollectionAction && idx < (gridView ? gridColumns : 1)
-      ? collectionItemNavRefs.current[idx] ??= { current: null } : undefined;
+    const firstRowNavRef = (hasCollectionAction || sortable) && idx < (gridView ? gridColumns : 1)
+      ? firstRowNavRefs.current[idx] ??= { current: null } : undefined;
     const sortTitle = alphabeticallySorted ? item.titleSort || item.title : undefined;
     const kind = item.type;
     const showPoster = homeView && kind === 'episode';
@@ -1864,7 +1876,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
           data-browser-card=""
           data-browser-home-start={firstHomeRow || undefined}
           data-browser-home-row={homeRow}
-          {...{ navRef: collectionNavRef }}
+          {...navigationSounds}
+          {...{ navRef: firstRowNavRef }}
           onFocus={focusItem}
           onGamepadFocus={focusItem}
           {...itemScroll}
@@ -1968,7 +1981,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
             data-browser-item-id={item.id}
             data-browser-item-index={idx}
             data-browser-sort-title={sortTitle}
-            {...{ navRef: collectionNavRef }}
+            {...navigationSounds}
+            {...{ navRef: firstRowNavRef }}
             onFocus={focusItem}
             onGamepadFocus={focusItem}
             {...itemScroll}
@@ -1992,7 +2006,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
     return (
       <Focusable key={item.id} ref={idx === 0 ? firstItemRef : undefined} data-browser-item-id={item.id} data-browser-item-index={idx}
         data-browser-sort-title={sortTitle}
-        {...{ navRef: collectionNavRef }}
+        {...navigationSounds}
+        {...{ navRef: firstRowNavRef }}
         onFocus={focusItem} onGamepadFocus={focusItem} {...itemScroll}
         onActivate={event => selectWithSound(event, onClick)} onClick={onClick}
         onCancel={handleCancel} onGamepadDirection={(event) => moveBetweenItems(event, idx)}
@@ -2044,12 +2059,19 @@ const LibraryBrowser = memo(function LibraryBrowser({
             {title}
           </DialogLabel>
           {playbackRequests > 0 && <InlineSpinner />}
-          {sortable && <Button ref={sortButtonRef} onClick={openSortMenu} onCancelButton={handleCancel}
-            onOKActionDescription="Sort by">
-            <span title="Press View to sort" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem' }}>
-              <FaRegClone aria-hidden="true" />{VIDEO_SORTS.find(sort => sort.id === sorting)?.title || 'Sort by'}
-            </span>
-          </Button>}
+          {sortable && <Focusable ref={sortButtonRef} {...focusOutlineProps} {...navigationSounds}
+            {...{ navRef: sortButtonNavRef }} data-browser-sort-button="" role="button" tabIndex={0}
+            title="Press View to sort" onCancel={handleCancel} onOKActionDescription="Sort by"
+            onActivate={event => selectWithSound(event, openSortMenu)} onClick={openSortMenu}
+            onKeyDown={event => {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              event.stopPropagation();
+              if (!event.repeat) openSortMenu();
+            }}
+            style={browserHeaderActionStyle}>
+            <FaRegClone aria-hidden="true" /><span>{sortTitle}</span>
+          </Focusable>}
           {remoteTargetSelected && (
             <DialogBodyText style={{ color: 'var(--deckyplex-accent, #9fc8ff)', fontSize: '0.8rem', margin: 0 }}>
               Playback target: {remotePlayerName || 'remote Plex player'}
@@ -2057,7 +2079,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           )}
           {hasCollectionAction && subView && !loading && (
             <Focusable key={`play-collection-${focusTreeVersion}`} ref={playCollectionRef}
-              {...focusOutlineProps} {...{ navRef: playCollectionNavRef }} data-browser-play-collection=""
+              {...focusOutlineProps} {...navigationSounds} {...{ navRef: playCollectionNavRef }} data-browser-play-collection=""
               role="button" tabIndex={0} onCancel={handleCancel}
               onActivate={event => selectWithSound(event, playCollection)} onClick={playCollection}
               onKeyDown={event => {
@@ -2067,9 +2089,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 if (!event.repeat) void playCollection();
               }}
               onOptionsActionDescription="Jump to top" onOptionsButton={jumpToListTop}
-              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem', flexShrink: 0,
-                padding: '0.3rem 0.55rem', fontSize: '0.85rem', lineHeight: 1.2,
-                borderRadius: '4px', background: 'var(--deckyplex-button, rgba(255, 255, 255, 0.10))' }}>
+              style={browserHeaderActionStyle}>
               <FaPlay aria-hidden="true" /><span>{videoCollection
                 ? subView.mediaType === 'show' ? 'Play series' : 'Play season'
                 : remoteTargetSelected ? 'Play remotely' : subView.type === 'albums' ? 'Play Artist' : subView.queueLabel || 'Play All'}</span>
@@ -2081,6 +2101,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
             <div ref={searchFormRef} style={{ width: '100%', padding: '0 0.35rem 0.7rem', boxSizing: 'border-box' }}>
               <Focusable flow-children="horizontal" onCancel={handleCancel} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: '100%', minWidth: 0 }}>
               <TextField
+                {...navigationSounds}
                 label=""
                 style={{ flex: '1 1 32rem', minWidth: '320px', width: '32rem', maxWidth: '70vw', boxSizing: 'border-box' }}
                 value={searchQuery}
@@ -2093,7 +2114,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
                   }
                 }}
               />
-              <Button onClick={handleSearch} aria-label="Search">
+              <Button {...navigationSounds} onClick={handleSearch} aria-label="Search">
                 <FaSearch />
               </Button>
             </Focusable>
@@ -2166,11 +2187,11 @@ const LibraryBrowser = memo(function LibraryBrowser({
             </div>
         )}
         {gridView && !gridPreferenceSet && (
-          <PanelSectionRow><Button onClick={openGridColumnsDialog}>Choose browser grid width</Button></PanelSectionRow>
+          <PanelSectionRow><Button {...navigationSounds} onClick={openGridColumnsDialog}>Choose browser grid width</Button></PanelSectionRow>
         )}
         {!subView && tabHasMore && <div ref={moreItemsRef} aria-hidden="true" style={{ height: 1 }} />}
         {!subView && paginationError && (
-          <PanelSectionRow><Button onClick={() => void loadMoreTabPage()}>Retry loading more</Button></PanelSectionRow>
+          <PanelSectionRow><Button {...navigationSounds} onClick={() => void loadMoreTabPage()}>Retry loading more</Button></PanelSectionRow>
         )}
         {!subView && loadingMore && (
           <PanelSectionRow>
@@ -2251,6 +2272,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       if (!active?.closest) return;
       const sidebar = sidebarRef.current;
       const content = contentRef.current;
+      const headerAction = playCollectionRef.current ?? sortButtonRef.current;
       let target: HTMLElement | null | undefined;
       if (sidebar?.contains(active)) {
         const tab = active.closest('[data-browser-tab]');
@@ -2258,18 +2280,17 @@ const LibraryBrowser = memo(function LibraryBrowser({
         const tabs = Array.from(sidebar.querySelectorAll<HTMLElement>('[data-browser-tab]'));
         if (tab !== (button === GamepadButton.DIR_UP ? tabs[0] : tabs[tabs.length - 1])) return;
       } else if (content?.contains(active)) {
-        const collection = playCollectionRef.current;
-        if (collection?.contains(active)) {
+        if (headerAction?.contains(active)) {
           if (button === GamepadButton.DIR_DOWN) {
-            target = lastCollectionItem.current ?? firstItemRef.current;
-            lastCollectionItem.current = null;
+            target = lastHeaderItem.current ?? firstItemRef.current;
+            lastHeaderItem.current = null;
           }
         } else if (button === GamepadButton.DIR_UP) {
           const card = active.closest<HTMLElement>('[data-browser-item-index]');
           if (!card || Number(card.dataset.browserItemIndex) >= (gridView ? gridColumns : 1)
               || (homeView && !card.hasAttribute('data-browser-home-start'))) return;
-          lastCollectionItem.current = collection ? card : null;
-          target = collection ?? searchFormRef.current?.querySelector('input');
+          lastHeaderItem.current = headerAction ? card : null;
+          target = headerAction ?? searchFormRef.current?.querySelector('input');
         } else {
           const page = nextPageAtBoundary.current;
           const hold = alphabetHold.current;
@@ -2289,10 +2310,10 @@ const LibraryBrowser = memo(function LibraryBrowser({
       event.preventDefault();
       event.stopImmediatePropagation();
       const destination = target?.isConnected ? target
-        : button === GamepadButton.DIR_DOWN && playCollectionRef.current?.contains(active) ? firstItemRef.current : null;
+        : button === GamepadButton.DIR_DOWN && headerAction?.contains(active) ? firstItemRef.current : null;
       if (destination && destination !== active) {
-        if (destination === playCollectionRef.current || playCollectionRef.current?.contains(active)) {
-          focusCollectionPosition(destination, event);
+        if (destination === headerAction || headerAction?.contains(active)) {
+          focusHeaderPosition(destination, event);
         } else focusForDirection(destination, event);
       }
     };
@@ -2374,7 +2395,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       endRepeat();
     };
   }, [viewerExpanded, gridView, gridColumns, homeView, connected, openSearch, openSortMenu, sortable, activeTab, sorting,
-    focusCollectionPosition, hideAlphabetOverlay, updateAlphabetOverlay]);
+    focusHeaderPosition, hideAlphabetOverlay, updateAlphabetOverlay]);
 
   const enterContent = () => {
     focusZone.current = 'content';
@@ -2413,7 +2434,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
       <InterfaceThemeStyles />
       <style>{`
         [data-browser-card].deckyplex-focus-outline-active::after { top: -4px; }
-        [data-browser-play-collection]:focus-visible {
+        :is([data-browser-play-collection], [data-browser-sort-button]):focus-visible {
           outline: 2px solid var(--deckyplex-focus, rgba(255, 255, 255, 0.6));
           outline-offset: -2px;
         }
@@ -2421,7 +2442,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
           width: max-content; max-width: min(17rem, 30vw);
         }
         [data-browser-alphabet]:not([hidden]) { display: grid; place-items: center; }
-        [data-deckyplex-browser][data-deckyplex-light] :is([data-browser-tab], [data-browser-item-id], [data-browser-play-collection]) {
+        [data-deckyplex-browser][data-deckyplex-light] :is([data-browser-tab], [data-browser-item-id], [data-browser-play-collection], [data-browser-sort-button]) {
           color: var(--deckyplex-text); text-shadow: none;
         }
         [data-deckyplex-browser][data-deckyplex-light] [data-browser-tab]:is(.gpfocus, :focus-visible) {
@@ -2462,6 +2483,7 @@ const LibraryBrowser = memo(function LibraryBrowser({
                 color: 'var(--deckyplex-muted, #aeb9c5)' }}>Video</div>}
             <Focusable
               data-browser-tab={tab}
+              {...navigationSounds}
               {...{ navRef: tab === firstTabId ? firstTabNavRef : undefined }}
               preferredFocus={tab === activeTab}
               onFocus={focusCategory} onGamepadFocus={focusCategory}
@@ -2586,6 +2608,7 @@ function GridColumnsDialog({ initialColumns, onPreview, onConfirm, onClose, ligh
         <ChoiceDialogList>
           <Focusable
             {...focusOutlineProps}
+            {...gamepadNavigationSoundProps()}
             flow-children="horizontal"
             onGamepadDirection={handleDirection}
             onActivate={event => selectWithSound(event, confirm)}
@@ -2857,7 +2880,7 @@ function TrackOptionsDialog({ track, playlistId, allowPlaylists, addToQueue, onC
         </>}
         {view === 'new' && <ChoiceDialogList>
           <PanelSectionRow>
-            <TextField label="Playlist name" value={playlistName} disabled={busy}
+            <TextField {...gamepadNavigationSoundProps()} label="Playlist name" value={playlistName} disabled={busy}
               {...{
                 refKeyboardHandle: playlistKeyboard,
                 strEnterKeyLabel: 'Create Playlist',

@@ -34,11 +34,12 @@ No additional Python dependencies are needed — `plexapi` is bundled with the p
 
 ## Usage
 
-- Open **Browse Music** to browse and play tracks, or **Browse Media** to include your selected movie, TV, and photo libraries. Under **Video**, **Home** shows Continue Watching, Watch Next, Recently Added Movies and TV, and Watchlist matches from your selected libraries. Press **Select** in a movie or TV library to sort it.
+- Open **Browse Music** to browse and play tracks, or **Browse Media** to include your selected movie, TV, and photo libraries. Under **Video**, **Home** shows Continue Watching, Watch Next, Recently Added Movies and TV, and Watchlist matches from your selected libraries. Press **Select** or choose the sort button above the grid to sort a movie or TV library.
 - Press **Start** in the Library Browser to focus the Search box.
 - During playback, press **B** to return focus to Browse in Quick Player. Press **B** again to close Quick Access, or use the back arrow to return to the Decky plugin list. You can change the tray behavior in **Settings > Interface > Quick Player**.
 - Videos resume from your Plex watch position when available. Choose **Full screen**, then press **B** to show the controls. Press **A** on the timeline to scrub, move left or right to preview a position, and press **A** again to seek or **B** to cancel. **Original when possible** prefers direct playback and uses Plex conversion for incompatible media. The player shows the active playback mode and decoded resolution. A failed quality switch reloads the previous quality at the same position.
-- To keep the picture over a game in Steam Gaming Mode, turn on **Settings > Interface > Video > Allow picture-in-picture over games** and choose **Pop out** from the video player or Quick Player. You can choose the corner and width under **Video**. A right-corner overlay moves left while Steam Quick Access is open. Use **Full screen** in Quick Player to return to the video at its current position. Starting local music closes the overlay. The setting is off by default.
+- To keep the picture over a game in Steam Gaming Mode, choose **Pop out** from the video player or Quick Player. The overlay opens only when you choose Pop out. You can disable it or adjust its position and size under **Settings > Interface > Video**. Use **Full screen** in Quick Player to return to the video at its current position. Starting local music closes the overlay.
+- During Plex setup, selecting a movie or TV library offers to show trailers and extras. They start off and can be enabled later under **Settings > Interface > Video**. DeckyPlex's navigation and selection sounds can be muted under **Settings > Interface > Appearance**.
 - Partially watched movies and the **Play series** and **Play season** actions offer **Resume** or **Start from beginning** when Plex has a saved starting point. Opening a single episode queues it through the end of its season. The next queued episode plays automatically in fullscreen and PiP. Press **X** on an upcoming episode in the Quick Player queue to remove it, or on an episode in the browser while a show is playing to play it next.
 - Set grid columns under **Settings > Interface > Library browser**.
 - Open **Settings** to sign in to Plex and select a server.
@@ -66,7 +67,26 @@ The package build installs the pinned dependencies in `requirements.txt` into th
 
 ### Releases
 
-Pushes and pull requests to `main` run the checks and build an installable `DeckyPlex.zip` in the Actions run's artifacts. To prepare a release, use `npm version <major|minor|patch> --no-git-tag-version` to update the version and lockfile together when needed. Tag the release commit with the matching version, such as `v1.0.0`, and push that tag. After a passing build, GitHub Actions attaches the ZIP to a draft release for review and publication.
+Use `main` for development and version tags for releases. In GitHub Actions, the **Test and package** job runs the TypeScript check, frontend tests, and backend and package tests. It uploads an installable `DeckyPlex.zip` for pushes and pull requests to `main`, and for version tags.
+
+#### First release
+
+1. Commit the release changes and push `main`. In **Actions → Build and test**, wait for **Test and package** to pass. Copy the commit SHA from that run.
+2. Fetch the commit, create the release tag on it, and push the tag. Replace `TESTED_COMMIT_SHA` with the SHA from step 1.
+
+   ```bash
+   git fetch origin
+   git tag -a v1.0.0 TESTED_COMMIT_SHA -m "DeckyPlex 1.0.0"
+   git push origin v1.0.0
+   ```
+
+3. Wait for **Build and test** to pass for the tag. In **Releases**, open the draft, check the notes and attached `DeckyPlex.zip`, and select **Publish release** when ready.
+
+#### Later releases
+
+1. Enable **Allow GitHub Actions to create and approve pull requests** in **Settings → Actions → General**. Use Conventional Commit messages for changes merged into `main`. Use `fix:` for patches, `feat:` for minor versions, and a `BREAKING CHANGE:` footer for major versions. If you squash a PR, put the prefix in the squash commit title.
+2. After CI passes, [Release Please](https://github.com/googleapis/release-please-action) opens or updates a release PR with the next version and changelog. Merge it when ready. GitHub may ask you to approve the checks on the generated PR.
+3. Wait for the release merge commit to pass **Test and package** on `main`. Tag that commit and push the tag using the commands above, with the new version in place of `1.0.0`. Review and publish the new draft from **Releases**.
 
 ## License
 

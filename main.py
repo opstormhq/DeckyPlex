@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "video_boost_dialog": False,
     "video_normalize_loudness": False,
     "video_autoplay": True,
-    "over_game_pip": False,
+    "over_game_pip": True,
     "pip_position": "bottom-left",
     "pip_size": 29,
     "volume": 50,
@@ -94,6 +94,7 @@ DEFAULT_SETTINGS = {
     "quick_player_native_style": False,
     "quick_player_compact_header": True,
     "quick_player_close_tray_on_back": True,
+    "mute_ui_sounds": False,
 }
 
 LIBRARY_TYPES = ("artist", "movie", "show", "photo")
@@ -2543,7 +2544,7 @@ class Plugin:
                         "allow_signed_out_companion", "companion_device_name", "hide_quick_login",
                         "quick_player_maintain_x", "quick_player_show_idle", "quick_player_native_style",
                         "quick_player_compact_header", "quick_player_close_tray_on_back", "video_quality", "video_autoplay",
-                        "video_show_extras", "interface_theme", *VIDEO_PLAYBACK_PREFERENCES,
+                        "video_show_extras", "interface_theme", "mute_ui_sounds", *VIDEO_PLAYBACK_PREFERENCES,
                         "over_game_pip", "pip_position", "pip_size"):
                 if key in settings:
                     merged[key] = settings[key]
@@ -2563,6 +2564,7 @@ class Plugin:
             merged["over_game_pip"] = merged["over_game_pip"] is True
             merged["video_autoplay"] = merged["video_autoplay"] is not False
             merged["video_show_extras"] = merged["video_show_extras"] is True
+            merged["mute_ui_sounds"] = merged["mute_ui_sounds"] is True
             merged["interface_theme"] = "light" if merged["interface_theme"] == "light" else "dark"
             if type(merged["video_caption_size"]) is not int or merged["video_caption_size"] not in VIDEO_CAPTION_SIZES:
                 merged["video_caption_size"] = DEFAULT_SETTINGS["video_caption_size"]
@@ -3414,7 +3416,8 @@ class Plugin:
     async def get_library_catalog(self) -> Dict[str, Any]:
         return await asyncio.to_thread(self._library_catalog, _load_settings())
 
-    async def set_library_selection(self, server_id: str, selected_ids: List[str]) -> Dict[str, Any]:
+    async def set_library_selection(self, server_id: str, selected_ids: List[str],
+                                    enable_video_extras: bool = False) -> Dict[str, Any]:
         if not isinstance(selected_ids, list) or not all(isinstance(section_id, str) for section_id in selected_ids):
             return {"error": "Invalid Plex library selection."}
         original = _load_settings()
@@ -3431,6 +3434,8 @@ class Plugin:
         if not selected:
             return {"error": "Choose at least one Plex library."}
         _set_library_choice(settings, server_id, selected)
+        if enable_video_extras is True and any(library["type"] in ("movie", "show") for library in selected):
+            settings["video_show_extras"] = True
         try:
             _save_settings(settings)
             return self._public_settings(settings)
@@ -4235,7 +4240,8 @@ class Plugin:
             _pin_state["setup_catalogs"][server_id] = catalog["libraries"]
         return catalog
 
-    async def complete_plex_setup(self, login_id: str, server_id: str, selected_ids: List[str]) -> Dict[str, Any]:
+    async def complete_plex_setup(self, login_id: str, server_id: str, selected_ids: List[str],
+                                  enable_video_extras: bool = False) -> Dict[str, Any]:
         settings = _load_settings()
         server = self._plex_setup_server(login_id, server_id, settings)
         if not server:
@@ -4254,6 +4260,8 @@ class Plugin:
         changed_server = settings["selected_server_id"] != server_id
         settings.update(_server_settings(server, settings["plex_token"]))
         _set_library_choice(settings, server_id, selected)
+        if enable_video_extras is True and any(library["type"] in ("movie", "show") for library in selected):
+            settings["video_show_extras"] = True
         try:
             _save_settings(settings)
         except OSError:

@@ -13,12 +13,18 @@ permissions:
 
 jobs:
   build:
+    name: Test and package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Record tested commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -36,17 +42,53 @@ jobs:
             echo "::error::The release tag must match the stable version in package.json (v$version)"
             exit 1
           fi
-      - run: npm ci
-      - run: npm run check
-      - run: npm test
-      - run: npm run package
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Type-check frontend
+        run: npm run check
+      - name: Run frontend tests
+        run: npm test
+      - name: Build the install ZIP
+        run: npm run package
       - run: node --check dist/index.js
-      - run: python -m unittest discover -s tests
+      - name: Run backend and package tests
+        run: python -m unittest discover -s tests -v
       - uses: actions/upload-artifact@v7
         with:
           path: DeckyPlex.zip
           archive: false
           if-no-files-found: error
+
+  propose-version:
+    name: Propose the next version
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: deckyplex-release-pr
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+          persist-credentials: false
+      - name: Check for the initial release tag
+        id: baseline
+        run: |
+          if git show-ref --verify --quiet refs/tags/v1.0.0; then
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Automatic version proposals start after v1.0.0 is tagged.'
+          fi
+      - name: Update the release pull request
+        if: steps.baseline.outputs.ready == 'true'
+        uses: googleapis/release-please-action@v5
+        with:
+          skip-github-release: true
 
   draft-release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -55,6 +97,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      pull-requests: write
     concurrency:
       group: release-${{ github.ref }}
     steps:
@@ -75,3 +118,14 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" DeckyPlex.zip --draft --verify-tag --generate-notes
           fi
+      - name: Clear the release PR's pending label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ needs.build.outputs.commit }}
+        run: |
+          pulls="$(gh api "repos/$GH_REPO/commits/$RELEASE_COMMIT/pulls" --jq \
+            '.[] | select(.merged_at and .base.ref == "main" and any(.labels[]; .name == "autorelease: pending")) | .number')"
+          for pull in $pulls; do
+            gh api --silent --method DELETE "repos/$GH_REPO/issues/$pull/labels/autorelease%3A%20pending"
+          done

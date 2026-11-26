@@ -1,7 +1,7 @@
 import type { ReactNode, Ref } from 'react';
 import { DialogBodyText, DialogHeader, Focusable } from '@decky/ui';
 import { FocusOutlineStyles, focusOutlineProps } from './FocusOutline';
-import { selectWithSound } from './GamepadSounds';
+import { gamepadNavigationSoundProps, selectWithSound } from './GamepadSounds';
 
 export function ChoiceDialogBody({ title, subtitle, bodyRef, children }: {
   title: string;
@@ -76,7 +76,7 @@ export function ChoiceDialogRow({ title, detail, icon, badge, actionDescription 
   };
   return (
     <Focusable ref={rowRef} data-deckyplex-choice-row="" role="button" tabIndex={disabled ? -1 : 0} aria-disabled={disabled} aria-pressed={selected}
-      {...focusOutlineProps} {...{ focusable: !disabled, preferredFocus }} onOKActionDescription={actionDescription}
+      {...focusOutlineProps} {...gamepadNavigationSoundProps()} {...{ focusable: !disabled, preferredFocus }} onOKActionDescription={actionDescription}
       onActivate={event => activate(event, onChoose)}
       onOKButton={event => activate(event, onChoose, event.detail?.is_repeat)}
       onSecondaryActionDescription={onToggle ? 'Toggle library' : undefined}

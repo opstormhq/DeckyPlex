@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type Ref } from 'react';
 import { Button, DialogBodyText, ToggleField } from '@decky/ui';
-import { FaArrowRight, FaServer } from 'react-icons/fa';
+import { FaArrowRight, FaFilm, FaServer } from 'react-icons/fa';
 import { ChoiceDialogBody, ChoiceDialogList, ChoiceDialogRow } from './ChoiceDialog';
 import { InlineSpinner } from './InlineSpinner';
 import { DeckyPlexModal } from './InterfaceTheme';
@@ -39,13 +39,14 @@ export function LibraryRow({ library, included, disabled, onChange, rowRef }: {
   </div>;
 }
 
-export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, complete, close, lightTheme }: {
+export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, complete, close, lightTheme, videoExtrasEnabled }: {
   servers: PlexServerOption[];
   defaultServerId: string;
   loadLibraries: (serverId: string) => Promise<LibraryCatalog>;
-  complete: (serverId: string, selectedIds: string[]) => Promise<void>;
+  complete: (serverId: string, selectedIds: string[], enableVideoExtras: boolean) => Promise<void>;
   close: () => void;
   lightTheme?: boolean;
+  videoExtrasEnabled: boolean;
 }) {
   const [server, setServer] = useState<PlexServerOption | null>(servers.length === 1 ? servers[0] : null);
   const [catalog, setCatalog] = useState<LibraryChoice[] | null>(null);
@@ -53,11 +54,13 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
   const [loadingError, setLoadingError] = useState('');
   const [saveError, setSaveError] = useState('');
   const [saving, setSaving] = useState(false);
+  const [choosingExtras, setChoosingExtras] = useState(false);
   const [retry, setRetry] = useState(0);
   const savingRef = useRef(false);
   const firstServerRef = useRef<HTMLDivElement>(null);
   const firstLibraryRef = useRef<HTMLDivElement>(null);
   const retryRef = useRef<HTMLDivElement>(null);
+  const skipExtrasRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!server) return;
@@ -76,14 +79,15 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      if (!server) firstServerRef.current?.focus();
+      if (choosingExtras) skipExtrasRef.current?.focus();
+      else if (!server) firstServerRef.current?.focus();
       else if (loadingError) retryRef.current?.focus();
       else if (catalog?.length) {
         firstLibraryRef.current?.querySelector<HTMLElement>('[tabindex="0"], button:not([disabled])')?.focus();
       }
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [server, catalog, loadingError]);
+  }, [server, catalog, loadingError, choosingExtras]);
 
   const choose = (value: PlexServerOption | null) => {
     setCatalog(null);
@@ -93,7 +97,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
     setServer(value);
   };
 
-  const confirm = async () => {
+  const confirm = async (enableVideoExtras: boolean) => {
     if (!server || !catalog?.length || savingRef.current) return;
     if (!selectedIds.length) {
       setSaveError('Select at least one library.');
@@ -103,7 +107,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
     setSaving(true);
     setSaveError('');
     try {
-      await complete(server.id, selectedIds);
+      await complete(server.id, selectedIds, enableVideoExtras);
       close();
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : 'Could not save your Plex setup.');
@@ -113,17 +117,41 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
     }
   };
 
+  const continueSetup = () => {
+    const hasVideo = catalog?.some(library => selectedIds.includes(library.id)
+      && (library.type === 'movie' || library.type === 'show'));
+    if (hasVideo && !videoExtrasEnabled) {
+      setSaveError('');
+      setChoosingExtras(true);
+    } else void confirm(false);
+  };
+
   const cancel = () => {
     if (savingRef.current) return;
-    if (server && servers.length > 1) choose(null);
+    if (choosingExtras) {
+      setSaveError('');
+      setChoosingExtras(false);
+    } else if (server && servers.length > 1) choose(null);
     else close();
   };
   const defaultServer = servers.find(option => option.id === defaultServerId) || servers[0];
   return (
     <DeckyPlexModal lightTheme={lightTheme} closeModal={cancel} onCancel={cancel} onOK={() => {}}
       bCancelDisabled={saving} bDisableBackgroundDismiss={saving}>
-      <ChoiceDialogBody title={server ? 'Choose Plex libraries' : 'Choose a Plex server'} subtitle={server?.name}>
-      {!server ? (
+      <ChoiceDialogBody title={choosingExtras ? 'Show trailers and extras?' : server ? 'Choose Plex libraries' : 'Choose a Plex server'}
+        subtitle={choosingExtras ? 'You can change this later in Settings › Interface › Video.' : server?.name}>
+      {choosingExtras ? (
+        <ChoiceDialogList>
+          <ChoiceDialogRow title="Keep off" icon={null} rowRef={skipExtrasRef}
+            disabled={saving} onChoose={() => void confirm(false)} />
+          <ChoiceDialogRow title="Enable trailers and extras" icon={<FaFilm />}
+            disabled={saving} onChoose={() => void confirm(true)} />
+          {saving && <div role="status" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <InlineSpinner />Applying…
+          </div>}
+          {saveError && <DialogBodyText>{saveError}</DialogBodyText>}
+        </ChoiceDialogList>
+      ) : !server ? (
         <ChoiceDialogList>
           {servers.map(option => <ChoiceDialogRow key={option.id} title={option.name} icon={<FaServer />} actionDescription="Choose server"
             rowRef={option === defaultServer ? firstServerRef : undefined}
@@ -154,7 +182,7 @@ export function PlexSetupDialog({ servers, defaultServerId, loadLibraries, compl
               ))}
               <ChoiceDialogRow title={saving ? 'Applying…' : 'Continue'}
                 icon={saving ? <InlineSpinner /> : <FaArrowRight />}
-                disabled={saving || !selectedIds.length} onChoose={() => void confirm()} />
+                disabled={saving || !selectedIds.length} onChoose={continueSetup} />
             </ChoiceDialogList>
           )}
           {saveError && <DialogBodyText style={{ margin: '0.4rem', color: '#ffc1c1' }}>{saveError}</DialogBodyText>}

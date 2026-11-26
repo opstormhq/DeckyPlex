@@ -2,6 +2,7 @@ import { definePlugin, routerHook } from '@decky/api';
 import { Navigation, Router } from '@decky/ui';
 import { FaMusic } from 'react-icons/fa';
 import { QuickPlayer } from './components/QuickPlayer';
+import { setGamepadSoundsMuted } from './components/GamepadSounds';
 import { PlayerProvider, startLocalVolumeSession } from './context/PlayerContext';
 import { BrowserPage } from './components/BrowserPage';
 import { SettingsPage } from './components/SettingsPage';
@@ -79,6 +80,7 @@ export default definePlugin(() => {
       </PlayerProvider>
     ),
     onDismount() {
+      setGamepadSoundsMuted(false);
       stopPreservingPreferences();
       endLocalVolumeSession();
       stopGamePip();

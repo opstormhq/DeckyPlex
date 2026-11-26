@@ -51,18 +51,28 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         manifest = json.loads((self.root / "plugin.json").read_text())
         version = json.loads(Path("package.json").read_text())["version"]
         lockfile = json.loads(Path("package-lock.json").read_text())
+        release_versions = json.loads(Path(".release-please-manifest.json").read_text())
         self.assertEqual(manifest["name"], "DeckyPlex")
         self.assertEqual(lockfile["version"], version)
         self.assertEqual(lockfile["packages"][""]["version"], version)
+        self.assertEqual(release_versions["."], version)
         self.assertEqual(self.backend.APP_VERSION, version)
         receiver = self.backend.PlexCompanionReceiver("test-player")
         self.assertIn(f"Version: {version}\r\n".encode(), receiver._response_headers())
 
-    async def test_quick_access_setting_defaults_and_persists(self):
-        self.assertIs((await self.plugin.get_settings())["quick_player_close_tray_on_back"], True)
-        await self.plugin.set_settings({"quick_player_close_tray_on_back": False})
+    async def test_interface_defaults_and_preferences_persist(self):
+        defaults = await self.plugin.get_settings()
+        self.assertIs(defaults["quick_player_close_tray_on_back"], True)
+        self.assertIs(defaults["over_game_pip"], True)
+        self.assertIs(defaults["mute_ui_sounds"], False)
+        self.assertIs(defaults["video_show_extras"], False)
+        await self.plugin.set_settings({
+            "quick_player_close_tray_on_back": False, "over_game_pip": False, "mute_ui_sounds": True,
+        })
         reloaded = await self.backend.Plugin().get_settings()
         self.assertIs(reloaded["quick_player_close_tray_on_back"], False)
+        self.assertIs(reloaded["over_game_pip"], False)
+        self.assertIs(reloaded["mute_ui_sounds"], True)
 
     async def test_packaged_plex_sdk_connects_and_prepares_tokenless_music(self):
         import plexapi
@@ -76,7 +86,10 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         documents = {
             "/": '<MediaContainer machineIdentifier="test-server" friendlyName="Test Plex" version="1.43.4.0"/>',
             "/library": "<MediaContainer/>",
-            "/library/sections": '<MediaContainer><Directory key="1" title="Music" type="artist"/></MediaContainer>',
+            "/library/sections": (
+                '<MediaContainer><Directory key="1" title="Music" type="artist"/>'
+                '<Directory key="2" title="Movies" type="movie"/></MediaContainer>'
+            ),
             "/library/metadata/30": (
                 '<MediaContainer size="1"><Track ratingKey="30" key="/library/metadata/30" title="Test Track" '
                 'type="track" duration="90000"><Media audioCodec="mp3" container="mp3"><Part id="30" '
@@ -97,7 +110,14 @@ class PackageTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(requests.Session, "send", reply):
             settings = await self.plugin.connect_local_server("test.invalid")
             self.assertIs(settings["has_plex_token"], False)
-            self.assertEqual(settings["library_selection_ids"], ["1"])
+            self.assertEqual(settings["library_selection_ids"], ["1", "2"])
+            self.assertIs(settings["video_show_extras"], False)
+            music_only = await self.plugin.set_library_selection("test-server", ["1"], True)
+            self.assertIs(music_only["video_show_extras"], False)
+            video_enabled = await self.plugin.set_library_selection("test-server", ["1", "2"], True)
+            self.assertIs(video_enabled["video_show_extras"], True)
+            music_again = await self.plugin.set_library_selection("test-server", ["1"])
+            self.assertIs(music_again["video_show_extras"], True)
             stream = await self.plugin.play_track("30", "1")
         self.assertTrue(stream["success"], stream)
         self.assertEqual(stream["stream_mode"], "direct-mp3")
