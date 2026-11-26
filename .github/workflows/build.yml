@@ -90,13 +90,18 @@ jobs:
         with:
           fetch-tags: true
           persist-credentials: false
-      - name: Check for the initial release tag
+      - name: Check that the initial release is published
         id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          if git show-ref --verify --quiet refs/tags/v1.0.0; then
+          published="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '
+            .[] | select(.tag_name == "v1.0.0" and .draft == false) | .tag_name')"
+          if [[ "$published" == v1.0.0 ]]; then
             echo 'ready=true' >> "$GITHUB_OUTPUT"
           else
-            echo 'Automatic version proposals start after v1.0.0 is tagged.'
+            echo 'Automatic version proposals start after v1.0.0 is published.'
           fi
       - name: Update the release pull request
         if: steps.baseline.outputs.ready == 'true'

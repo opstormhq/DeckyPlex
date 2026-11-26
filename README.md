@@ -101,7 +101,7 @@ Use `main` for development and version tags for releases. In GitHub Actions, the
 #### Later releases
 
 1. Enable **Allow GitHub Actions to create and approve pull requests** in **Settings → Actions → General**. Use Conventional Commit messages for changes merged into `main`. Use `fix:` for patches, `feat:` for minor versions, and a `BREAKING CHANGE:` footer for major versions. If you squash a PR, put the prefix in the squash commit title.
-2. After CI passes, [Release Please](https://github.com/googleapis/release-please-action) opens or updates a release PR with the next version and changelog. Merge it when ready. GitHub may ask you to approve the checks on the generated PR.
+2. After v1.0.0 is published and CI passes on `main`, [Release Please](https://github.com/googleapis/release-please-action) opens or updates a release PR with the next version and changelog when commits warrant a version bump. Merge it when ready. GitHub may ask you to approve the checks on the generated PR.
 3. Wait for the release merge commit to pass **Test and package** on `main`. Tag that commit and push the tag using the commands above, with the new version in place of `1.0.0`. Review and publish the new draft from **Releases**.
 
 ## License
