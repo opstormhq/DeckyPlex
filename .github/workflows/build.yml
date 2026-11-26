@@ -18,6 +18,8 @@ jobs:
     timeout-minutes: 15
     outputs:
       commit: ${{ steps.source.outputs.commit }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,6 +56,7 @@ jobs:
       - name: Run backend and package tests
         run: python -m unittest discover -s tests -v
       - uses: actions/upload-artifact@v7
+        id: upload
         with:
           path: DeckyPlex.zip
           archive: false
@@ -96,14 +99,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: write
       pull-requests: write
     concurrency:
       group: release-${{ github.ref }}
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: DeckyPlex.zip
+      - name: Download and verify the install ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ARTIFACT_ID: ${{ needs.build.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact-digest }}
+        run: |
+          gh api "repos/$GH_REPO/actions/artifacts/$ARTIFACT_ID/zip" > DeckyPlex.zip
+          printf '%s  %s\n' "${ARTIFACT_DIGEST#sha256:}" DeckyPlex.zip | sha256sum --check
+          unzip -tq DeckyPlex.zip
       - name: Attach ZIP to draft release
         env:
           GH_TOKEN: ${{ github.token }}
