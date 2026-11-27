@@ -2,7 +2,7 @@
 
 Play Plex music, movies, and TV in Steam Gaming Mode. Browse your libraries with a controller, keep music playing while you game, or pop a video out over the game.
 
-[Install DeckyPlex](#install-deckyplex) · [Features](#features) · [Contribute](#contributing)
+[Features](#features) · [Install DeckyPlex](#install-deckyplex) · [Contribute](#contributing)
 
 ## Features
 
