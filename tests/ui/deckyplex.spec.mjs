@@ -5,6 +5,7 @@ import { build } from 'esbuild';
 
 const fixtureHtml = new URL('./fixture.html', import.meta.url);
 const host = fileURLToPath(new URL('./decky-host.jsx', import.meta.url));
+const captureScreenshots = process.env.DECKYPLEX_CAPTURE_SCREENSHOTS === '1';
 let javascript;
 
 test.beforeAll(async () => {
@@ -53,7 +54,9 @@ test('the library keeps top-row focus in the grid and restores the selected albu
   await expect(firstArtist).toBeVisible();
   await expect.poll(() => page.locator('[data-browser-card] img').evaluateAll(images =>
     images.length > 0 && images.every(image => image.complete && image.naturalWidth > 0))).toBe(true);
-  await page.screenshot({ path: info.outputPath('library-browser.png'), animations: 'disabled' });
+  if (captureScreenshots) {
+    await page.screenshot({ path: info.outputPath('library-browser.png'), animations: 'disabled' });
+  }
   await firstArtist.focus();
   expect(await press(page, 'DIR_UP')).toBe(false);
   await expect(firstArtist).toBeFocused();
@@ -138,7 +141,9 @@ test('Quick View collapses a focused queue, goes to Browse, then closes the tray
   await expect(secondTrack).toBeVisible();
   await expect.poll(() => page.locator('[data-quick-artwork] img').evaluateAll(images =>
     images.length > 0 && images.every(image => image.complete && image.naturalWidth > 0))).toBe(true);
-  await page.screenshot({ path: info.outputPath('quick-player.png'), animations: 'disabled' });
+  if (captureScreenshots) {
+    await page.screenshot({ path: info.outputPath('quick-player.png'), animations: 'disabled' });
+  }
   await secondTrack.focus();
   await press(page, 'CANCEL');
   await expect(secondTrack).toHaveCount(0);
@@ -177,7 +182,9 @@ test('light Quick View exposes video actions and keeps content within the tray w
   expect(left.y).toBeCloseTo(right.y);
   expect(left.x + left.width).toBeLessThan(right.x);
   expect(right.x + right.width).toBeLessThanOrEqual(440);
-  await page.screenshot({ path: info.outputPath('quick-video-light.png'), animations: 'disabled' });
+  if (captureScreenshots) {
+    await page.screenshot({ path: info.outputPath('quick-video-light.png'), animations: 'disabled' });
+  }
   await fullscreen.click();
   await popout.click();
   expect(await actions(page)).toEqual(expect.arrayContaining([['fullscreen'], ['pop out']]));

@@ -53,13 +53,18 @@ jobs:
       - name: Install Chromium for UI tests
         run: npx --no-install playwright install --with-deps --only-shell chromium
       - name: Run browser UI tests
+        id: ui-tests
         run: npm run test:ui
-      - name: Upload UI screenshots and failure traces
-        if: ${{ !cancelled() }}
+      - name: Upload browser failure diagnostics
+        if: ${{ failure() && steps.ui-tests.outcome == 'failure' }}
         uses: actions/upload-artifact@v7
         with:
-          name: ui-test-results
-          path: test-results/ui/
+          name: ui-test-failures
+          path: |
+            test-results/ui/**/test-failed-*.png
+            test-results/ui/**/trace.zip
+            test-results/ui/**/error-context.md
+          retention-days: 7
           if-no-files-found: ignore
       - name: Build the install ZIP
         run: npm run package
@@ -71,6 +76,7 @@ jobs:
         with:
           path: DeckyPlex.zip
           archive: false
+          retention-days: 14
           if-no-files-found: error
 
   release-versions:
