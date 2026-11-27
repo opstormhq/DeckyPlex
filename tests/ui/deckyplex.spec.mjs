@@ -45,6 +45,7 @@ const press = (page, button, repeat = false) =>
   page.evaluate(([key, repeating]) => window.fixture.press(key, repeating), [button, repeat]);
 
 test('the library keeps top-row focus in the grid and restores the selected album from Play Artist', async ({ page }, info) => {
+  await page.clock.install();
   const errors = await openFixture(page, 'browser');
   const artists = page.locator('[data-browser-tab="artists"]');
   const firstArtist = page.locator('[data-browser-item-id="artist-0"]');
@@ -57,17 +58,24 @@ test('the library keeps top-row focus in the grid and restores the selected albu
   expect(await press(page, 'DIR_UP')).toBe(false);
   await expect(firstArtist).toBeFocused();
 
-  await firstArtist.click();
+  // Reproduce navigation before the artist view's deferred focus has run.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 100));
+  await firstArtist.evaluate(element => element.click());
   const secondAlbum = page.locator('[data-browser-item-id="album-1"]');
   const playArtist = page.locator('[data-browser-play-collection]');
   await expect(secondAlbum).toBeVisible();
   await secondAlbum.focus();
   await press(page, 'DIR_UP');
   await expect(playArtist).toBeFocused();
+  await page.clock.runFor(48);
+  await expect(playArtist).toBeFocused();
   await press(page, 'DIR_DOWN');
   await expect(secondAlbum).toBeFocused();
+  await page.clock.resume();
   await page.keyboard.press('Escape');
   await expect(firstArtist).toBeFocused();
+  await firstArtist.click();
+  await expect(page.locator('[data-browser-item-id="album-0"]')).toBeFocused();
   expect(errors).toEqual([]);
 });
 

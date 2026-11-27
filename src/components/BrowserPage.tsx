@@ -1854,6 +1854,8 @@ const LibraryBrowser = memo(function LibraryBrowser({
       }
     };
     const focusItem = () => {
+      // A card can receive focus before the deferred entry focus runs.
+      enterContentPending.current = false;
       focusZone.current = 'content';
       focusedItemId.current = item.id;
       focusedHomeRow.current = homeRow;
