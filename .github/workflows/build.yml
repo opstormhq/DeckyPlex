@@ -132,8 +132,9 @@ jobs:
         if: steps.release-please.outputs.prs_created == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_PR: ${{ fromJSON(steps.release-please.outputs.pr).number }}
+          RELEASE_PR: ${{ fromJSON(steps.release-please.outputs.pr || '{}').number }}
         run: |
+          [[ "$RELEASE_PR" =~ ^[1-9][0-9]*$ ]]
           sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR" --jq '.head.sha')"
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
