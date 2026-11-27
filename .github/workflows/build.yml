@@ -14,6 +14,11 @@ permissions:
 jobs:
   build:
     name: Test and package
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.user.login != 'github-actions[bot]' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      github.head_ref != 'release-please--branches--main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
@@ -38,12 +43,7 @@ jobs:
       - name: Check release version
         if: github.ref_type == 'tag'
         shell: bash
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::The release tag must match the stable version in package.json (v$version)"
-            exit 1
-          fi
+        run: node scripts/check-release-versions.mjs . "$GITHUB_REF_NAME"
       - name: Install frontend dependencies
         run: npm ci
       - name: Type-check frontend
@@ -73,6 +73,23 @@ jobs:
           archive: false
           if-no-files-found: error
 
+  release-versions:
+    name: Check edited release PR versions
+    # Bot updates get their status from the main run that creates or updates the PR.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.user.login == 'github-actions[bot]' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'release-please--branches--main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: node scripts/check-release-versions.mjs
+
   propose-version:
     name: Propose the next version
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -83,6 +100,7 @@ jobs:
       contents: write
       issues: write
       pull-requests: write
+      statuses: write
     concurrency:
       group: deckyplex-release-pr
     steps:
@@ -104,10 +122,44 @@ jobs:
             echo 'Automatic version proposals start after v1.0.0 is published.'
           fi
       - name: Update the release pull request
+        id: release-please
         if: steps.baseline.outputs.ready == 'true'
         uses: googleapis/release-please-action@v5
         with:
           skip-github-release: true
+      - name: Find the release PR commit
+        id: release-pr
+        if: steps.release-please.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ fromJSON(steps.release-please.outputs.pr).number }}
+        run: |
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RELEASE_PR" --jq '.head.sha')"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Check the release PR version files
+        id: release-versions
+        if: steps.release-pr.outputs.sha != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release-pr.outputs.sha }}
+        run: |
+          versions_dir="$(mktemp -d)"
+          for file in package.json package-lock.json .release-please-manifest.json; do
+            gh api -H 'Accept: application/vnd.github.raw+json' \
+              "repos/$GITHUB_REPOSITORY/contents/$file?ref=$RELEASE_SHA" > "$versions_dir/$file"
+          done
+          node scripts/check-release-versions.mjs "$versions_dir"
+      - name: Report the version check on the release PR
+        if: ${{ !cancelled() && steps.release-pr.outputs.sha != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ steps.release-pr.outputs.sha }}
+          CHECK_STATE: ${{ steps.release-versions.outcome == 'success' && 'success' || 'failure' }}
+        run: |
+          gh api --silent --method POST "repos/$GITHUB_REPOSITORY/statuses/$RELEASE_SHA" \
+            -f context='Release version files' -f state="$CHECK_STATE" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
   draft-release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
