@@ -20,20 +20,42 @@ Play Plex music, movies, and TV in Steam Gaming Mode. Browse your libraries with
 
 <img src="docs/screenshots/quick-player.png" alt="DeckyPlex Quick Player with a song playing, transport controls, and the upcoming queue" width="320">
 
+## Prerequisites
+
+- A SteamOS device with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
+- **Developer mode** enabled in Decky Loader
+- Access to a Plex Media Server
+
+<details>
+<summary>How to enable Developer mode</summary>
+
+1. In Gaming Mode, press **…** to open **Quick Access**.
+2. Open **Decky** (the plug icon) and select the **gear icon**.
+3. In **General**, scroll to **Other** and turn on **Developer mode**.
+
+</details>
+
 ## Install DeckyPlex
 
-You’ll need a SteamOS device with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) and access to a Plex Media Server.
+Find the `DeckyPlex-v*.zip` asset from the [latest GitHub release](https://github.com/opstormhq/DeckyPlex/releases/latest). Choose **one** of the methods below.
 
-1. Download the versioned ZIP, such as `DeckyPlex-v1.0.0.zip`, from the [latest GitHub release](https://github.com/opstormhq/DeckyPlex/releases/latest) and install the ZIP through Decky Loader’s developer settings. The ZIP includes the Python dependencies.
-2. Open **DeckyPlex → Settings → Account** and choose **Sign in with a code**. Enter the code at [plex.tv/link](https://plex.tv/link).
-3. Choose a server and its libraries. DeckyPlex starts with music libraries selected on a new server and remembers your choices per server. Change them later under **Settings → Server**.
-4. Open **Browse Music** or **Browse Media** in Quick Player. Pick a track to listen, or select a movie or episode to watch.
+**Option 1 · Install from a URL (public releases)**
 
-If your server already allows local access while signed out, enter its address under **Settings → Advanced → Local Plex server address**. When signed in, use **Plex server address override** and **Test connection** if automatic discovery picks an unreachable address.
+1. Copy the ZIP asset’s link from GitHub.
+2. In Gaming Mode, open **Decky → Settings → Developer**.
+3. Paste the link into **Install Plugin from URL**, select **Install**, and confirm when prompted.
 
-Use **Settings → Interface** to adjust grid columns, appearance, and navigation sounds. The **Video** section includes picture-in-picture position and size, autoplay, and trailers and extras.
+**OR**
 
-### Connect Plexamp
+**Option 2 · Install from a downloaded ZIP**
+
+1. In Desktop Mode, download the ZIP to **Downloads**.
+2. Return to Gaming Mode and open **Decky → Settings → Developer**.
+3. Under **Install Plugin from ZIP File**, select **Browse**, pick the downloaded ZIP, and confirm when prompted.
+
+Open **DeckyPlex** from the Decky menu and select **Log in**. If your Plex server allows local access without signing in, enter its address under **Settings → Advanced** instead.
+
+## Connect Plexamp
 
 1. Open **Settings → Players**, enable **Plexamp receiver**, and check that the receiver reports ready.
 2. With both devices on the same network, select DeckyPlex in Plexamp’s player picker. Set a distinct **Receiver device name** if you have more than one DeckyPlex device.
